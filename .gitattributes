@@ -7,3 +7,5 @@
 *.lock text eol=lf
 *.html text eol=lf
 *.js text eol=lf
+*.png binary
+*.jpg binary

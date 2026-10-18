@@ -17,16 +17,10 @@ use std::path::{Path, PathBuf};
 
 pub struct OpenclawSource;
 
-/// 只读打开 + busy_timeout + query_only(SQLite 纪律,同 hermes/zcode)。
+/// 只读打开(收编至 common,2026-10-17):此前自持样板且 URI flag 对纯 PathBuf 无意义——
+/// SQLITE_OPEN_URI 仅影响 file: URI 解析,传 PathBuf 反而在路径含 `?` 时有解析歧义。
 fn open_ro(db: &Path) -> Option<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .ok()?;
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-    let _ = conn.pragma_update(None, "query_only", true);
-    Some(conn)
+    crate::common::open_sqlite_readonly(db).ok()
 }
 
 /// 别名组取值:首个存在且非 null 的键(遗留 JSONL 通道别名宽度,§2)。

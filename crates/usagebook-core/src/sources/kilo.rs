@@ -9,10 +9,8 @@
 use crate::common::{env_roots, home, json_u64};
 use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OpenFlags};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
 
 pub struct KiloSource;
 
@@ -67,10 +65,7 @@ impl UsageSource for KiloSource {
                 stats.notes.push(format!("根 {} 下无 kilo.db", root.display()));
                 continue;
             }
-            let conn = match Connection::open_with_flags(
-                &db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY,
-            ) {
+            let conn = match crate::common::open_sqlite_readonly(&db) {
                 Ok(c) => c,
                 Err(e) => {
                     stats.notes.push(format!("kilo.db 打开失败: {}", e));
@@ -78,11 +73,6 @@ impl UsageSource for KiloSource {
                     continue;
                 }
             };
-            if let Err(e) = conn.busy_timeout(Duration::from_secs(5)) {
-                stats.notes.push(format!("busy_timeout 设置失败: {}", e));
-                stats.failed = true;
-            }
-            let _ = conn.pragma_update(None, "query_only", true);
 
             let has_table = conn
                 .query_row(

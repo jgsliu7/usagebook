@@ -19,7 +19,7 @@
 
 本项目纪律:**先档案、后代码**——适配器只实现档案中已验证的行为,不猜测解析。
 
-1. **立档案**:`docs/数据源档案/NN-<源名>.md`(套用既有档案结构:发现规则/文件格式/字段映射/去重/口径),格式证据需可复核(本机样本、上游源码 文件:行号、或官方文档)
+1. **立档案**:`docs/数据源档案/NN-<源名>.md`(套用既有档案结构:发现规则/文件格式/字段映射/去重/口径),格式证据需可复核(真实安装样本、上游源码 文件:行号、或官方文档)
 2. **写 fixture**:`crates/usagebook-core/tests/`,按档案构造最小合成样本
 3. **实现适配器**:`crates/usagebook-core/src/sources/<id>.rs`,实现 `UsageSource` 协议(`model.rs`:discover_roots + scan_roots → Vec<UsageRecord>)
 4. **注册**:`crates/usagebook-core/src/lib.rs` 的 `SOURCE_CATALOG` 与 `registered_sources()` 各加一行(顺序一致,单元测试会校验)。另有两处**按需**登记:JSONL 大源要启用文件级尾读增量,需在 `common.rs` 的增量档位名单(`matches!(source.id(), …)`)加该源 id(漏加只损性能、不损正确性);doctor 的环境变量展示表(cli `main.rs` 的 `ENV_OVERRIDES`)同步加上该源认的变量

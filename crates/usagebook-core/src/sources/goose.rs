@@ -13,7 +13,7 @@ use crate::common::{env_roots, home, iso_to_ms, secs_or_ms};
 use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
 use chrono::NaiveDate;
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -130,10 +130,7 @@ impl UsageSource for GooseSource {
 
         for db in roots {
             stats.files_seen += 1;
-            let conn = match Connection::open_with_flags(
-                db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY,
-            ) {
+            let conn = match crate::common::open_sqlite_readonly(db) {
                 Ok(c) => c,
                 Err(e) => {
                     stats.notes.push(format!("{} 打开失败: {}", db.display(), e));

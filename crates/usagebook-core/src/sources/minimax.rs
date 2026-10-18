@@ -15,7 +15,6 @@
 
 use crate::common::*;
 use crate::model::*;
-use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -108,10 +107,7 @@ impl UsageSource for MinimaxSource {
 
             // 只读打开 + busy_timeout + query_only;失败重试一次;不动 journal mode(档案 §5.5/§8)
             let try_open = || {
-                Connection::open_with_flags(
-                    &db,
-                    OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
+                crate::common::open_sqlite_readonly(&db)
             };
             let conn = match try_open().or_else(|_| try_open()) {
                 Ok(c) => c,

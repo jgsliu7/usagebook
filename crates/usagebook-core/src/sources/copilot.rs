@@ -14,11 +14,10 @@
 use crate::common::{env_roots, flex_to_ms, home, json_u64, walk_with, SnapshotDiff};
 use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 pub struct CopilotSource;
 
@@ -459,13 +458,7 @@ fn scan_session_store(
 }
 
 fn open_ro(db: &Path) -> Option<Connection> {
-    let conn = Connection::open_with_flags(
-        db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
-    let _ = conn.busy_timeout(Duration::from_secs(5));
-    let _ = conn.pragma_update(None, "query_only", true);
+    let conn = crate::common::open_sqlite_readonly(db).ok()?;
     Some(conn)
 }
 

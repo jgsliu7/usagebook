@@ -10,7 +10,6 @@
 use crate::common::{home, json_u64};
 use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OpenFlags};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -104,10 +103,7 @@ impl UsageSource for KiroSource {
 
         for db in roots {
             stats.files_seen += 1;
-            let conn = match Connection::open_with_flags(
-                db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY,
-            ) {
+            let conn = match crate::common::open_sqlite_readonly(db) {
                 Ok(c) => c,
                 Err(e) => {
                     stats.notes.push(format!("{} 打开失败: {}", db.display(), e));

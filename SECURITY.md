@@ -28,5 +28,5 @@
 
 不依赖本承诺、想自行核验的读者可以:
 
-- 程序运行期间,在另一终端执行 `lsof -nP -iTCP -sTCP:ESTABLISHED | grep usagebook`(macOS/Linux),应无任何输出(唯一监听是 `serve` 在 127.0.0.1 上的本地端口)
+- 程序运行期间,在另一终端执行 `lsof -nP -iTCP -sTCP:ESTABLISHED | grep usagebook`(macOS/Linux),应仅有 127.0.0.1 与 127.0.0.1 之间的本地回环连接(看板轮询),不应出现任何外部地址 (expect only loopback connections to 127.0.0.1 from your own browser; any external address is a problem)(唯一监听是 `serve` 在 127.0.0.1 上的本地端口)
 - 核对 `Cargo.lock`:本项目运行时**不依赖任何 HTTP/网络客户端类 crate**,唯一的网络相关依赖只服务于本地看板监听

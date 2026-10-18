@@ -10,10 +10,8 @@
 use crate::common::{env_roots, home, json_u64, walk_with};
 use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OpenFlags};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
 
 pub struct OpencodeSource;
 
@@ -140,14 +138,7 @@ fn parse_payload(doc: &serde_json::Value) -> Option<Payload> {
 /// 单个 db 内三通道互斥探测(§2,本机实证):session_message(v2)> message(v1)>
 /// session 聚合兜底。聚合 = 明细之和(本机对拍五列全吻合),同取两通道必双计。
 fn scan_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut HashSet<String>, stats: &mut ScanStats) -> bool {
-    let Ok(conn) = Connection::open_with_flags(
-        db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) else {
-        return false;
-    };
-    let _ = conn.busy_timeout(Duration::from_secs(5));
-    let _ = conn.pragma_update(None, "query_only", true);
+    let Ok(conn) = crate::common::open_sqlite_readonly(db) else { return false; };
 
     let db_alias = db.file_name().and_then(|s| s.to_str()).unwrap_or("opencode.db");
     // 通道一/二:逐行明细(v2 session_message 判 type;v1 message 判 role)

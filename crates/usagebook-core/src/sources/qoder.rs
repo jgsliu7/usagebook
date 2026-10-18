@@ -11,7 +11,6 @@
 use crate::common::{for_each_line, home, iso_to_ms, json_u64, secs_or_ms, walk_with};
 use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OpenFlags};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,10 +29,7 @@ fn v_text(v: &SqlValue) -> Option<String> {
 /// IDE 通道(§2):local.db chat_message 表。
 fn scan_ide_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut HashSet<String>, stats: &mut ScanStats) {
     stats.files_seen += 1;
-    let conn = match Connection::open_with_flags(
-        db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) {
+    let conn = match crate::common::open_sqlite_readonly(db) {
         Ok(c) => c,
         Err(e) => {
             stats.notes.push(format!("{} 打开失败: {}", db.display(), e));

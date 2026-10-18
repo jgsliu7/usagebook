@@ -290,7 +290,7 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
                     // 正常用户点击节奏远低于此,节流静默放行(响应不变)
                     let now = now_ms();
                     let last = last_trigger_ms.swap(now, Ordering::Relaxed);
-                    if now - last >= 2000 { trigger.store(true, Ordering::Relaxed); }
+                    if now.saturating_sub(last) >= 2000 { trigger.store(true, Ordering::Relaxed); }   // 回拨防御(u64 下溢)
                     (serde_json::json!({"ok":true,"scanning":scanning.load(Ordering::Relaxed)}).to_string(), "application/json; charset=utf-8", 200)
                 }
                 _ => (r#"{"error":"not found"}"#.to_string(), "application/json; charset=utf-8", 404),

@@ -13,7 +13,7 @@
     --border: #232a38;
     --fg: #e8edf5;
     --muted: #93a0b4;
-    --dim: #6b7689;
+    --dim: #8290a6;   /* 2026-10-17 UX:对 panel 底 4.6:1,达 WCAG AA(原 #6b7689 为 3.95:1) */
     --accent: #6cb6ff;
     color-scheme: dark;
   }
@@ -73,6 +73,7 @@
   }
   .seg button:last-child { border-right: none; }
   .seg button.on { background: #1d2b45; color: var(--fg); }
+  .seg button:hover:not(.on) { color: var(--fg); }   /* 可点性指示(2026-10-17 UX) */
   input[type="date"] {
     background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
     border-radius: 8px; padding: 4px 10px; font-size: 12.5px; color-scheme: dark;
@@ -114,6 +115,7 @@
   .ms-item .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ms-item .share { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
   .srcrow, .mrow { cursor: pointer; }
+  .srcrow:focus-visible, .mrow:focus-visible { background: #1d2b45; }   /* 键盘走查焦点可见 */
 
   .panel {
     background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
@@ -192,7 +194,7 @@
     <button id="btn-refresh" data-i18n="btn.refresh">↻ 立即刷新</button>
   </header>
 
-  <div id="scanning"><span id="scanning-txt" data-i18n="scan.first">首次全量扫描中,数据量大时约 10–30 秒</span><span class="dot-loading"></span></div>
+  <div id="scanning" aria-live="polite"><span id="scanning-txt" data-i18n="scan.first">首次全量扫描中,数据量大时约 10–30 秒</span><span class="dot-loading"></span></div>
   <div id="app" hidden>
     <div class="cards" id="cards"></div>
     <div class="controls">
@@ -237,24 +239,25 @@
         <h2><span id="daily-h2" data-i18n="h2.daily">每日 Token 消耗</span><small id="daily-sub"></small></h2>
         <span class="p-tools">
           <span class="day-entry" id="dayview-bar">
+            <button class="hbtn" id="day-back" hidden>‹ <span data-i18n="btn.backToday">返回今天</span></button>
             <button class="hbtn" id="day-prev" hidden>‹</button>
             <input type="date" id="day-pick">
             <button class="hbtn" id="day-next" hidden>›</button>
           </span>
         </span>
       </div>
-      <div class="chart-box"><canvas id="chartDaily"></canvas></div>
+      <div class="chart-box"><canvas id="chartDaily" aria-hidden="true"></canvas></div>
     </div>
 
     <div class="grid2" id="grid2">
       <div class="panel" id="hourly-panel">
         <!-- 同 daily-h2:标题由 render 按模式覆写(小时分布/周趋势/月趋势),data-i18n 仅首帧兜底 -->
         <div class="p-head"><h2><span id="hourly-h2" data-i18n="h2.hourly">当日按小时分布</span><small id="hourly-sub"></small></h2></div>
-        <div class="chart-box"><canvas id="chartHourly"></canvas></div>
+        <div class="chart-box"><canvas id="chartHourly" aria-hidden="true"></canvas></div>
       </div>
       <div class="panel">
         <div class="p-head"><h2><span id="doughnut-h2" data-i18n="h2.sourceShare">来源占比</span></h2></div>
-        <div class="chart-box"><canvas id="chartSource"></canvas><div class="empty-tip" id="doughnut-empty" hidden data-i18n="empty.noSel">当前口径下无数据</div></div>
+        <div class="chart-box"><canvas id="chartSource" aria-hidden="true"></canvas><div class="empty-tip" id="doughnut-empty" hidden data-i18n="empty.noSel">当前口径下无数据</div></div>
       </div>
     </div>
 
@@ -869,7 +872,9 @@ function mkChart(id, cfg) {
     } catch (e) { /* 自愈:更新异常 → 走重建 */ }
   }
   if (c) { try { c.destroy(); } catch (e) {} }
-  const nc = new Chart($(id), cfg);
+  const el = $(id);
+  if (el) el.style.cursor = cfg.options && cfg.options.onClick ? 'pointer' : '';   // 可钻取的图给手型(2026-10-17 UX)
+  const nc = new Chart(el, cfg);
   nc.$shape = key;
   nc.$center = cfg.$center;
   if (cfg.$center) nc.update('none');   // 构造内 attached 时同步首绘读不到 $center,补一次同步重绘(环心首帧不缺)
@@ -897,8 +902,12 @@ const stackOpts = (yTitle) => ({
   },
   plugins: {
     legend: { labels: { boxWidth: 10, boxHeight: 10 } },
-    /* tooltip 首行:轴标签 + 该柱各段总和(单看刻度序号意义不大) */
-    tooltip: { callbacks: { title: items => {
+    /* tooltip 明细:零段不列(长列表里全是无信息的 0),并按当前柱数值降序;
+       itemSort 是 Chart.js 4 的选项名(旧版叫 itemSorter) */
+    tooltip: {
+      filter: it => ((it.parsed && it.parsed.y) || 0) > 0,
+      itemSort: (a, b) => ((b.parsed && b.parsed.y) || 0) - ((a.parsed && a.parsed.y) || 0),
+      callbacks: { title: items => {
       if (!items || !items.length) return '';
       const sum = items.reduce((a, it) => a + ((it.parsed && it.parsed.y) || 0), 0);
       return items[0].label + ' · ' + t('sub.total', fmt(sum));
@@ -939,6 +948,7 @@ function renderDaily() {
   $('#daily-h2').textContent = t('h2.daily');
   $('#day-prev').hidden = true;
   $('#day-next').hidden = true;
+  $('#day-back').hidden = true;
   if (document.activeElement !== $('#day-pick')) $('#day-pick').value = '';   // 多日窗清空也守焦点(编辑中间态不丢)
   $('#hourly-panel').hidden = false;
   $('#grid2').classList.remove('single');
@@ -965,6 +975,7 @@ function renderDayView() {
   $('#daily-h2').textContent = t('h2.dayHourly');
   $('#day-prev').hidden = false;
   $('#day-next').hidden = false;
+  $('#day-back').hidden = state.win === 'today';   // 钻取态给新手一个明确出口(2026-10-17 UX)
   $('#hourly-panel').hidden = true;   // 与大图重复,隐藏,占比环独占一行
   $('#grid2').classList.add('single');
 
@@ -1006,14 +1017,15 @@ function renderPeriodTrend(unit) {
   }
   const selIdx = count - 1 - (state.win === 'thisweek' || state.win === 'thismonth' ? 0 : 1);
   const labels = periods.map(p => p.label);
-  /* 周期键按日期缓存(2026-10-17 性能实测):此前每行 new Date()+weekStartStr,
-     10 万小时行每 tick 5-10 万次解析(40-80ms);日期种类 ≤ 数百,缓存后 O(D) */
+  /* 周期键缓存(2026-10-17 性能实测):仅周分支受益(weekStartStr 的 Date 解析 21ms→4ms@10万行);
+     月分支 slice 本身 O(1) 快于查表,不走缓存 */
   const keyCache = new Map();
   const keyOf = r => {
     const d = r.h.slice(0, 10);
+    if (unit !== 'week') return d.slice(0, 7);
     let k = keyCache.get(d);
     if (k === undefined) {
-      k = unit === 'week' ? weekStartStr(new Date(d + 'T12:00:00')).slice(5) : d.slice(0, 7);
+      k = weekStartStr(new Date(d + 'T12:00:00')).slice(5);
       keyCache.set(d, k);
     }
     return k;
@@ -1167,7 +1179,7 @@ function renderModelTable() {
   for (const r of rows) {
     const tot = totalOf(r.b);
     const share = total > 0 ? (tot * 100 / total) : 0;
-    html += `<tr class="mrow" data-m="${escapeHtml(r.m)}" title="${escapeHtml(t('tbl.clickModel'))}">
+    html += `<tr class="mrow" role="button" tabindex="0" data-m="${escapeHtml(r.m)}" title="${escapeHtml(t('tbl.clickModel'))}">
       <td class="mname">${escapeHtml(r.m)}</td>
       <td style="text-align:left">${r.sources.map(s => `<span class="srcdot" style="background:${srcColor(s)}"></span>${escapeHtml(srcLabel(s))}`).join(' ')}</td>
       <td>${fmt(r.b.i)}</td><td>${fmt(r.b.cr)}</td>${cw ? `<td>${fmt(r.b.cw)}</td>` : ''}<td>${fmt(r.b.o + r.b.r)}</td>
@@ -1194,7 +1206,7 @@ function renderSourceTable() {
     .sort((a, b) => totalOf(b.b) - totalOf(a.b));
   let html = `<tr><th>${t('tbl.source')}</th><th>${t('tbl.requests')}</th><th>${t('tbl.input')}</th><th>${t('tbl.cr')}</th>${cw ? `<th>${t('tbl.cw')}</th>` : ''}<th>${t('tbl.output')}</th><th>${t('tbl.sum')}</th>${costAny ? `<th title="${escapeHtml(t('tbl.costTitle'))}">${t('tbl.cost')}</th>` : ''}</tr>`;
   for (const r of rows) {
-    html += `<tr class="srcrow" data-s="${escapeHtml(r.s)}" title="${escapeHtml(t('tbl.clickSource'))}">
+    html += `<tr class="srcrow" role="button" tabindex="0" data-s="${escapeHtml(r.s)}" title="${escapeHtml(t('tbl.clickSource'))}">
       <td class="mname"><span class="srcdot" style="background:${srcColor(r.s)}"></span>${escapeHtml(srcLabel(r.s))}</td>
       <td>${fmtInt(r.b.n)}</td>
       <td>${fmt(r.b.i)}</td><td>${fmt(r.b.cr)}</td>${cw ? `<td>${fmt(r.b.cw)}</td>` : ''}<td>${fmt(r.b.o + r.b.r)}</td>
@@ -1406,6 +1418,17 @@ function shiftDay(n) {
 $('#day-pick').addEventListener('change', e => { if (e.target.value) enterDay(e.target.value); });
 $('#day-prev').addEventListener('click', () => shiftDay(-1));
 $('#day-next').addEventListener('click', () => shiftDay(1));
+$('#day-back').addEventListener('click', () => { state.win = 'today'; render(); });
+/* 表行键盘可达(2026-10-17 UX):role=button+tabindex 的行,Enter/Space 触发与点击同款筛选 */
+for (const [sel, dim] of [['#tbl-source', 'src'], ['#tbl-model', 'mdl']]) {
+  $(sel).addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const tr = e.target.closest('tr.srcrow, tr.mrow');
+    if (!tr) return;
+    e.preventDefault();
+    if (dim === 'src') toggleSrc(tr.dataset.s); else toggleMdl(tr.dataset.m);
+  });
+}
 
 /* 下拉开关(两个面板互不影响,点页面其他处全部收起) */
 function bindMsToggle(btnId, panelId, builder) {

@@ -12,7 +12,7 @@
 use crate::common::*;
 use crate::model::*;
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -126,10 +126,7 @@ impl UsageSource for ZcodeSource {
             }
 
             // 只读打开 + busy_timeout + query_only;失败注记不 panic(档案 §5.6)
-            let conn = match Connection::open_with_flags(
-                &db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY,
-            ) {
+            let conn = match crate::common::open_sqlite_readonly(&db) {
                 Ok(c) => c,
                 Err(e) => {
                     stats.notes.push(format!("db.sqlite 打开失败: {}", e));

@@ -9,10 +9,9 @@
 use crate::common::{env_roots, home};
 use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
 
 pub struct HermesSource;
 
@@ -47,13 +46,7 @@ fn v_text(v: &SqlValue) -> Option<String> {
 
 /// 只读打开 + busy_timeout + query_only(zcode SQLite 纪律)。
 fn open_ro(db: &std::path::Path) -> Option<Connection> {
-    let conn = Connection::open_with_flags(
-        db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
-    let _ = conn.busy_timeout(Duration::from_secs(5));
-    let _ = conn.pragma_update(None, "query_only", true);
+    let conn = crate::common::open_sqlite_readonly(db).ok()?;
     Some(conn)
 }
 

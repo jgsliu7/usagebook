@@ -210,8 +210,9 @@ fn main() {
 }
 
 /// 增量状态库面板 只读,不写 store)。
-fn store_panel_json() -> serde_json::Value {
-    let s = usagebook_core::store::doctor_snapshot();
+/// 接收已有快照构建 JSON(2026-10-17):doctor 终端路径曾两次调用 doctor_snapshot,
+/// quick_check 全库校验重复执行,大库 doctor 慢一倍——快照一次,JSON/终端共用
+fn store_panel_json(s: &usagebook_core::store::DoctorSnapshot) -> serde_json::Value {
     serde_json::json!({
         "mode": s.mode,
         "path": s.db_path.display().to_string(),
@@ -230,8 +231,7 @@ fn store_panel_json() -> serde_json::Value {
     })
 }
 
-fn print_store_panel() {
-    let s = usagebook_core::store::doctor_snapshot();
+fn print_store_panel(s: &usagebook_core::store::DoctorSnapshot) {
     println!("\n增量状态库 —— mode={} · {} ({})",
         s.mode, s.db_path.display(), human_size(s.db_bytes));
     match s.quick_check_ok {
@@ -300,7 +300,8 @@ fn doctor(check: bool, json: bool) {
             }
             rows.push(row);
         }
-        let store = store_panel_json();
+        let snap = usagebook_core::store::doctor_snapshot();
+        let store = store_panel_json(&snap);
         // 数据性失败(退出码 3):任一源 failed / store 真损坏 / 本进程打开两连败 / 库由更新版本创建
         let store_failed = store["quick_check_ok"].as_bool() == Some(false)
             || store["mode"].as_str().is_some_and(|m| m == "failed" || m == "future-schema");
@@ -328,14 +329,14 @@ fn doctor(check: bool, json: bool) {
                 }
             }
             println!("未识别事件不一定含用量；坏行可能是尚未写完或损坏的记录。反馈时只提供诊断计数，不提供原始对话。");
-            print_store_panel();
+            print_store_panel(&snap);
         }
         if any_failed || store_failed {
             std::process::exit(3);
         }
         return;
     }
-    print_store_panel();
+    print_store_panel(&usagebook_core::store::doctor_snapshot());
     println!("usagebook doctor —— 本机数据源自检\n图例:✅ 已发现目录  — 未发现（未安装属正常）\n");
     let mut found = 0usize;
     for a in registered_sources() {

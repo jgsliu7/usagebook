@@ -1,5 +1,11 @@
 # Changelog
 
+## [未发布]
+
+- dsh 源显示名:"DeepSeek Code" → "DeepSeek Harness"(对齐产品官方名;仅显示名,id 与统计口径不变)
+- 看板柱状图悬浮明细按当前柱数值降序排列,并隐藏零值段(每日/小时/周趋势/月趋势四图一致)
+- 文档:README 全文改为面向读者的通用语态;快速开始增加 GitHub Releases 预编译包入口
+
 ## [0.1.0] - 2026-10-18
 
 首个公开版本。
@@ -9,6 +15,7 @@
 - 24 个可扫描 AI 编程工具数据源(17 实机验证 + 7 依上游实现),另 1 个(Kiro)暂停;统一五桶模型(request_delta 口径)
 - Claude 1 小时 TTL 缓存写子桶(`cache_write_1h`,计入缓存写总量的子集,不改变五桶合计;终端报表显示 1h 部分注记)
 - 源内去重键碰撞哨兵计数:四大 JSONL 源(Claude/Codex/Kimi/DeepSeek)在去重时统计同键不同请求的碰撞数(当前实测为 0,作为防御性可见性保留);`doctor --check --json` 逐源携带 rewrote/replayed/key_clash 计数(机器可读诊断通道)
+- **过夜质量攻坚**(2026-10-17 夜,五域双轮):安全域——state.db 及 WAL/SHM 权限 0600、/api/trigger 2s 节流、DNS rebinding/注入/外泄面全面复核收敛;性能域——时间戳阈值统一(TS_MS_FLOOR)、SQLite 只读打开 10 适配器收编、趋势图周期键缓存、性能包络量化(6 万小时行内无感);代码质量域——doctor 双跑消除、OpenError 实装 std::error::Error、别名清理;UX 域——WCAG AA 对比度、钻取"返回今天"按钮、表行键盘可达、seg hover、EN 措辞放宽;开源就绪域——README.en 卸载/发行包英文化、SECURITY 自证措辞修正、.gitattributes 二进制声明——五域终审全部收敛,达可发布标准
 - **增量持久层**:扫描状态跨启动持久化(`~/.usagebook/state.db`,WAL)——未变更文件零重读、追加文件按尾部增量读取、文件改写自动检测并全量重放(终端报表显示"重绕"计数);实测二次全量报表约 0.7s、首轮约 11.6s(macOS 开发机、25 源全开的一次性观察值,不构成性能承诺);`USAGEBOOK_INCREMENTAL=off` 一键回退全量扫描,`usagebook doctor` 含状态库健康面板(quick_check/游标规模/轮转/GC)
 - 数据正确性(2026-10-17 深夜):聚合差分逐桶单调(防桶间迁移错账);claude cost-state 多模型归属;roocode input 按档案§6.2 inclusive 减除(含缓存请求系统性虚增);pi/qwen 推理值钳制(估算超输出虚增);dsh/minimax 数值宽松读(浮点不再归零);pi 跨根去重键;opencode 主库空回退与缺时间戳计数;openclaw 成本按 totalOrigin 分治;goose INTEGER 成本;DST 折叠同期核正——后端数据正确性以 34 项毒样本断言收敛
 

@@ -912,9 +912,28 @@ pub fn json_u64(v: Option<&Value>) -> u64 {
     }
 }
 
-/// epoch 秒/毫秒自适应(<1e12 视为秒 ×1000;juejin 惯例,时间戳漂移防护)。
+/// 秒/毫秒分界(2026-10-17 统一):此值以下视为秒。此前 secs_or_ms 用 1e12 而
+/// flex_to_ms 数值档用 1e11,同一概念两套判据、[1e11,1e12) 区间结论相反——统一为 1e11
+/// (2013 年以前的秒与 5138 年以后的毫秒均不出现,分界取谁都正确,取严格侧)。
+pub const TS_MS_FLOOR: i64 = 100_000_000_000;
+
+/// 只读打开 SQLite 并统一施加 busy_timeout/query_only 纪律(2026-10-17 收编):
+/// 此前 10 处适配器样板复制且失败语义漂移(部分吞掉/部分 notes+failed)。
+/// 打开或 busy_timeout 失败均返回 Err,由调用方按各自渠道语义处置;
+/// query_only 失败静默降级(个别平台不支持,只读 flags 已是主防线)。
+pub fn open_sqlite_readonly(db: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let _ = conn.pragma_update(None, "query_only", true);
+    Ok(conn)
+}
+
+/// epoch 秒/毫秒自适应(<TS_MS_FLOOR 视为秒 ×1000;juejin 惯例,时间戳漂移防护)。
 pub fn secs_or_ms(n: i64) -> i64 {
-    if n.abs() < 1_000_000_000_000 {
+    if n.abs() < TS_MS_FLOOR {
         n.saturating_mul(1000)
     } else {
         n
@@ -946,8 +965,8 @@ pub fn flex_to_ms(v: Option<&Value>) -> Option<i64> {
                 f / 1e6 // 纳秒
             } else if f.abs() >= 1e14 {
                 f / 1e3 // 微秒
-            } else if f.abs() >= 1e11 {
-                f // 毫秒
+            } else if f.abs() >= TS_MS_FLOOR as f64 {
+                f // 毫秒(与 secs_or_ms 共用分界,见 TS_MS_FLOOR 注释)
             } else {
                 f * 1e3 // 秒
             };

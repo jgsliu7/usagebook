@@ -17,7 +17,7 @@ usagebook parses the on-disk data of 24 AI coding tools — read-only, zero conf
 | Kimi Code | ✅ | dual-root, dual-format session streams |
 | ZCode | ✅ | SQLite usage ledger |
 | WorkBuddy | ✅ | session transcripts + usage lines |
-| DeepSeek DSH | ✅ | zstd-compressed session streams |
+| DeepSeek Harness | ✅ | zstd-compressed session streams |
 | MiniMax | ✅ | SQLite usage projection |
 | OMP / Pi | ✅ | session streams (OMP carries per-request cost) |
 | Cline | ✅ | native sessions only (imported mirrors excluded) |
@@ -46,6 +46,10 @@ cargo build --release --locked  # binary at target/release/usagebook
 ```
 
 If `~/.local/bin` is not on your PATH, run `export PATH="$HOME/.local/bin:$PATH"` first.
+
+Uninstall: `sh install.sh --uninstall` (removes the binary; your data stays under `~/.usagebook`, delete it manually if you want a full wipe).
+
+Prebuilt archives are available on [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) — unzip and run `sh install.sh` inside; no Rust toolchain needed.
 
 Quick start:
 

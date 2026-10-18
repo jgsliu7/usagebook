@@ -60,7 +60,7 @@ jobs:
           package: usagebook-cli
           target: ${{ matrix.target }}
           archive: usagebook-${{ matrix.target }}
-          include: README.md,INSTALL.md,CHANGELOG.md,SECURITY.md,LICENSE,THIRD_PARTY_LICENSES.md,install.sh,docs
+          include: README.md,README.en.md,INSTALL.md,CHANGELOG.md,SECURITY.md,LICENSE,THIRD_PARTY_LICENSES.md,install.sh,docs
           leading-dir: true
           checksum: sha256
           locked: true

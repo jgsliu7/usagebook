@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-pub const PARSER_VERSION: &str = "5";
+pub const PARSER_VERSION: &str = "6";
 const SCHEMA_VERSION: i32 = 2;
 const LOCK_PROTOCOL_VERSION: u32 = 1;
 
@@ -79,6 +79,8 @@ impl From<rusqlite::Error> for OpenError {
 impl From<std::io::Error> for OpenError {
     fn from(e: std::io::Error) -> Self { Self::Io(e) }
 }
+impl std::error::Error for OpenError {}
+
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -135,6 +137,14 @@ fn open_connection() -> Result<Connection, OpenError> {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        // sidecar(-wal/-shm)一并收紧(2026-10-17 安全二轮):外部工具或异常时序创建的 0644
+        // sidecar 不会自愈,而 checkpoint 前全部载荷在 WAL 中——每次打开顺带修权
+        let mut side = path.clone().into_os_string();
+        side.push("-wal");
+        let _ = std::fs::set_permissions(std::path::PathBuf::from(side), std::fs::Permissions::from_mode(0o600));
+        let mut side = path.clone().into_os_string();
+        side.push("-shm");
+        let _ = std::fs::set_permissions(std::path::PathBuf::from(side), std::fs::Permissions::from_mode(0o600));
     }
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let version = get_schema_version(&conn)?;
@@ -210,7 +220,6 @@ pub fn state_lock_path() -> PathBuf {
     path.push(".lock");
     PathBuf::from(path)
 }
-fn db_path() -> PathBuf { state_db_path() }
 
 pub fn incremental_enabled() -> bool {
     match std::env::var("USAGEBOOK_INCREMENTAL") {
@@ -749,7 +758,7 @@ pub struct DoctorSnapshot {
 }
 
 pub fn doctor_snapshot() -> DoctorSnapshot {
-    let path = db_path();
+    let path = state_db_path();
     let db_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let cell_peek = store_cell();
     let guard_peek = cell_peek.lock().unwrap_or_else(|e| e.into_inner());

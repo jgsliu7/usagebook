@@ -37,7 +37,7 @@ pub const SOURCE_CATALOG: &[SourceInfo] = &[
     SourceInfo { id: "kimi",      label: "Kimi Code",      tier: SourceTier::Verified },
     SourceInfo { id: "zcode",     label: "ZCode",          tier: SourceTier::Verified },
     SourceInfo { id: "workbuddy", label: "WorkBuddy",      tier: SourceTier::Verified },
-    SourceInfo { id: "dsh",       label: "DeepSeek Code",   tier: SourceTier::Verified },
+    SourceInfo { id: "dsh",       label: "DeepSeek Harness", tier: SourceTier::Verified },
     SourceInfo { id: "minimax",   label: "MiniMax Code",   tier: SourceTier::Verified },
     SourceInfo { id: "omp",       label: "oh-my-pi",       tier: SourceTier::Verified },
     SourceInfo { id: "pi",        label: "pi",             tier: SourceTier::Verified },
