@@ -1,6 +1,6 @@
 # usagebook 安装与使用
 
-首发以 **macOS** 为主。Windows 保留实验性兼容，尚未完成实机验收；Linux 也未承诺完整来源兼容。本页所有步骤都可由用户或 AI 编程助手执行；只有命令实际成功才能汇报安装成功。
+首发以 **macOS** 为主；Linux 可从源码构建，未承诺完整来源兼容。Windows 当前不可用：自动测试尚未通过，暂不提供发行包。本页所有步骤都可由用户或 AI 编程助手执行；只有命令实际成功才能汇报安装成功。
 
 ## 1. 选择安装方式
 
@@ -41,7 +41,7 @@ cd usagebook
 
 ### macOS：从本地解压包安装
 
-当前版本尚未发布。发行包可用后，从 [本项目 Releases](https://github.com/jgsliu7/usagebook/releases) 下载 `universal-apple-darwin` 包及对应 `.sha256` 文件；通用包包含 Apple Silicon 和 Intel 两种架构。先在下载目录用 `shasum -a 256 -c <校验和文件名>` 校验，再完整解压。
+从 [本项目 Releases](https://github.com/jgsliu7/usagebook/releases) 下载 `universal-apple-darwin` 包及对应 `.sha256` 文件；通用包包含 Apple Silicon 和 Intel 两种架构。Linux 用户下载 `x86_64-unknown-linux-gnu` 包，步骤相同。先在下载目录用 `shasum -a 256 -c <校验和文件名>` 校验，再完整解压。
 
 进入解压目录运行：
 
@@ -139,9 +139,9 @@ sh install.sh
 
 发行包用户下载并校验新包、完整解压，在新包目录重新运行 `sh install.sh`。若使用自定义 `--prefix`，更新时传入相同目录。更新不会删除缓存或原始数据。
 
-升级/降级与本地状态库：状态库只是扫描加速缓存，统计真相始终在各工具的原始日志中。当前代次使用 `~/.usagebook/state.db.cache-p5-s2-l1/state.db`；解析语义、数据库结构或锁协议不兼容时会使用另一个目录，首次扫描重建。旧 `state.db` 和其他代次目录不会被读取、迁移或清理，因此新旧程序采用相同配置时可以同时运行。请勿将旧程序人为指向新版的实际库文件。
+升级/降级与本地状态库：状态库只是扫描加速缓存，统计真相始终在各工具的原始日志中。当前代次使用 `~/.usagebook/state.db.cache-p6-s2-l1/state.db`；解析语义、数据库结构或锁协议不兼容时会使用另一个目录，首次扫描重建。旧 `state.db` 和其他代次目录不会被读取、迁移或清理，因此新旧程序采用相同配置时可以同时运行。请勿将旧程序人为指向新版的实际库文件。
 
-`USAGEBOOK_STATE_DB` 现在是逻辑基址：`/x/custom.db` 对应 `/x/custom.db.cache-p5-s2-l1/state.db`，这是自定义路径配置的兼容变化；以 `usagebook doctor` 显示的实际路径为准。数据库连接整个生命周期持有目录外的稳定 `.lock` 文件锁。仅在所有使用者连接关闭、取得独占锁且确认损坏后，才会整体移动目录为 `<版本目录>.bad-<时间戳>-<序号>` 并重建。其他进程仍在使用，或出现锁冲突、权限、磁盘满等错误时，本进程改为全量扫描，不把这些错误当作损坏。当前代次的损坏备份最多保留三份。需要手动清理缓存或锁文件时，先停止所有使用该代次的 usagebook 进程。
+`USAGEBOOK_STATE_DB` 现在是逻辑基址：`/x/custom.db` 对应 `/x/custom.db.cache-p6-s2-l1/state.db`，这是自定义路径配置的兼容变化；以 `usagebook doctor` 显示的实际路径为准。数据库连接整个生命周期持有目录外的稳定 `.lock` 文件锁。仅在所有使用者连接关闭、取得独占锁且确认损坏后，才会整体移动目录为 `<版本目录>.bad-<时间戳>-<序号>` 并重建。其他进程仍在使用，或出现锁冲突、权限、磁盘满等错误时，本进程改为全量扫描，不把这些错误当作损坏。当前代次的损坏备份最多保留三份。需要手动清理缓存或锁文件时，先停止所有使用该代次的 usagebook 进程。
 
 卸载脚本安装的程序：
 
@@ -153,17 +153,17 @@ sh "$HOME/.local/share/usagebook/install.sh" --uninstall
 
 Cargo 安装的程序使用 `cargo uninstall usagebook-cli` 卸载。
 
-## 6. Windows 实验性使用
+## 6. Windows 现状
 
-Windows 本轮未实机验收。发行包可用后完整解压，在 PowerShell 进入该目录运行：
+Windows 当前不可用：自动测试尚未通过（源码可编译，测试失败原因排查中），暂不提供发行包；待测试修绿后恢复 `x86_64-pc-windows-msvc` 发行包与本节安装步骤。需要先行尝鲜时可从源码构建（结果未验收），在 PowerShell 运行：
 
 ```powershell
-.\usagebook.exe --version
-.\usagebook.exe doctor
-.\usagebook.exe serve --open
+.\target\release\usagebook.exe --version
+.\target\release\usagebook.exe doctor
+.\target\release\usagebook.exe serve --open
 ```
 
-源码构建需要 Rust MSVC 工具链和 Visual Studio Build Tools（C++ 工具），运行 `cargo build --release --locked`，随后使用 `.\target\release\usagebook.exe`。按 Ctrl-C 停止看板；更新前先停止，再替换解压包；卸载时删除解压目录。来源默认路径和解析结果以实机检查为准，兼容代码存在不等于已完成验收。
+源码构建需要 Rust MSVC 工具链和 Visual Studio Build Tools（C++ 工具），运行 `cargo build --release --locked`。按 Ctrl-C 停止看板；卸载时删除构建目录。来源默认路径和解析结果以实机检查为准，兼容代码存在不等于已完成验收。
 
 ## 7. 常见问题
 

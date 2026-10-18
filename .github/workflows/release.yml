@@ -32,9 +32,10 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             rust_targets: x86_64-unknown-linux-gnu
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-            rust_targets: x86_64-pc-windows-msvc
+          # Windows 暂不发行:CI 测试未修绿(恢复后加回本条目):
+          # - os: windows-2022
+          #   target: x86_64-pc-windows-msvc
+          #   rust_targets: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -120,9 +121,17 @@ jobs:
           pattern: package-*
           path: release-assets
           merge-multiple: true
+      # 只取 CHANGELOG 中对应版本的小节作为发布说明,而非整份文件
+      - name: Extract changelog section for this tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          awk -v ver="$version" 'BEGIN{sec="## [" ver "]"} index($0,sec)==1 {found=1; next} /^## \[/ {found=0} found {print}' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then echo "CHANGELOG 中未找到 [${version}] 小节" >&2; exit 1; fi
       - name: Publish verified release assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "$RELEASE_TAG" --notes-file CHANGELOG.md
+          gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "$RELEASE_TAG" --notes-file RELEASE_NOTES.md

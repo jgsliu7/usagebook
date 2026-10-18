@@ -2,19 +2,22 @@
 
 [English](README.en.md) | **简体中文**
 
+[![CI](https://github.com/jgsliu7/usagebook/actions/workflows/ci.yml/badge.svg)](https://github.com/jgsliu7/usagebook/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
 中文优先、零配置、跨工具的 **AI 编程 token 用量统计与本地看板**：只读解析各 AI 编程工具落盘在本地的数据，统一口径算清"token 花在哪"。
 
 ## 界面语言
 
 看板支持 **简体中文与 English**：header 的 `中文 / EN` 切换，选择按浏览器记忆；非中英浏览器默认 English。终端 CLI 输出当前为中文（多语言在路线图中）。
 
-> 注：看板口径说明中「规范」条目链接的 `docs/数据源档案/` 为中文文档；日期选择控件跟随浏览器语言，不跟随界面语言。
+> 注：`docs/数据源档案/` 为中文文档；日期选择控件跟随浏览器语言，不跟随界面语言。
 
 ![看板](docs/img/dashboard.png)
 
 ## 支持的数据源
 
-v0.1 统计 24 种 AI 编程工具的 token 消耗。**首发以 macOS 为主；Windows 为实验性支持，尚未完成实机验收**，部分来源也有平台限制。各数据源的格式规范见 `docs/数据源档案/`：
+v0.1 统计 24 种 AI 编程工具的 token 消耗。**首发以 macOS 为主；Linux 可从源码构建；Windows 暂不可用（自动测试未通过，暂无发行包）**，部分来源也有平台限制。各数据源的格式规范见 `docs/数据源档案/`：
 
 | 数据源 | 状态 | 说明 |
 |---|---|---|
@@ -39,7 +42,7 @@ v0.1 统计 24 种 AI 编程工具的 token 消耗。**首发以 macOS 为主；
 | Roo Code | 🧪 | 任务消息文件(产品已停运,存量数据) |
 | Kiro | ⏸ | 该工具本地不落 token 计数,暂不支持 |
 
-✅ = 有真实安装数据，逐位对账验证；🧪 = 依上游源码与官方文档实现，通过合成样本测试，未经真实安装验证；⏸ = 暂停支持。分级依据见 `docs/数据源档案/29-源可信度评级报告.md`。
+✅ = 有真实安装数据，逐位对账验证；🧪 = 依上游源码与官方文档实现，未经真实安装验证（合成样本测试尚覆盖不全，逐源验证状态见各档案）；⏸ = 暂停支持。分级依据见 `docs/数据源档案/29-源可信度评级报告.md`。
 
 
 ## 快速开始
@@ -51,7 +54,7 @@ git clone https://github.com/jgsliu7/usagebook && cd usagebook
 sh install.sh && "$HOME/.local/bin/usagebook" serve --open
 ```
 
-也可以从 [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) 下载预编译发行包：解压后运行其中的 `sh install.sh`，不需要 Rust。
+也可以从 [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) 下载预编译发行包（当前提供 macOS 通用包与 Linux x86_64 包；Windows 暂无）：完整解压后运行其中的 `sh install.sh`，不需要 Rust。
 
 看板只在 `127.0.0.1:7878` 提供服务；按 **Ctrl-C** 停止。安装脚本不需要 sudo，不修改 shell 配置，不注册后台服务。已有源码并位于仓库根目录时，复制上面的第二行即可安装并打开看板。关闭浏览器标签页不会停止服务；下次使用仍运行 `"$HOME/.local/bin/usagebook" serve --open`。
 
@@ -114,9 +117,9 @@ usagebook serve --port 8080 --refresh-secs 30
 
 各数据源自己的目录覆盖变量，以 `usagebook doctor` 的展示与各源档案为准。
 
-usagebook 在自己的本地缓存目录保存扫描加速状态，默认位于 `~/.usagebook/` 下按兼容代次命名的子目录（如 `state.db.cache-p5-s2-l1/state.db`）。它仅包含**文件路径**、缓存修订号与白名单用量元数据（模型名、会话标识、token 计数、消息标识、时间戳），**不含任何提示词、工具调用或代码内容**；纯本地，零网络。设置 `USAGEBOOK_INCREMENTAL=off` 可完全停用并退回全量扫描；`usagebook doctor` 显示实际状态库路径及健康信息。
+usagebook 在自己的本地缓存目录保存扫描加速状态，默认位于 `~/.usagebook/` 下按兼容代次命名的子目录（如 `state.db.cache-p6-s2-l1/state.db`）。它仅包含**文件路径**、缓存修订号与白名单用量元数据（模型名、会话标识、token 计数、消息标识、时间戳），**不含任何提示词、工具调用或代码内容**；纯本地，零网络。设置 `USAGEBOOK_INCREMENTAL=off` 可完全停用并退回全量扫描；`usagebook doctor` 显示实际状态库路径及健康信息。
 
-状态库按解析语义与锁协议的兼容代次隔离：兼容的应用版本共享同一目录，代次变更后首轮重新扫描。`USAGEBOOK_STATE_DB` 是逻辑基址，设为 `/x/custom.db` 时实际文件为 `/x/custom.db.cache-p5-s2-l1/state.db`。旧目录不会被读取、迁移或清理；目录旁的同名 `.lock` 文件是生命周期锁，正常使用期间不要删除。
+状态库按解析语义与锁协议的兼容代次隔离：兼容的应用版本共享同一目录，代次变更后首轮重新扫描。`USAGEBOOK_STATE_DB` 是逻辑基址，设为 `/x/custom.db` 时实际文件为 `/x/custom.db.cache-p6-s2-l1/state.db`。旧目录不会被读取、迁移或清理；目录旁的同名 `.lock` 文件是生命周期锁，正常使用期间不要删除。
 
 ### 运行日志
 
@@ -183,6 +186,8 @@ usagebook-core(内核)
 ├── model.rs      统一用量模型:UsageRecord(五桶+口径+成本+去重键)、UsageSource 协议
 ├── sources/      每个数据源一个文件(claude/codex/kimi/…),互不依赖
 ├── common.rs     跨源工具:环境变量多根、递归发现、时间转换、流式行读
+├── store/        增量状态库(SQLite:游标持久化、锁协议、损坏轮转与封顶清理)
+├── logging.rs    运行日志(脱敏闸门、日期+大小滚动、上限自动清理)
 ├── snapshot.rs   快照聚合(小时桶;看板与终端报表共用,含磁盘缓存热启动)
 └── report.rs     终端报表聚合 + JSON
 usagebook-cli(外壳)

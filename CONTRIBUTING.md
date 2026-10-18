@@ -27,7 +27,7 @@
 
 ## 发布前检查
 
-- `cargo test --workspace --locked` 与 `cargo clippy --workspace --all-targets --locked -- -D warnings` 均须通过。CI 还会检查声明的 Rust 最低版本；本机通过不替代 Windows 实机验收。
+- `cargo fmt --all -- --check`、`cargo test --workspace --locked` 与 `cargo clippy --workspace --all-targets --locked -- -D warnings` 均须通过。CI 还会检查声明的 Rust 最低版本；本机通过不替代 Windows 实机验收。
 - 修改 `Cargo.lock` 后运行 `python3 scripts/collect_licenses.py`，提交更新后的 `THIRD_PARTY_LICENSES.md`。它保留锁定版本 crates.io 原包中的许可文件，并包含内嵌图表库的对应版本许可；生成器需 Python 3，用户运行程序无需 Python。
 - 更换内嵌 JS 时同步更新 `src/vendor` 对应版权头、许可文件和生成器中的版本/来源。借鉴实现时保留适用的来源与许可义务，改名不能代替许可核对。
 - 在隔离 `--prefix` 中验证 `install.sh` 安装、更新、卸载；不覆盖日常使用的安装，不用真实日志测试安装步骤。

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "usagebook 内核:统一用量模型 + 数据源适配器框架"
 
 [features]

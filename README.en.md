@@ -2,9 +2,12 @@
 
 [简体中文](README.md) | **English** — the Chinese README is the authoritative version; this condensed translation may lag behind it.
 
+[![CI](https://github.com/jgsliu7/usagebook/actions/workflows/ci.yml/badge.svg)](https://github.com/jgsliu7/usagebook/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
 usagebook parses the on-disk data of 24 AI coding tools — read-only, zero config — and answers "where did my tokens go" under a unified methodology. Everything runs locally on your machine; data never leaves it.
 
-- **24 scannable sources** (17 verified on real machines + 7 per upstream implementation), 1 suspended. macOS first; Windows is experimental and not yet validated on real hardware.
+- **24 scannable sources** (17 verified on real machines + 7 per upstream implementation), 1 suspended. macOS first; Linux builds from source; Windows is not usable yet (automated tests failing, no prebuilt archive).
 - **Dashboard**: `usagebook serve` starts a local-only web dashboard at `http://127.0.0.1:7878` — daily/hourly trends, calendar week/month windows, per-source and per-model breakdowns, 10K/100M (万/亿) or K/M/B number scales. The auto-refresh selector (10s/30s/1min/off) directly drives the server's rescan cadence while the page keeps polling; `--refresh-secs` is the fallback when no dashboard is polling.
 - **Interface language**: the dashboard supports **English and 简体中文** — toggle `中文 / EN` in the header; your choice is remembered per browser. Non-zh/en browsers default to English.
 
@@ -29,11 +32,11 @@ usagebook parses the on-disk data of 24 AI coding tools — read-only, zero conf
 | Kilo Code | ✅ | SQLite message store |
 | Hermes | ✅ | SQLite session stats |
 | OpenClaw | ✅ | SQLite event stream |
-| Grok Build / Amp / Codebuff / Droid / Qoder | 🧪 | implemented from upstream sources/docs, fixture-tested, not verified on real machines |
+| Grok Build / Amp / Codebuff / Droid / Qoder | 🧪 | implemented from upstream sources/docs, not verified on real machines |
 | Roo Code | 🧪 | task message files (product discontinued; existing data) |
 | Kiro | ⏸ | the tool stores no local token counts; unsupported for now |
 
-✅ = verified digit-by-digit against a real installation · 🧪 = implemented from upstream source code & official docs, fixture-tested, not machine-verified · ⏸ = suspended. Per-source dossiers (Chinese) live in `docs/数据源档案/`.
+✅ = verified digit-by-digit against a real installation · 🧪 = implemented from upstream source code & official docs, not machine-verified (synthetic-sample test coverage is still incomplete — per-source status in the Chinese dossiers) · ⏸ = suspended. Per-source dossiers (Chinese) live in `docs/数据源档案/`.
 
 ## Install (from source)
 
@@ -49,7 +52,7 @@ If `~/.local/bin` is not on your PATH, run `export PATH="$HOME/.local/bin:$PATH"
 
 Uninstall: `sh install.sh --uninstall` (removes the binary; your data stays under `~/.usagebook`, delete it manually if you want a full wipe).
 
-Prebuilt archives are available on [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) — unzip and run `sh install.sh` inside; no Rust toolchain needed.
+Prebuilt archives for macOS (universal) and Linux x86_64 are available on [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) — no Windows archive yet. Unzip and run `sh install.sh` inside; no Rust toolchain needed.
 
 Quick start:
 
@@ -59,7 +62,7 @@ usagebook serve      # local dashboard (add --open to launch browser)
 usagebook doctor     # discover source dirs; --check verifies parsing
 ```
 
-> Note: CLI terminal output is currently Chinese only. The dashboard is fully bilingual. `INSTALL.md`, `CONTRIBUTING.md` and `SECURITY.md` are also Chinese only for now.
+> **Note for international users**: CLI terminal output is currently Chinese only (multilingual CLI is on the roadmap). The dashboard is fully bilingual. `INSTALL.md`, `CONTRIBUTING.md` and `SECURITY.md` are also Chinese only for now.
 
 ## Updating
 
@@ -67,7 +70,7 @@ The tool never checks for updates online (zero network at runtime — see `SECUR
 
 ## Privacy & local state
 
-usagebook keeps scan-acceleration state at `~/.usagebook/ (logical base path; derived cache files live alongside)`: file paths and a whitelist of usage metadata (model names, session ids, token counts, message ids, timestamps) only — **never prompts, tool calls, or code content**. Purely local, zero network. Set `USAGEBOOK_INCREMENTAL=off` to disable it entirely, or point `USAGEBOOK_DATA_DIR` elsewhere.
+usagebook keeps scan-acceleration state at `~/.usagebook/` (logical base path; derived cache files live alongside): file paths and a whitelist of usage metadata (model names, session ids, token counts, message ids, timestamps) only — **never prompts, tool calls, or code content**. Purely local, zero network. Set `USAGEBOOK_INCREMENTAL=off` to disable it entirely, or point `USAGEBOOK_DATA_DIR` elsewhere.
 
 ### Runtime logs
 

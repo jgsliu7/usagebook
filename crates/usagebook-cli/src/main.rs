@@ -65,6 +65,7 @@ const DEFAULT_SERVE_PORT: u16 = 7878;
 /// 仅供 doctor 展示,错列/漏列不影响扫描本身;改各源发现变量时须同步此表。
 const ENV_OVERRIDES: &[&str] = &[
     "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "KIMI_CODE_HOME",
@@ -86,6 +87,7 @@ const ENV_OVERRIDES: &[&str] = &[
     "OPENCLAW_STATE_DIR",
     "GEMINI_DATA_DIR",
     "GEMINI_HOME",
+    "GEMINI_CLI_HOME",
     "COPILOT_HOME",
     "AI_USAGE_VSCODE_ROOTS",
     "CODEBUFF_DATA_DIR",
@@ -240,6 +242,16 @@ fn store_panel_json(s: &usagebook_core::store::DoctorSnapshot) -> serde_json::Va
     })
 }
 
+/// epoch 毫秒 → 本地时间字符串(doctor 终端展示用;无法换算时回退显示原值)。
+fn fmt_local_ms(ms: i64) -> String {
+    use chrono::TimeZone as _;
+    chrono::Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| format!("{ms}"))
+}
+
 fn print_store_panel(s: &usagebook_core::store::DoctorSnapshot) {
     println!(
         "\n增量状态库 —— mode={} · {} ({})",
@@ -268,10 +280,15 @@ fn print_store_panel(s: &usagebook_core::store::DoctorSnapshot) {
             .unwrap_or_else(|| "—".into())
     );
     for (src, n, ms) in &s.files_by_source {
-        println!("  file_state  {:<10} {} 个游标 · 最近更新 {}", src, n, ms);
+        println!(
+            "  file_state  {:<10} {} 个游标 · 最近更新 {}",
+            src,
+            n,
+            fmt_local_ms(*ms)
+        );
     }
     for (src, ms) in &s.sources {
-        println!("  source_state {:<10} 最近更新 {}", src, ms);
+        println!("  source_state {:<10} 最近更新 {}", src, fmt_local_ms(*ms));
     }
 }
 
