@@ -1,0 +1,23 @@
+[package]
+name = "usagebook-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "usagebook CLI —— 各 AI 编程工具 token 用量统计(macOS 优先,Windows 实验性)"
+
+[[bin]]
+name = "usagebook"
+path = "src/main.rs"
+
+[dependencies]
+usagebook-core = { path = "../usagebook-core" }
+clap.workspace = true
+tiny_http.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+regex = "1"

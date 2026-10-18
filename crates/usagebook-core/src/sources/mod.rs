@@ -1,0 +1,27 @@
+//! 数据源适配器集合:每个文件一个源,各自头部标注发现规则/口径/去重依据(对应 docs/数据源档案/ 某档案)。
+//! 新增源的样板参考:grok.rs(纯 JSONL 累计快照+差分)、kimi.rs(复杂状态机)、hermes.rs(简单 SQLite 单库)。
+pub mod amp;
+pub mod claude;
+pub mod copilot;
+pub mod cline;
+pub mod codebuff;
+pub mod codex;
+pub mod droid;
+pub mod dsh;
+pub mod gemini;
+pub mod goose;
+pub mod grok;
+pub mod hermes;
+pub mod kilo;
+pub mod kimi;
+pub mod kiro;
+pub mod minimax;
+pub mod omp;
+pub mod openclaw;
+pub mod opencode;
+pub mod pi;
+pub mod qoder;
+pub mod qwen;
+pub mod roocode;
+pub mod workbuddy;
+pub mod zcode;

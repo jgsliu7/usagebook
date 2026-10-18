@@ -1,0 +1,128 @@
+# Manual dispatch builds downloadable test artifacts only. Tag pushes publish
+# after every build/test/package check succeeds. Runtime never self-updates.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  minimum-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.85
+      - run: cargo check --workspace --all-targets --locked
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Check third-party license inventory
+        if: runner.os == 'Linux'
+        run: python3 scripts/collect_licenses.py --check
+      # The action accepts one target; universal-apple-darwin builds two Apple
+      # targets then invokes lipo. A comma-separated target is not valid here.
+      - name: Build and package without publishing
+        id: package
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: usagebook
+          package: usagebook-cli
+          target: ${{ matrix.target }}
+          archive: usagebook-${{ matrix.target }}
+          include: README.md,INSTALL.md,CHANGELOG.md,SECURITY.md,LICENSE,THIRD_PARTY_LICENSES.md,install.sh,docs
+          leading-dir: true
+          checksum: sha256
+          locked: true
+          dry-run: true
+          dry-run-intended: true
+      - name: Verify packaged files and native executable
+        shell: python
+        env:
+          PACKAGE_ARCHIVE: ${{ steps.package.outputs.tar || steps.package.outputs.zip }}
+          PACKAGE_BASE: ${{ steps.package.outputs.archive }}
+          PACKAGE_CHECKSUM: ${{ steps.package.outputs.sha256 }}
+        run: |
+          import hashlib, os, pathlib, subprocess, tarfile, zipfile
+          archive = pathlib.Path(os.environ['PACKAGE_ARCHIVE'])
+          expected = pathlib.Path(os.environ['PACKAGE_CHECKSUM']).read_text().split()[0]
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected
+          unpack = pathlib.Path(os.environ['RUNNER_TEMP']) / 'usagebook-unpack'
+          unpack.mkdir()
+          if archive.suffix == '.zip':
+              with zipfile.ZipFile(archive) as packed:
+                  packed.extractall(unpack)
+          else:
+              with tarfile.open(archive) as packed:
+                  packed.extractall(unpack, filter='data')
+          folder = unpack / os.environ['PACKAGE_BASE']
+          for name in ['README.md', 'INSTALL.md', 'CHANGELOG.md', 'SECURITY.md', 'LICENSE', 'THIRD_PARTY_LICENSES.md', 'install.sh']:
+              assert (folder / name).is_file(), name
+          binary = folder / ('usagebook.exe' if os.name == 'nt' else 'usagebook')
+          subprocess.run([str(binary), '--version'], check=True)
+          subprocess.run([str(binary), '--help'], check=True)
+          if os.name != 'nt':
+              prefix = pathlib.Path(os.environ['RUNNER_TEMP']) / 'usagebook-install'
+              subprocess.run(['sh', str(folder / 'install.sh'), '--prefix', str(prefix)], check=True)
+              subprocess.run([str(prefix / 'bin/usagebook'), '--version'], check=True)
+              subprocess.run(['sh', str(folder / 'install.sh'), '--prefix', str(prefix)], check=True)
+              subprocess.run(['sh', str(prefix / 'share/usagebook/install.sh'), '--prefix', str(prefix), '--uninstall'], check=True)
+              assert not (prefix / 'bin/usagebook').exists()
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.tar }}
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.sha256 }}
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [build, minimum-rust]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "$RELEASE_TAG" --notes-file CHANGELOG.md

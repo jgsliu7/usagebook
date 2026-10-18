@@ -1,0 +1,25 @@
+# Rust 构建产物
+/target
+code/target
+
+# macOS
+.DS_Store
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 密钥与环境配置(永不入库——本仓未来开源,服务端安全设计 §八;
+# usagebook 是独立 git 仓,根仓的 .gitignore 不作用于这里)
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+secrets.*
+# 本地调试产生的运行日志目录
+logs/
+
+# 本地临时脚本与验证产物(不入库)
+tmp/
