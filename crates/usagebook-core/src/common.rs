@@ -1086,7 +1086,10 @@ pub fn scan_source_cached(
     source: &dyn crate::model::UsageSource,
     roots: &[PathBuf],
 ) -> (Vec<crate::model::UsageRecord>, crate::model::ScanStats) {
-    if matches!(source.id(), "claude" | "codex" | "kimi" | "dsh") {
+    if matches!(
+        source.id(),
+        "claude" | "codex" | "kimi" | "kimi-work" | "dsh"
+    ) {
         return with_incremental_cache(|| source.scan_roots(roots, None));
     }
     let before = source_fingerprint(roots);

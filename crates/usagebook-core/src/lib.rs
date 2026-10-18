@@ -48,6 +48,11 @@ pub const SOURCE_CATALOG: &[SourceInfo] = &[
         tier: SourceTier::Verified,
     },
     SourceInfo {
+        id: "kimi-work",
+        label: "Kimi Work",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
         id: "zcode",
         label: "ZCode",
         tier: SourceTier::Verified,
@@ -168,6 +173,7 @@ pub fn registered_sources() -> Vec<Box<dyn UsageSource>> {
         Box::new(sources::claude::ClaudeSource),
         Box::new(sources::codex::CodexSource),
         Box::new(sources::kimi::KimiSource),
+        Box::new(sources::kimi_work::KimiWorkSource),
         Box::new(sources::zcode::ZcodeSource),
         Box::new(sources::workbuddy::WorkbuddySource),
         Box::new(sources::dsh::DshSource),

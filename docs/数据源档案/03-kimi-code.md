@@ -134,3 +134,31 @@
 ## 9. v1 支持结论
 
 **✅ 支持,首发第一梯队**(中文工具基本盘第一个落地源)。三方闭环:本机字段级(两代命名/协议自描述/四桶/scope=turn)、开源五项目(ccusage 双格式预过滤 + CodeBurn 五元组键为实现蓝本)、官方三页文档。**档案冻结 v1.0,可写适配器。**
+
+## 10. 桌面版(Kimi Work)补记 —— 2026-10-18 本机实证
+
+**触发**:用户报告"正在用 kimi 但台账统计为 0"。排查发现运行的并非 CLI,而是 Kimi 桌面版(Kimi.app 3.2.15,com.moonshot.kimichat);`~/.kimi-code` 最新会话停在 2026-10-03,当日实际用量写在下述桌面根。
+
+### 10.1 产品与数据根关系
+
+- **Kimi Work ≠ Kimi Code**(两个产品):Work = 桌面版知识工作平台(内置智能体代号 daimon);Code = 编程 CLI。但 daimon 的执行引擎**内嵌完整 kimi-code 运行时**,数据路径自证:`…/daimon-share/daimon/runtime/kimi-code/home`。
+- **桌面版数据根(macOS 实证)**:`~/Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home`(应用支持目录,路径含空格;位于 Electron user-data 旁,不随 app 更新漂移)。
+- 与 `~/.kimi-code` **互不相通**(各自独立 device_id/credentials;6 月的 `~/.kimi → ~/.kimi-code` 迁移不涉及桌面根)。
+- Windows 桌面版数据根**未实证**,暂以 `KIMI_WORK_HOME` 环境变量手工指定(全源均未在 Windows 验证)。
+
+### 10.2 布局与格式(与 CLI 新格式的异同)
+
+| 项 | 桌面版实证 | 与 CLI 对比 |
+|---|---|---|
+| 目录层级 | `sessions/wd_<slug>_<hash>/<会话>/agents/<agent>/wire.jsonl` | 同构 |
+| 会话目录命名 | `conv-<hex>` / `ctitle-<uuid>`(标题生成后台调用独立会话) | **无 session_/ses_ 前缀**,session_id 原样保留即天然可区分 |
+| 行格式 | metadata/llm.request/usage.record 逐位一致;time 毫秒 | 同(§3 新格式) |
+| 模型实证 | k3-agent / k3-agent-swarm / daimon-kimi-code(llm.request.model) | CLI 本机为 kimi-for-coding/k3 |
+| 新行型 | `tools.register_user_tool`(本机 880/8951 行,插件注册事件,非用量)→ 收编 KNOWN_TYPES | CLI 语料未见 |
+| 本机体量 | 35 个 wire.jsonl / 8951 行 / 874 条用量 / 41M;历史自 2026-06-06(时点 2026-10-18 15:45,活库持续增长) | CLI 根 418 文件 / 9384 条(同时点) |
+
+### 10.3 实现决策:双源分开统计
+
+- **拆两个源 id**:`kimi`(CLI,双根 ~/.kimi-code + ~/.kimi + KIMI_CODE_HOME)与 `kimi-work`(桌面根 + KIMI_WORK_HOME)。理由:产品口径分开呈现;引擎/格式/计费同源,无需第二套解析。
+- **共用扫描核**:kimi.rs 抽出 `scan_kimi_wire(source_id, empty_note, roots, max_files)`;source_id 同时用作记录 source、增量缓存命名空间、去重键前缀(`kimi-work:{session}:{agent}:{line}:{ordinal}`),两源互不串扰;报表"按工具"维度天然分行。
+- **PARSER_VERSION 6→7**:收编 `tools.register_user_tool` 改变投影白名单行为(未知→已知,L1 缓存内容变化),按不变式 8 bump,触发一次全量重建(~12s,语义不变)。

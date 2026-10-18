@@ -2,6 +2,7 @@
 
 ## [未发布]
 
+- 新增数据源 **Kimi Work**(`kimi-work`):Kimi 桌面版内置智能体(daimon)内嵌的 kimi-code 运行时,与 Kimi Code(CLI)分开统计,共用同一扫描核。数据根仅 macOS 实证(应用支持目录 `kimi-desktop/daimon-share/…/runtime/kimi-code/home`),其余平台可用 `KIMI_WORK_HOME` 指定。Kimi Work 语料新行型 `tools.register_user_tool` 收编为已知非用量类型(CLI 语料未见该行型;PARSER_VERSION 6→7,升级后首轮扫描自动全量重建增量库,约 12s)。
 - 看板与终端报表不再展示费用金额:移除来源表"成本$"列、会话基线列表的成本列及相关文案(各家工具计价差异很大,源内金额覆盖不全且不等于实际账单,展示易误导;金额字段保留在本地数据中,不展示、不上传)
 
 ## [0.1.0] - 2026-10-18

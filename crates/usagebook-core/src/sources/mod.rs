@@ -14,6 +14,7 @@ pub mod grok;
 pub mod hermes;
 pub mod kilo;
 pub mod kimi;
+pub mod kimi_work;
 pub mod kiro;
 pub mod minimax;
 pub mod omp;

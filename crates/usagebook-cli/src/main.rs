@@ -69,6 +69,7 @@ const ENV_OVERRIDES: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "KIMI_CODE_HOME",
+    "KIMI_WORK_HOME",
     "ZCODE_HOME",
     "WORKBUDDY_HOME",
     "DSH_HOME",

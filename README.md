@@ -17,13 +17,14 @@
 
 ## 支持的数据源
 
-v0.1 统计 24 种 AI 编程工具的 token 消耗。**首发以 macOS 为主；Linux 可从源码构建；Windows 暂不可用（自动测试未通过，暂无发行包）**，部分来源也有平台限制。各数据源的格式规范见 `docs/数据源档案/`：
+v0.1 统计 25 种 AI 编程工具的 token 消耗。**首发以 macOS 为主；Linux 可从源码构建；Windows 暂不可用（自动测试未通过，暂无发行包）**，部分来源也有平台限制。各数据源的格式规范见 `docs/数据源档案/`：
 
 | 数据源 | 状态 | 说明 |
 |---|---|---|
 | Claude Code | ✅ | 会话转录 |
 | Codex CLI | ✅ | 会话事件流 |
 | Kimi Code | ✅ | 双根双格式会话流 |
+| Kimi Work | ✅ | Kimi 桌面版内嵌 kimi-code 运行时（仅 macOS 实证） |
 | ZCode | ✅ | SQLite 用量账本 |
 | WorkBuddy | ✅ | 会话转录 + 用量行 |
 | DeepSeek Harness | ✅ | 压缩会话流(zstd) |

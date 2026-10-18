@@ -14,7 +14,8 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-pub const PARSER_VERSION: &str = "6";
+/// 7:kimi-work 源接入(桌面版内嵌运行时)+ kimi 核收编 tools.register_user_tool(§10)。
+pub const PARSER_VERSION: &str = "7";
 const SCHEMA_VERSION: i32 = 2;
 const LOCK_PROTOCOL_VERSION: u32 = 1;
 

@@ -5,9 +5,9 @@
 [![CI](https://github.com/jgsliu7/usagebook/actions/workflows/ci.yml/badge.svg)](https://github.com/jgsliu7/usagebook/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-usagebook parses the on-disk data of 24 AI coding tools — read-only, zero config — and answers "where did my tokens go" under a unified methodology. Everything runs locally on your machine; data never leaves it.
+usagebook parses the on-disk data of 25 AI coding tools — read-only, zero config — and answers "where did my tokens go" under a unified methodology. Everything runs locally on your machine; data never leaves it.
 
-- **24 scannable sources** (17 verified on real machines + 7 per upstream implementation), 1 suspended. macOS first; Linux builds from source; Windows is not usable yet (automated tests failing, no prebuilt archive).
+- **25 scannable sources** (18 verified on real machines + 7 per upstream implementation), 1 suspended. macOS first; Linux builds from source; Windows is not usable yet (automated tests failing, no prebuilt archive).
 - **Dashboard**: `usagebook serve` starts a local-only web dashboard at `http://127.0.0.1:7878` — daily/hourly trends, calendar week/month windows, per-source and per-model breakdowns, 10K/100M (万/亿) or K/M/B number scales. The auto-refresh selector (10s/30s/1min/off) directly drives the server's rescan cadence while the page keeps polling; `--refresh-secs` is the fallback when no dashboard is polling.
 - **Interface language**: the dashboard supports **English and 简体中文** — toggle `中文 / EN` in the header; your choice is remembered per browser. Non-zh/en browsers default to English.
 
@@ -18,6 +18,7 @@ usagebook parses the on-disk data of 24 AI coding tools — read-only, zero conf
 | Claude Code | ✅ | session transcripts |
 | Codex CLI | ✅ | session event streams |
 | Kimi Code | ✅ | dual-root, dual-format session streams |
+| Kimi Work | ✅ | kimi-code runtime embedded in the Kimi desktop app (macOS only, machine-verified) |
 | ZCode | ✅ | SQLite usage ledger |
 | WorkBuddy | ✅ | session transcripts + usage lines |
 | DeepSeek Harness | ✅ | zstd-compressed session streams |
