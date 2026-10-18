@@ -1,12 +1,12 @@
 # usagebook
 
+[English](README.en.md) | **简体中文**
+
 中文优先、零配置、跨工具的 **AI 编程 token 用量统计与本地看板**：只读解析各 AI 编程工具落盘在本地的数据，统一口径算清"token 花在哪"。
 
-> **English**: usagebook is an offline token usage dashboard for AI coding tools (24 scannable sources + 1 suspended). macOS first; Windows is experimental and awaits real-device acceptance. Read-only source access, zero config. **[Read the English README →](README.en.md)**
+## 界面语言
 
-## 界面语言 / Interface Language
-
-看板支持 **简体中文与 English**：header 的 `中文 / EN` 切换，选择按浏览器记忆；非中英浏览器默认 English。终端 CLI 输出当前为中文（多语言在路线图中）。The dashboard ships in both 简体中文 and English — toggle `中文 / EN` in the header. CLI output is currently Chinese only.
+看板支持 **简体中文与 English**：header 的 `中文 / EN` 切换，选择按浏览器记忆；非中英浏览器默认 English。终端 CLI 输出当前为中文（多语言在路线图中）。
 
 > 注：看板口径说明中「规范」条目链接的 `docs/数据源档案/` 为中文文档；日期选择控件跟随浏览器语言，不跟随界面语言。
 

@@ -1,6 +1,6 @@
 # usagebook
 
-**English**（简体中文见 [README.md](README.md)——**中文版 README 为权威版本**,本页是精简翻译,可能滞后）
+[简体中文](README.md) | **English** — the Chinese README is the authoritative version; this condensed translation may lag behind it.
 
 usagebook parses the on-disk data of 24 AI coding tools — read-only, zero config — and answers "where did my tokens go" under a unified methodology. Everything runs locally on your machine; data never leaves it.
 
