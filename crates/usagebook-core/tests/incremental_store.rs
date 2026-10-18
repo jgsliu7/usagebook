@@ -2,14 +2,14 @@
 //! 测试手法 注):L1a/L1b 为进程级静态,以 __reset_caches_for_tests + store::reset_for_tests
 //! 模拟"新进程";env 全局 → 全部用例串行(ENV_LOCK)。
 
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 use usagebook_core::common::{
     cached_usage_file, with_incremental_cache, CacheOutcome, FileParser, UsageLines,
 };
 use usagebook_core::model::ScanStats;
 use usagebook_core::store;
-use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -32,11 +32,17 @@ fn project_identity(v: &serde_json::Value) -> Option<serde_json::Value> {
 }
 
 fn parser() -> FileParser {
-    FileParser { project: project_identity, keep: |_| true }
+    FileParser {
+        project: project_identity,
+        keep: |_| true,
+    }
 }
 
 /// 单轮调用:重置进程级状态(=新进程),设 env,跑一次缝并记账。
-fn round(state_db: &std::path::Path, file: &std::path::Path) -> (ArcProxy, CacheOutcome, ScanStats) {
+fn round(
+    state_db: &std::path::Path,
+    file: &std::path::Path,
+) -> (ArcProxy, CacheOutcome, ScanStats) {
     std::env::set_var("USAGEBOOK_STATE_DB", state_db);
     std::env::remove_var("USAGEBOOK_INCREMENTAL");
     store::reset_for_tests();
@@ -44,7 +50,10 @@ fn round(state_db: &std::path::Path, file: &std::path::Path) -> (ArcProxy, Cache
     run_once(file)
 }
 
-fn round_off(state_db: &std::path::Path, file: &std::path::Path) -> (ArcProxy, CacheOutcome, ScanStats) {
+fn round_off(
+    state_db: &std::path::Path,
+    file: &std::path::Path,
+) -> (ArcProxy, CacheOutcome, ScanStats) {
     std::env::set_var("USAGEBOOK_STATE_DB", state_db);
     std::env::set_var("USAGEBOOK_INCREMENTAL", "off");
     store::reset_for_tests();
@@ -62,8 +71,15 @@ impl ArcProxy {
 fn run_once(file: &std::path::Path) -> (ArcProxy, CacheOutcome, ScanStats) {
     let p = parser();
     let (lines, outcome) = with_incremental_cache(|| {
-        cached_usage_file("tfx", file, Some(FileParser { project: p.project, keep: p.keep }),
-            || usagebook_core::common::read_usage_jsonl_committed(file, p.project, p.keep))
+        cached_usage_file(
+            "tfx",
+            file,
+            Some(FileParser {
+                project: p.project,
+                keep: p.keep,
+            }),
+            || usagebook_core::common::read_usage_jsonl_committed(file, p.project, p.keep),
+        )
     });
     let mut stats = ScanStats::default();
     lines.account(&mut stats, outcome);
@@ -73,12 +89,14 @@ fn run_once(file: &std::path::Path) -> (ArcProxy, CacheOutcome, ScanStats) {
 fn bump_mtime(path: &std::path::Path) {
     let later = SystemTime::now() + Duration::from_secs(2);
     let f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-    f.set_times(std::fs::FileTimes::new().set_modified(later)).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(later))
+        .unwrap();
 }
 
 fn set_mtime(path: &std::path::Path, t: SystemTime) {
     let f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-    f.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(t))
+        .unwrap();
 }
 
 fn write_lines(path: &std::path::Path, lines: &[&str], terminated: bool) {
@@ -116,7 +134,10 @@ fn fresh_insert_persists_cursor() {
     assert_eq!(outcome, CacheOutcome::FreshLoad);
     assert_eq!(stats.rewrote, 1);
     let row = store::file_row("tfx", &file).expect("游标必须落库");
-    assert_eq!(row.cursor.byte_offset as u64, std::fs::metadata(&file).unwrap().len());
+    assert_eq!(
+        row.cursor.byte_offset as u64,
+        std::fs::metadata(&file).unwrap().len()
+    );
 
     // 新进程语义(L1/L2 皆冷)且无变更 → Unchanged 零读。
     let (_, outcome2, stats2) = round(&db, &file);
@@ -140,7 +161,11 @@ fn tail_append_only_reads_new_bytes() {
     let (lines, outcome, stats) = round(&db, &file);
     assert_eq!(outcome, CacheOutcome::Appended);
     let tail_bytes = 2 * (r#"{"a":2}"#.len() as u64 + 1);
-    assert!(stats.bytes_read <= tail_bytes + 4096, "bytes_read={} 应≤尾部+窗口", stats.bytes_read);
+    assert!(
+        stats.bytes_read <= tail_bytes + 4096,
+        "bytes_read={} 应≤尾部+窗口",
+        stats.bytes_read
+    );
     assert_eq!(lines.events().len(), 3);
     // 载荷推进:下一轮(无变更)Unchanged 且事件数=3。
     let (lines2, o2, s2) = round(&db, &file);
@@ -162,7 +187,10 @@ fn pending_tail_not_committed() {
     assert_eq!(o1, CacheOutcome::FreshLoad);
     assert_eq!(l1.events().len(), 2, "无换行末行本轮可见");
     let row = store::file_row("tfx", &file).unwrap();
-    assert!(row.cursor.byte_offset < std::fs::metadata(&file).unwrap().len(), "游标不得越过未终结尾段");
+    assert!(
+        row.cursor.byte_offset < std::fs::metadata(&file).unwrap().len(),
+        "游标不得越过未终结尾段"
+    );
     let stored = store::decode_lines(&row.events, row.events_len).unwrap();
     assert_eq!(stored.events.len(), 1, "载荷只含已提交前缀");
 
@@ -170,7 +198,11 @@ fn pending_tail_not_committed() {
     let old_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
     let _ = old_mtime;
     let (l2, o2, _) = round(&db, &file);
-    assert_eq!(o2, CacheOutcome::Appended, "pending 残留必须走 AppendFrom 而非 Unchanged");
+    assert_eq!(
+        o2,
+        CacheOutcome::Appended,
+        "pending 残留必须走 AppendFrom 而非 Unchanged"
+    );
     assert_eq!(l2.events().len(), 2, "pending 行不得消失");
 
     // —— P0 形态:pending 行不产出事件(撕裂写/坏行)不得下溢/丢事件 ——
@@ -178,16 +210,26 @@ fn pending_tail_not_committed() {
         let dir2 = temp_dir("f3-torn");
         let file2 = dir2.join("s.jsonl");
         // 末行为无 \n 的半行坏 JSON(撕裂写残留, 场景族)。
-        std::fs::write(&file2, concat!(
-            r#"{"a":1}"#, "\n",
-            r#"{"a":2}"#, "\n",
-            r#"{"type":"assistant","broken"#,
-        )).unwrap();
+        std::fs::write(
+            &file2,
+            concat!(
+                r#"{"a":1}"#,
+                "\n",
+                r#"{"a":2}"#,
+                "\n",
+                r#"{"type":"assistant","broken"#,
+            ),
+        )
+        .unwrap();
         bump_mtime(&file2);
         let db2 = dir2.join("state.db");
         let (l1, o1, _) = round(&db2, &file2);
         assert_eq!(o1, CacheOutcome::FreshLoad);
-        assert_eq!(l1.events().len(), 2, "坏 pending 行不产出事件,已提交 2 事件");
+        assert_eq!(
+            l1.events().len(),
+            2,
+            "坏 pending 行不产出事件,已提交 2 事件"
+        );
         // 无变更下一轮:判 AppendFrom 续读 pending 坏行——不得 panic、事件数不变。
         let (l2, o2, s2) = round(&db2, &file2);
         assert_eq!(o2, CacheOutcome::Appended);
@@ -198,7 +240,10 @@ fn pending_tail_not_committed() {
     // 补 \n 终结上轮尾行,再追加一行新事件:恰好提交一次,总数无重复。
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
         write!(f, "\n{{\"a\":3}}\n").unwrap();
     }
     bump_mtime(&file);
@@ -240,9 +285,15 @@ fn same_size_rewrite_detected() {
     round(&db, &file);
 
     write_lines(&file, &[r#"{"b":1}"#], true); // 等长不同内容
-    assert_eq!(std::fs::metadata(&file).unwrap().len(), r#"{"a":1}"#.len() as u64 + 1);
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().len(),
+        r#"{"a":1}"#.len() as u64 + 1
+    );
     let (_, o2, s2) = round(&db, &file);
-    assert!(matches!(o2, CacheOutcome::Replay("identity" | "same-size-change")));
+    assert!(matches!(
+        o2,
+        CacheOutcome::Replay("identity" | "same-size-change")
+    ));
     assert_eq!(s2.replayed, 1);
 }
 
@@ -269,8 +320,11 @@ fn prefix_window_limitation() {
     #[cfg(unix)]
     {
         let (_, o2, _) = round(&db, &file);
-        assert_eq!(o2, CacheOutcome::Replay("identity"),
-            "unix:窗口外前缀改写被 identity 捕获(identity 分支)");
+        assert_eq!(
+            o2,
+            CacheOutcome::Replay("identity"),
+            "unix:窗口外前缀改写被 identity 捕获(identity 分支)"
+        );
     }
 
     // 窗口盲区本体(Windows/identity 缺失语义):judge 纯函数,seal 窗口外不可检出。
@@ -278,17 +332,23 @@ fn prefix_window_limitation() {
     // 构造:mtime/size 相等但 seal 失配(窗口外改写的可检出面=窗口内;窗口外 seal 仍匹配旧值)。
     // 直接证明"identity=None 时 step3 通过 → Unchanged":局限固化。
     let verdict = usagebook_core::store::judge(
-        stamp.mtime_ns(), stamp.size(), None,
+        stamp.mtime_ns(),
+        stamp.size(),
+        None,
         Some(&usagebook_core::store::FileCursor {
-            mtime_ns: stamp.mtime_ns(), size: stamp.size(),
+            mtime_ns: stamp.mtime_ns(),
+            size: stamp.size(),
             byte_offset: stamp.size(),
             tail_seal: usagebook_core::store::tail_seal(&[]),
             identity: None,
         }),
         |_| unreachable!("Unchanged 不得读窗口"),
     );
-    assert_eq!(verdict, usagebook_core::store::Verdict::Unchanged,
-        "identity 缺失时窗口外前缀改写判 Unchanged(已知局限,Windows 面)");
+    assert_eq!(
+        verdict,
+        usagebook_core::store::Verdict::Unchanged,
+        "identity 缺失时窗口外前缀改写判 Unchanged(已知局限,Windows 面)"
+    );
 }
 
 // —— 7. corrupt_db_rotates:坏库轮转自愈 ——
@@ -306,14 +366,19 @@ fn corrupt_db_rotates() {
 
     let (_, o1, _) = round(&db, &file);
     assert_eq!(o1, CacheOutcome::FreshLoad, "坏库轮转后正常全量读");
-    let bad: Vec<_> = std::fs::read_dir(&dir).unwrap()
+    let bad: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().contains(".bad-"))
         .collect();
     assert!(!bad.is_empty(), "必须存在 .bad-<ms> 轮转文件");
     let snap = store::doctor_snapshot();
     assert_eq!(snap.rotations, 1);
-    assert_eq!(store::file_row("tfx", &file).map(|_| ()), Some(()), "重建后游标照常落库");
+    assert_eq!(
+        store::file_row("tfx", &file).map(|_| ()),
+        Some(()),
+        "重建后游标照常落库"
+    );
 }
 
 // —— 8. incremental_off_switch:off 时库零写入(不建库) ——
@@ -349,11 +414,16 @@ fn kimi_ordinal_continues() {
     let (l2, o2, _) = round(&db, &file);
     assert_eq!(o2, CacheOutcome::Appended);
     let ordinals: Vec<u64> = l2.events().iter().map(|(n, _)| *n).collect();
-    assert_eq!(ordinals, vec![1, 2, 3, 4], "ordinal 续算必须连续无重复无跳号(空行不计)");
+    assert_eq!(
+        ordinals,
+        vec![1, 2, 3, 4],
+        "ordinal 续算必须连续无重复无跳号(空行不计)"
+    );
     let stored = store::decode_lines(
         &store::file_row("tfx", &file).unwrap().events,
         store::file_row("tfx", &file).unwrap().events_len,
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(stored.total, 4, "空行不计 total(kimi line_no 口径)");
 }
 
@@ -374,7 +444,9 @@ fn parser_namespace_mismatch_does_not_wipe() {
     assert_eq!(s2.rewrote, 1);
     assert_eq!(store::doctor_snapshot().mode, "incompatible-cache");
     let conn = rusqlite::Connection::open(store::state_db_path()).unwrap();
-    let count: i64 = conn.query_row("SELECT count(*) FROM file_state", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM file_state", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 1, "不得清空不匹配的命名空间");
 }
 
@@ -437,13 +509,20 @@ fn semantics_parity_synthetic() {
     std::env::remove_var("USAGEBOOK_INCREMENTAL");
     store::reset_for_tests();
     usagebook_core::common::__reset_caches_for_tests();
-    let (records_on, _) = usagebook_core::common::with_incremental_cache(|| src.scan_roots(&roots, None));
+    let (records_on, _) =
+        usagebook_core::common::with_incremental_cache(|| src.scan_roots(&roots, None));
     assert_eq!(sorted_dbg(&records_off), sorted_dbg(&records_on));
 
     // 追加一行后第二轮(on)仍与 off 全等(覆盖 AppendFrom 合并路径)。
-    append_lines(&proj.join("s1.jsonl"), &[r#"{"type":"assistant","sessionId":"s1","requestId":"r4","timestamp":"2026-10-12T10:03:00+08:00","message":{"id":"msg_w","model":"claude-opus-4-8","usage":{"input_tokens":7,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"stop_reason":"end_turn"}"#]);
+    append_lines(
+        &proj.join("s1.jsonl"),
+        &[
+            r#"{"type":"assistant","sessionId":"s1","requestId":"r4","timestamp":"2026-10-12T10:03:00+08:00","message":{"id":"msg_w","model":"claude-opus-4-8","usage":{"input_tokens":7,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"stop_reason":"end_turn"}"#,
+        ],
+    );
     usagebook_core::common::__reset_caches_for_tests();
-    let (records_on2, _) = usagebook_core::common::with_incremental_cache(|| src.scan_roots(&roots, None));
+    let (records_on2, _) =
+        usagebook_core::common::with_incremental_cache(|| src.scan_roots(&roots, None));
 
     std::env::set_var("USAGEBOOK_INCREMENTAL", "off");
     store::reset_for_tests();
@@ -504,7 +583,6 @@ fn cd_source_l2_reuse() {
     assert!(recs3.len() > recs1.len());
 }
 
-
 // —— 2b. dsh_reload_on_change:reload 源的缝级集成 ——
 #[test]
 fn dsh_reload_on_change() {
@@ -538,7 +616,9 @@ fn dsh_reload_on_change() {
     store::reset_for_tests();
     usagebook_core::common::__reset_caches_for_tests();
     let (l1, o1) = {
-        let (l, o) = with_incremental_cache(|| cached_usage_file("tfx2", &file, None, || reload_load(&file)));
+        let (l, o) = with_incremental_cache(|| {
+            cached_usage_file("tfx2", &file, None, || reload_load(&file))
+        });
         (ArcProxy(l), o)
     };
     assert_eq!(o1, CacheOutcome::FreshLoad);
@@ -548,7 +628,9 @@ fn dsh_reload_on_change() {
     store::reset_for_tests();
     usagebook_core::common::__reset_caches_for_tests();
     let (l2, o2, s2) = {
-        let (l, o) = with_incremental_cache(|| cached_usage_file("tfx2", &file, None, || reload_load(&file)));
+        let (l, o) = with_incremental_cache(|| {
+            cached_usage_file("tfx2", &file, None, || reload_load(&file))
+        });
         let mut st = ScanStats::default();
         l.account(&mut st, o);
         (ArcProxy(l), o, st)
@@ -564,18 +646,23 @@ fn dsh_reload_on_change() {
     store::reset_for_tests();
     usagebook_core::common::__reset_caches_for_tests();
     let (l3, o3, s3) = {
-        let (l, o) = with_incremental_cache(|| cached_usage_file("tfx2", &file, None, || reload_load(&file)));
+        let (l, o) = with_incremental_cache(|| {
+            cached_usage_file("tfx2", &file, None, || reload_load(&file))
+        });
         let mut st = ScanStats::default();
         l.account(&mut st, o);
         (ArcProxy(l), o, st)
     };
-    assert_eq!(o3, CacheOutcome::Replay("reload"), "失配→Rewound(reload),不走 AppendFrom");
+    assert_eq!(
+        o3,
+        CacheOutcome::Replay("reload"),
+        "失配→Rewound(reload),不走 AppendFrom"
+    );
     assert_eq!(s3.replayed, 1);
     assert!(s3.bytes_read >= 15, "整文件重读");
     assert_eq!(l3.events().len(), 2);
     let _ = &l1;
 }
-
 
 // —— 17. gc_dead_rows:扫描前 &[] 不触 L2;发现后清单轮删除死行 ——
 #[test]
@@ -592,8 +679,12 @@ fn gc_dead_rows() {
         round(&db, f);
     }
     let count = |src: &str| -> usize {
-        store::doctor_snapshot().files_by_source.iter()
-            .filter(|(s, _, _)| s == src).map(|(_, n, _)| *n as usize).sum()
+        store::doctor_snapshot()
+            .files_by_source
+            .iter()
+            .filter(|(s, _, _)| s == src)
+            .map(|(_, n, _)| *n as usize)
+            .sum()
     };
     assert_eq!(count("tfx"), 4, "4 文件 4 游标");
 

@@ -8,7 +8,7 @@
 //! 去重键:kiro:{request_id}(§4)
 
 use crate::common::{home, json_u64};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use rusqlite::types::Value as SqlValue;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -86,7 +86,11 @@ impl UsageSource for KiroSource {
         dbs
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], _max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        _max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         // max_files 对本源无意义:sqlite 单库全量读
         let mut stats = ScanStats::default();
         if roots.is_empty() {
@@ -106,7 +110,9 @@ impl UsageSource for KiroSource {
             let conn = match crate::common::open_sqlite_readonly(db) {
                 Ok(c) => c,
                 Err(e) => {
-                    stats.notes.push(format!("{} 打开失败: {}", db.display(), e));
+                    stats
+                        .notes
+                        .push(format!("{} 打开失败: {}", db.display(), e));
                     stats.failed = true;
                     continue;
                 }
@@ -126,9 +132,10 @@ impl UsageSource for KiroSource {
                 .unwrap_or(0)
                 > 0;
             if !has_v2 {
-                stats
-                    .notes
-                    .push(format!("{} 无 conversations_v2 表,忽略(旧版布局待适配)", db.display()));
+                stats.notes.push(format!(
+                    "{} 无 conversations_v2 表,忽略(旧版布局待适配)",
+                    db.display()
+                ));
                 continue;
             }
             let sql = "SELECT conversation_id, value FROM conversations_v2";
@@ -144,7 +151,9 @@ impl UsageSource for KiroSource {
             };
             stats.files_parsed += 1;
             while let Ok(Some(row)) = rows.next() {
-                let vals: Vec<SqlValue> = (0..2).filter_map(|i| row.get::<_, SqlValue>(i).ok()).collect();
+                let vals: Vec<SqlValue> = (0..2)
+                    .filter_map(|i| row.get::<_, SqlValue>(i).ok())
+                    .collect();
                 if vals.len() < 2 {
                     stats.lines_bad_json += 1;
                     continue;
@@ -172,7 +181,9 @@ impl UsageSource for KiroSource {
                     .pointer("/model_info/model_id")
                     .and_then(|x| x.as_str())
                     .map(norm_model);
-                let Some(reqs) = doc.pointer("/user_turn_metadata/requests").and_then(|x| x.as_array())
+                let Some(reqs) = doc
+                    .pointer("/user_turn_metadata/requests")
+                    .and_then(|x| x.as_array())
                 else {
                     continue;
                 };
@@ -230,9 +241,10 @@ impl UsageSource for KiroSource {
             ));
         }
         if no_token_counts > 0 {
-            stats
-                .notes
-                .push(format!("{} 个请求缺 request_start_timestamp_ms,跳过", no_token_counts));
+            stats.notes.push(format!(
+                "{} 个请求缺 request_start_timestamp_ms,跳过",
+                no_token_counts
+            ));
         }
         (records, stats)
     }
@@ -251,11 +263,17 @@ mod tests {
             norm_model("arn:aws:bedrock:us-east-1:123:model/anthropic.claude-sonnet-4-5"),
             "claude-sonnet-4-5"
         );
-        assert_eq!(norm_model("anthropic.claude-haiku-4-5:1"), "claude-haiku-4-5");
-        assert_eq!(norm_model("us.anthropic.claude-sonnet-4-5-20251001-v1:0"), {
-            // us.anthropic. 前缀不在剥除清单,日期段剥离生效
-            "us.anthropic.claude-sonnet-4-5".to_string()
-        });
+        assert_eq!(
+            norm_model("anthropic.claude-haiku-4-5:1"),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(
+            norm_model("us.anthropic.claude-sonnet-4-5-20251001-v1:0"),
+            {
+                // us.anthropic. 前缀不在剥除清单,日期段剥离生效
+                "us.anthropic.claude-sonnet-4-5".to_string()
+            }
+        );
         assert_eq!(norm_model(""), "kiro-cli-agent");
         assert_eq!(norm_model("auto"), "kiro-cli-agent");
     }

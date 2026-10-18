@@ -12,7 +12,7 @@
 //! 成本:requests.cost 口径不明(ccusage 忽略)→ 不取(§6)
 
 use crate::common::{env_roots, flex_to_ms, home, json_u64, walk_with, SnapshotDiff};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use serde_json::Value;
@@ -63,7 +63,11 @@ impl UsageSource for CopilotSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             stats.notes.push("未发现 ~/.copilot 或 COPILOT_HOME".into());
@@ -80,18 +84,21 @@ impl UsageSource for CopilotSource {
             // ===== 首选通道:session-store.db 逐请求(§7.1)=====
             let store_db = r.join("session-store.db");
             if store_db.is_file() {
-                let ledger_rows = scan_session_store(&store_db, &mut records, &mut seen, &mut stats);
+                let ledger_rows =
+                    scan_session_store(&store_db, &mut records, &mut seen, &mut stats);
                 if ledger_rows > 0 {
                     stats.files_seen += 1;
                     stats.files_parsed += 1;
-                    stats
-                        .notes
-                        .push(format!("session-store.db 逐请求通道 {} 行(§7.1,免差分)", ledger_rows));
+                    stats.notes.push(format!(
+                        "session-store.db 逐请求通道 {} 行(§7.1,免差分)",
+                        ledger_rows
+                    ));
                     continue; // 该根独占,session-state/otel 让位防双计
                 }
-                stats
-                    .notes
-                    .push(format!("{} 空/不可读,回退 events.jsonl(§7.1)", store_db.display()));
+                stats.notes.push(format!(
+                    "{} 空/不可读,回退 events.jsonl(§7.1)",
+                    store_db.display()
+                ));
             }
 
             // ===== 通道 1:session-state(§2)=====
@@ -119,13 +126,18 @@ impl UsageSource for CopilotSource {
                             return;
                         };
                         if v.get("type").and_then(|x| x.as_str()) != Some("session.shutdown") {
-                            if v.get("type").and_then(|x| x.as_str()).is_some_and(|t| t.starts_with("session.")) {
+                            if v.get("type")
+                                .and_then(|x| x.as_str())
+                                .is_some_and(|t| t.starts_with("session."))
+                            {
                                 return; // start/resume:已知类型,静默跳过(§2)
                             }
                             stats.lines_unknown_type += 1;
                             return;
                         }
-                        let Some(metrics) = v.pointer("/data/modelMetrics").and_then(|x| x.as_object()) else {
+                        let Some(metrics) =
+                            v.pointer("/data/modelMetrics").and_then(|x| x.as_object())
+                        else {
                             stats.lines_unknown_type += 1;
                             return;
                         };
@@ -134,13 +146,23 @@ impl UsageSource for CopilotSource {
                             .and_then(|x| x.as_str())
                             .and_then(crate::common::iso_to_ms)
                             .unwrap_or(0);
-                        let event_id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let event_id = v
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         for (model, _m) in metrics {
-                            let Some(usage) = _m.pointer("/usage") else { continue };
+                            let Some(usage) = _m.pointer("/usage") else {
+                                continue;
+                            };
                             snaps
                                 .entry((session.clone(), model.clone()))
                                 .or_default()
-                                .push(ShutdownSnap { ts_ms, event_id: event_id.clone(), usage: usage.clone() });
+                                .push(ShutdownSnap {
+                                    ts_ms,
+                                    event_id: event_id.clone(),
+                                    usage: usage.clone(),
+                                });
                         }
                     });
                     stats.files_parsed += 1;
@@ -156,7 +178,8 @@ impl UsageSource for CopilotSource {
                 for s in &seq {
                     last_shutdown.insert((session.clone(), model.clone()), s.ts_ms);
                     let g = |k: &str| json_u64(s.usage.get(k));
-                    let (i_raw, o, rs) = (g("inputTokens"), g("outputTokens"), g("reasoningTokens"));
+                    let (i_raw, o, rs) =
+                        (g("inputTokens"), g("outputTokens"), g("reasoningTokens"));
                     let (cr, cw) = (g("cacheReadTokens"), g("cacheWriteTokens"));
                     let cur = [
                         i_raw.saturating_sub(cr.saturating_add(cw)), // 双减除(§2)
@@ -222,7 +245,10 @@ impl UsageSource for CopilotSource {
                     let a = |k: &str| attrs.get(k);
                     let is_span = v.get("type").and_then(|x| x.as_str()) == Some("span");
                     let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
-                    let event_name = v.pointer("/event.name").and_then(|x| x.as_str()).unwrap_or("");
+                    let event_name = v
+                        .pointer("/event.name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
                     let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
                     // 类型判别(§3)
                     let kind = if is_span
@@ -237,7 +263,10 @@ impl UsageSource for CopilotSource {
                         Some(OtelKind::InferenceLog)
                     } else if !is_span && event_name == "copilot_chat.agent.turn" {
                         Some(OtelKind::AgentTurnLog)
-                    } else if is_span && a("gen_ai.operation.name").and_then(|x| x.as_str()) == Some("invoke_agent") {
+                    } else if is_span
+                        && a("gen_ai.operation.name").and_then(|x| x.as_str())
+                            == Some("invoke_agent")
+                    {
                         Some(OtelKind::AgentSummarySpan)
                     } else {
                         None
@@ -258,12 +287,23 @@ impl UsageSource for CopilotSource {
                         return;
                     }
                     let input_uncached = input.saturating_sub(cr.min(input)); // input 含 cache_read(§3)
-                    // 会话(§5)
-                    let session = ["gen_ai.conversation.id", "copilot_chat.session_id", "copilot_chat.chat_session_id", "session.id", "github.copilot.interaction_id", "gen_ai.response.id"]
-                        .iter()
-                        .find_map(|k| a(k).and_then(|x| x.as_str()))
-                        .map(str::to_string);
-                    let trace = v.get("traceId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                                                              // 会话(§5)
+                    let session = [
+                        "gen_ai.conversation.id",
+                        "copilot_chat.session_id",
+                        "copilot_chat.chat_session_id",
+                        "session.id",
+                        "github.copilot.interaction_id",
+                        "gen_ai.response.id",
+                    ]
+                    .iter()
+                    .find_map(|k| a(k).and_then(|x| x.as_str()))
+                    .map(str::to_string);
+                    let trace = v
+                        .get("traceId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // 模型(§5):response.model > request.model,剥 -1m 后缀
                     let model = ["gen_ai.response.model", "gen_ai.request.model"]
                         .iter()
@@ -279,11 +319,17 @@ impl UsageSource for CopilotSource {
                     let ts_ms = ["endTime", "startTime", "hrTime", "_hrTime", "time"]
                         .iter()
                         .find_map(|k| flex_to_ms(v.get(*k)))
-                        .or_else(|| v.get("timeUnixNano").and_then(|x| x.as_f64()).map(|n| (n / 1e6) as i64))
+                        .or_else(|| {
+                            v.get("timeUnixNano")
+                                .and_then(|x| x.as_f64())
+                                .map(|n| (n / 1e6) as i64)
+                        })
                         .unwrap_or(mtime_ms);
                     let content_key = format!(
                         "copilot:o:{}:{}:{}:{}:{}",
-                        v.get("spanId").and_then(|x| x.as_str()).unwrap_or(trace.as_str()),
+                        v.get("spanId")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or(trace.as_str()),
                         ts_ms,
                         model,
                         input_uncached,
@@ -349,9 +395,13 @@ impl UsageSource for CopilotSource {
             }
         }
 
-        stats.notes.push(format!("session-state 文件 {ss_files} · otel 文件 {otel_files}"));
+        stats.notes.push(format!(
+            "session-state 文件 {ss_files} · otel 文件 {otel_files}"
+        ));
         if !last_shutdown.is_empty() {
-            stats.notes.push(format!("shutdown 快照组 {}(相邻差分)", last_shutdown.len()));
+            stats
+                .notes
+                .push(format!("shutdown 快照组 {}(相邻差分)", last_shutdown.len()));
         }
         (records, stats)
     }
@@ -381,18 +431,26 @@ fn scan_session_store(
                 FROM assistant_usage_events ORDER BY id"
     );
     let Ok(mut stmt) = conn.prepare(&sql) else {
-        stats.notes.push(format!("{} assistant_usage_events 查询构建失败", db.display()));
+        stats.notes.push(format!(
+            "{} assistant_usage_events 查询构建失败",
+            db.display()
+        ));
         stats.failed = true;
         return 0;
     };
     let Ok(mut rows) = stmt.query([]) else {
-        stats.notes.push(format!("{} assistant_usage_events 查询执行失败", db.display()));
+        stats.notes.push(format!(
+            "{} assistant_usage_events 查询执行失败",
+            db.display()
+        ));
         stats.failed = true;
         return 0;
     };
     let mut n = 0usize;
     while let Ok(Some(row)) = rows.next() {
-        let vals: Vec<SqlValue> = (0..11).filter_map(|i| row.get::<_, SqlValue>(i).ok()).collect();
+        let vals: Vec<SqlValue> = (0..11)
+            .filter_map(|i| row.get::<_, SqlValue>(i).ok())
+            .collect();
         if vals.len() < 11 {
             stats.lines_bad_json += 1;
             continue;
@@ -405,7 +463,11 @@ fn scan_session_store(
         let session_id = v_text(&vals[1]).unwrap_or_default();
         let agent_raw = v_text(&vals[2]).unwrap_or_default();
         let model = v_text(&vals[3]).unwrap_or_default();
-        let model = if model.trim().is_empty() { "unknown".into() } else { model };
+        let model = if model.trim().is_empty() {
+            "unknown".into()
+        } else {
+            model
+        };
         let input = v_u64(&vals[4]); // 已含 cacheRead+cacheWrite(§7.3)
         let output_gross = v_u64(&vals[5]); // 已含 reasoning(§7.3)
         let cr = v_u64(&vals[6]);
@@ -428,7 +490,11 @@ fn scan_session_store(
             })
             .unwrap_or(0);
         // 成本(§7.3):美元 ≈ total_nano_aiu/1e9 × 0.01(1 AIU=1 credit=$0.01)
-        let cost = if nano > 0 { Some(nano as f64 / 1e9 * 0.01) } else { None };
+        let cost = if nano > 0 {
+            Some(nano as f64 / 1e9 * 0.01)
+        } else {
+            None
+        };
         let agent = match agent_raw.trim() {
             "" | "main" => None,
             a => Some(a.to_string()),

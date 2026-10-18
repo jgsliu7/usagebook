@@ -7,7 +7,15 @@ use usagebook_core::snapshot::{Buckets, HourRow, ModelAgg, Snapshot, SourceAgg, 
 use usagebook_core::SOURCE_CATALOG;
 
 fn snap() -> Snapshot {
-    let b = Buckets { i: 1, cr: 2, cw: 3, o: 4, r: 1, n: 2, c: 0.5 };
+    let b = Buckets {
+        i: 1,
+        cr: 2,
+        cw: 3,
+        o: 4,
+        r: 1,
+        n: 2,
+        c: 0.5,
+    };
     Snapshot {
         ready: true,
         generated_at_ms: 1,
@@ -16,13 +24,39 @@ fn snap() -> Snapshot {
         source_scans: vec![],
         scan_ms: 2,
         refresh_secs: 30,
-        totals: Totals { b: b.clone(), sessions: 1, cost_official_usd: 0.0, cost_sessions: 0, cost_req_usd: 0.5 },
+        totals: Totals {
+            b: b.clone(),
+            sessions: 1,
+            cost_official_usd: 0.0,
+            cost_sessions: 0,
+            cost_req_usd: 0.5,
+        },
         hours: vec![
-            HourRow { h: "2026-10-09T10".into(), s: "codex".into(), m: "gpt-5".into(), b: b.clone() },
-            HourRow { h: "2026-10-09T11".into(), s: "claude".into(), m: "glm".into(), b },
+            HourRow {
+                h: "2026-10-09T10".into(),
+                s: "codex".into(),
+                m: "gpt-5".into(),
+                b: b.clone(),
+            },
+            HourRow {
+                h: "2026-10-09T11".into(),
+                s: "claude".into(),
+                m: "glm".into(),
+                b,
+            },
         ],
-        per_source: vec![SourceAgg { s: "codex".into(), b: Default::default(), sessions: 1, files: 1, cost_usd: 0.0 }],
-        per_model: vec![ModelAgg { m: "gpt-5".into(), sources: vec!["codex".into()], b: Default::default() }],
+        per_source: vec![SourceAgg {
+            s: "codex".into(),
+            b: Default::default(),
+            sessions: 1,
+            files: 1,
+            cost_usd: 0.0,
+        }],
+        per_model: vec![ModelAgg {
+            m: "gpt-5".into(),
+            sources: vec!["codex".into()],
+            b: Default::default(),
+        }],
         notes: vec![],
         sources: SOURCE_CATALOG,
     }
@@ -41,16 +75,45 @@ fn snapshot_shape_golden() {
     // serve 拼接的前提约定:尾字节必为 '}' 且非空(serve.rs /api_data 分支依赖此)
     assert_eq!(*bytes.last().unwrap(), b'}');
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let mut want = ["ready", "generated_at_ms", "scan_ms", "refresh_secs", "totals", "hours", "per_source", "per_model", "notes", "sources", "local_date", "prior_day_to_now", "source_scans"];
+    let mut want = [
+        "ready",
+        "generated_at_ms",
+        "scan_ms",
+        "refresh_secs",
+        "totals",
+        "hours",
+        "per_source",
+        "per_model",
+        "notes",
+        "sources",
+        "local_date",
+        "prior_day_to_now",
+        "source_scans",
+    ];
     want.sort_unstable();
     assert_eq!(keys(&v), want);
-assert_eq!(keys(&v["hours"][0]), vec!["b", "h", "m", "s"]);
-assert_eq!(keys(&v["hours"][0]["b"]), vec!["c", "cr", "cw", "i", "n", "o", "r"]);
-assert_eq!(keys(&v["totals"]), vec!["b", "cost_official_usd", "cost_req_usd", "cost_sessions", "sessions"]);
+    assert_eq!(keys(&v["hours"][0]), vec!["b", "h", "m", "s"]);
+    assert_eq!(
+        keys(&v["hours"][0]["b"]),
+        vec!["c", "cr", "cw", "i", "n", "o", "r"]
+    );
+    assert_eq!(
+        keys(&v["totals"]),
+        vec![
+            "b",
+            "cost_official_usd",
+            "cost_req_usd",
+            "cost_sessions",
+            "sessions"
+        ]
+    );
     // 前端引用面(dashboard.html):per_source[].s/.b、per_model[].m、sources[].id/.label/.tier
-assert_eq!(keys(&v["per_source"][0]), vec!["b", "cost_usd", "files", "s", "sessions"]);
-assert_eq!(keys(&v["per_model"][0]), vec!["b", "m", "sources"]);
+    assert_eq!(
+        keys(&v["per_source"][0]),
+        vec!["b", "cost_usd", "files", "s", "sessions"]
+    );
+    assert_eq!(keys(&v["per_model"][0]), vec!["b", "m", "sources"]);
     for s in v["sources"].as_array().unwrap() {
-assert_eq!(keys(s), vec!["id", "label", "tier"]);
+        assert_eq!(keys(s), vec!["id", "label", "tier"]);
     }
 }

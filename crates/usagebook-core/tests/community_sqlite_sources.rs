@@ -8,11 +8,7 @@ use usagebook_core::UsageSource;
 
 /// 进程唯一临时目录,测试结束best-effort 清理。
 fn temp_root(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "usagebook-fixture-{}-{}",
-        tag,
-        std::process::id()
-    ));
+    let d = std::env::temp_dir().join(format!("usagebook-fixture-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -38,15 +34,26 @@ fn goose_sessions_db() {
     drop(conn);
 
     let (records, stats) = goose::GooseSource.scan_roots(&[db], None);
-    assert_eq!(records.len(), 2, "空 config 行应跳过;实际 notes: {:?}", stats.notes);
+    assert_eq!(
+        records.len(),
+        2,
+        "空 config 行应跳过;实际 notes: {:?}",
+        stats.notes
+    );
     let s1 = records.iter().find(|r| r.session_id == "s1").unwrap();
     assert_eq!(s1.model, "claude-sonnet-4-5");
     // 升级:input 已含 cache(本 fixture 无 cache 列 → 不减);reasoning 恒 0(§6.3)
-    assert_eq!((s1.input_uncached, s1.output, s1.reasoning_output), (100, 10, 0));
+    assert_eq!(
+        (s1.input_uncached, s1.output, s1.reasoning_output),
+        (100, 10, 0)
+    );
     assert_eq!(s1.ts_ms, 1767323045000, "naive created_at 按 UTC 解析(§2)");
     let s2 = records.iter().find(|r| r.session_id == "s2").unwrap();
     // 旧列回落 + reasoning 恒 0(total−in−out 公式已作废,§6.3)
-    assert_eq!((s2.input_uncached, s2.output, s2.reasoning_output), (150, 30, 0));
+    assert_eq!(
+        (s2.input_uncached, s2.output, s2.reasoning_output),
+        (150, 30, 0)
+    );
     assert_eq!(s2.ts_ms, 1750000000000, "毫秒 created_at 原样(§2)");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -75,15 +82,31 @@ fn goose_ledger_channel() {
     drop(conn);
 
     let (records, stats) = goose::GooseSource.scan_roots(&[db], None);
-    assert_eq!(records.len(), 2, "compaction 行跳过;notes: {:?}", stats.notes);
+    assert_eq!(
+        records.len(),
+        2,
+        "compaction 行跳过;notes: {:?}",
+        stats.notes
+    );
     let r1 = records.iter().find(|r| r.ts_ms == 1791338725000).unwrap();
     // input 已含 cache → 拆分:11266 − 11136 = 130(§6.3)
-    assert_eq!((r1.input_uncached, r1.cache_read, r1.output), (130, 11136, 153));
+    assert_eq!(
+        (r1.input_uncached, r1.cache_read, r1.output),
+        (130, 11136, 153)
+    );
     assert_eq!(r1.reasoning_output, 0, "ledger 无 reasoning 列(§6.3)");
     assert_eq!(r1.cost_usd, None, "estimated 不落 cost_usd(model.rs 纪律)");
     let r2 = records.iter().find(|r| r.ts_ms == 1791338726000).unwrap();
-    assert_eq!(r2.cost_usd, Some(0.01), "provider_reported 视为官方实报(§6.3)");
-    assert!(stats.notes.iter().any(|n| n.contains("compaction")), "compaction 跳过应计数: {:?}", stats.notes);
+    assert_eq!(
+        r2.cost_usd,
+        Some(0.01),
+        "provider_reported 视为官方实报(§6.3)"
+    );
+    assert!(
+        stats.notes.iter().any(|n| n.contains("compaction")),
+        "compaction 跳过应计数: {:?}",
+        stats.notes
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -114,23 +137,54 @@ fn openclaw_sqlite_canonical() {
            \"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0}}}',NULL);",
     )
     .unwrap();
-    conn.execute("INSERT INTO transcript_events VALUES('sessA',4,NULL,?1)", [zstd_payload]).unwrap();
+    conn.execute(
+        "INSERT INTO transcript_events VALUES('sessA',4,NULL,?1)",
+        [zstd_payload],
+    )
+    .unwrap();
     drop(conn);
 
     let (records, stats) = openclaw::OpenclawSource.scan_roots(std::slice::from_ref(&root), None);
-    assert_eq!(records.len(), 2, "全零行跳过+zstd 解压;notes: {:?}", stats.notes);
-    let e1 = records.iter().find(|r| r.dedup_key == "openclaw:main:sessA:ev-1").unwrap();
+    assert_eq!(
+        records.len(),
+        2,
+        "全零行跳过+zstd 解压;notes: {:?}",
+        stats.notes
+    );
+    let e1 = records
+        .iter()
+        .find(|r| r.dedup_key == "openclaw:main:sessA:ev-1")
+        .unwrap();
     // exclusive 直取(§7.3):input 不减 cache;output 拆 reasoning
     assert_eq!(
-        (e1.input_uncached, e1.cache_read, e1.cache_write, e1.output, e1.reasoning_output),
+        (
+            e1.input_uncached,
+            e1.cache_read,
+            e1.cache_write,
+            e1.output,
+            e1.reasoning_output
+        ),
         (15866, 0, 0, 38, 504)
     );
     assert_eq!(e1.cost_usd, None, "混合口径不落(model.rs 纪律,§7.3)");
-    assert_eq!(e1.ts_ms, 1750000000000, "message.timestamp epoch 毫秒优先(§7.4)");
-    let ez = records.iter().find(|r| r.dedup_key == "openclaw:main:sessA:ev-z").unwrap();
-    assert_eq!((ez.input_uncached, ez.output, ez.reasoning_output), (100, 20, 10));
+    assert_eq!(
+        e1.ts_ms, 1750000000000,
+        "message.timestamp epoch 毫秒优先(§7.4)"
+    );
+    let ez = records
+        .iter()
+        .find(|r| r.dedup_key == "openclaw:main:sessA:ev-z")
+        .unwrap();
+    assert_eq!(
+        (ez.input_uncached, ez.output, ez.reasoning_output),
+        (100, 20, 10)
+    );
     assert_eq!(ez.ts_ms, 1791338400000, "envelope ISO 回退(§7.4)");
-    assert!(stats.notes.iter().any(|n| n.contains("zstd")), "zstd 应计数: {:?}", stats.notes);
+    assert!(
+        stats.notes.iter().any(|n| n.contains("zstd")),
+        "zstd 应计数: {:?}",
+        stats.notes
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -161,9 +215,15 @@ fn copilot_session_store_channel() {
     assert_eq!(records.len(), 2, "全零行跳过;notes: {:?}", stats.notes);
     let r1 = records.iter().find(|r| r.ts_ms == 1791339843000).unwrap();
     // 双减除(§7.3):24379 − 13184 − 0 = 11195
-    assert_eq!((r1.input_uncached, r1.cache_read, r1.output), (11195, 13184, 32));
+    assert_eq!(
+        (r1.input_uncached, r1.cache_read, r1.output),
+        (11195, 13184, 32)
+    );
     // nano → 美元:254108000/1e9 × 0.01 = 0.00254108(§7.3)
-    assert!((r1.cost_usd.unwrap() - 0.00254108).abs() < 1e-12, "nano→美元换算(§7.3)");
+    assert!(
+        (r1.cost_usd.unwrap() - 0.00254108).abs() < 1e-12,
+        "nano→美元换算(§7.3)"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -189,9 +249,17 @@ fn kilo_message_json() {
     drop(conn);
 
     let (records, stats) = kilo::KiloSource.scan_roots(&[dir], None);
-    assert_eq!(records.len(), 2, "user 行与无时间行跳过;notes: {:?}", stats.notes);
+    assert_eq!(
+        records.len(),
+        2,
+        "user 行与无时间行跳过;notes: {:?}",
+        stats.notes
+    );
     let m1 = records.iter().find(|r| r.dedup_key == "kilo:m1").unwrap();
-    assert_eq!((m1.input_uncached, m1.cache_read, m1.cache_write, m1.output), (10, 2, 1, 5));
+    assert_eq!(
+        (m1.input_uncached, m1.cache_read, m1.cache_write, m1.output),
+        (10, 2, 1, 5)
+    );
     assert_eq!(m1.ts_ms, 1750000000000);
     // m3:total 差额兜底补 output(§3)+ 秒级时间戳自适应(§4)
     let m3 = records.iter().find(|r| r.dedup_key == "kilo:m3").unwrap();
@@ -222,7 +290,16 @@ fn hermes_state_db() {
     // 秒(带小数)→ 毫秒(§4);actual > estimated(§5)
     assert_eq!(h1.ts_ms, 1750000000250);
     assert_eq!(h1.cost_usd, Some(0.02));
-    assert_eq!((h1.input_uncached, h1.output, h1.cache_read, h1.cache_write, h1.reasoning_output), (100, 50, 10, 5, 5));
+    assert_eq!(
+        (
+            h1.input_uncached,
+            h1.output,
+            h1.cache_read,
+            h1.cache_write,
+            h1.reasoning_output
+        ),
+        (100, 50, 10, 5, 5)
+    );
     let h3 = records.iter().find(|r| r.session_id == "h3").unwrap();
     assert_eq!(h3.cost_usd, Some(0.05), "actual 缺失回落 estimated(§5)");
     let _ = std::fs::remove_dir_all(root);
@@ -250,7 +327,12 @@ fn kiro_conversations_v2() {
     drop(conn);
 
     let (records, stats) = kiro::KiroSource.scan_roots(&[root.join("data.sqlite3")], None);
-    assert_eq!(records.len(), 2, "char/4 估算行不采用(§2);notes: {:?}", stats.notes);
+    assert_eq!(
+        records.len(),
+        2,
+        "char/4 估算行不采用(§2);notes: {:?}",
+        stats.notes
+    );
     let r1 = records.iter().find(|r| r.dedup_key == "kiro:r1").unwrap();
     assert_eq!(r1.model, "claude-opus-4", "arn 规范化(§3)");
     assert_eq!((r1.input_uncached, r1.output), (100, 50));
@@ -277,7 +359,12 @@ fn qoder_ide_local_db() {
     drop(conn);
 
     let (records, stats) = qoder::QoderSource.scan_roots(&[root.join("local.db")], None);
-    assert_eq!(records.len(), 1, "user 行与空 token_info 行跳过;notes: {:?}", stats.notes);
+    assert_eq!(
+        records.len(),
+        1,
+        "user 行与空 token_info 行跳过;notes: {:?}",
+        stats.notes
+    );
     let m1 = &records[0];
     // inclusive 减除:prompt 110 − cached 10(§2)
     assert_eq!((m1.input_uncached, m1.cache_read, m1.output), (100, 10, 7));
@@ -308,7 +395,16 @@ fn opencode_v2_and_json_fallback() {
     let (records, stats) = opencode::OpencodeSource.scan_roots(std::slice::from_ref(&dir_a), None);
     assert_eq!(records.len(), 1, "user 行跳过;notes: {:?}", stats.notes);
     let om1 = &records[0];
-    assert_eq!((om1.input_uncached, om1.cache_read, om1.cache_write, om1.output, om1.reasoning_output), (10, 2, 1, 5, 1));
+    assert_eq!(
+        (
+            om1.input_uncached,
+            om1.cache_read,
+            om1.cache_write,
+            om1.output,
+            om1.reasoning_output
+        ),
+        (10, 2, 1, 5, 1)
+    );
     assert_eq!(om1.cost_usd, Some(0.01));
 
     // 通道 B:无 db → JSON storage/message 兜底
@@ -322,7 +418,8 @@ fn opencode_v2_and_json_fallback() {
             "time":{"created":1750000900}}"#,
     )
     .unwrap();
-    let (records2, stats2) = opencode::OpencodeSource.scan_roots(std::slice::from_ref(&dir_b), None);
+    let (records2, stats2) =
+        opencode::OpencodeSource.scan_roots(std::slice::from_ref(&dir_b), None);
     assert_eq!(records2.len(), 1, "JSON 兜底;notes: {:?}", stats2.notes);
     assert_eq!(records2[0].session_id, "sess9");
     assert_eq!(records2[0].input_uncached, 20);
@@ -344,12 +441,27 @@ fn opencode_v2_and_json_fallback() {
     )
     .unwrap();
     drop(conn);
-    let (records3, stats3) = opencode::OpencodeSource.scan_roots(std::slice::from_ref(&dir_c), None);
-    assert_eq!(records3.len(), 1, "全零 session 跳过;notes: {:?}", stats3.notes);
+    let (records3, stats3) =
+        opencode::OpencodeSource.scan_roots(std::slice::from_ref(&dir_c), None);
+    assert_eq!(
+        records3.len(),
+        1,
+        "全零 session 跳过;notes: {:?}",
+        stats3.notes
+    );
     let s = &records3[0];
     assert_eq!(s.dedup_key, "opencode:session:ses_x");
     assert_eq!(s.model, "glm-5.3-flash", "model JSON 取 id(§2)");
-    assert_eq!((s.input_uncached, s.output, s.reasoning_output, s.cache_read, s.cache_write), (63612, 2011, 15242, 137024, 0));
+    assert_eq!(
+        (
+            s.input_uncached,
+            s.output,
+            s.reasoning_output,
+            s.cache_read,
+            s.cache_write
+        ),
+        (63612, 2011, 15242, 137024, 0)
+    );
     assert_eq!(s.ts_ms, 1791282693955);
     let _ = std::fs::remove_dir_all(root);
 }

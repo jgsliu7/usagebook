@@ -42,7 +42,13 @@ pub struct UsageRecord {
 impl UsageRecord {
     /// 可相加的完整五桶;1h 是缓存写子集,不另列入碰撞观察签名。
     pub fn token_buckets(&self) -> [u64; 5] {
-        [self.input_uncached, self.cache_read, self.cache_write, self.output, self.reasoning_output]
+        [
+            self.input_uncached,
+            self.cache_read,
+            self.cache_write,
+            self.output,
+            self.reasoning_output,
+        ]
     }
 
     /// 五桶合计(替换裁决:同键后到且总量更大者替换)。

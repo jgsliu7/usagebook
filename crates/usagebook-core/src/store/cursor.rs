@@ -66,7 +66,9 @@ pub fn judge(
     cursor: Option<&FileCursor>,
     seal_at_offset: impl FnOnce(u64) -> std::io::Result<i64>,
 ) -> Verdict {
-    let Some(c) = cursor else { return Verdict::Fresh };
+    let Some(c) = cursor else {
+        return Verdict::Fresh;
+    };
     if size < c.byte_offset {
         return Verdict::Rewound("truncated");
     }
@@ -76,11 +78,19 @@ pub fn judge(
         _ => true,
     };
     if size == c.size {
-        if identity_changed { return Verdict::Rewound("identity"); }
-        if mtime_ns != c.mtime_ns { return Verdict::Rewound("same-size-change"); }
-        if c.byte_offset == c.size { return Verdict::Unchanged; }
+        if identity_changed {
+            return Verdict::Rewound("identity");
+        }
+        if mtime_ns != c.mtime_ns {
+            return Verdict::Rewound("same-size-change");
+        }
+        if c.byte_offset == c.size {
+            return Verdict::Unchanged;
+        }
     }
-    if size < c.size { return Verdict::Rewound("truncated"); }
+    if size < c.size {
+        return Verdict::Rewound("truncated");
+    }
     if let (Some(a), Some(b)) = (identity, c.identity.as_deref()) {
         // ctime changes on a legitimate append. Only the file object portion
         // proves replacement when size grows; the tail window verifies prefix.
@@ -91,7 +101,9 @@ pub fn judge(
         return Verdict::Rewound("identity");
     }
     match seal_at_offset(c.byte_offset) {
-        Ok(seal) if seal == c.tail_seal => Verdict::AppendFrom { offset: c.byte_offset },
+        Ok(seal) if seal == c.tail_seal => Verdict::AppendFrom {
+            offset: c.byte_offset,
+        },
         _ => Verdict::Rewound("seal-mismatch"),
     }
 }
@@ -104,7 +116,9 @@ pub fn judge_reload(
     identity: Option<&str>,
     cursor: Option<&FileCursor>,
 ) -> Verdict {
-    let Some(c) = cursor else { return Verdict::Fresh };
+    let Some(c) = cursor else {
+        return Verdict::Fresh;
+    };
     if size == c.size && mtime_ns == c.mtime_ns && c.byte_offset == c.size {
         match (identity, c.identity.as_deref()) {
             (Some(a), Some(b)) if a != b => Verdict::Rewound("identity"),
@@ -120,7 +134,13 @@ mod tests {
     use super::*;
 
     fn cursor(size: u64, offset: u64, seal: i64, mtime: i64) -> FileCursor {
-        FileCursor { mtime_ns: mtime, size, byte_offset: offset, tail_seal: seal, identity: None }
+        FileCursor {
+            mtime_ns: mtime,
+            size,
+            byte_offset: offset,
+            tail_seal: seal,
+            identity: None,
+        }
     }
 
     #[test]
@@ -131,49 +151,71 @@ mod tests {
     #[test]
     fn shrink_below_offset_is_truncated() {
         let c = cursor(100, 80, 0, 1);
-        assert_eq!(judge(2, 50, None, Some(&c), |_| unreachable!()),
-            Verdict::Rewound("truncated"));
+        assert_eq!(
+            judge(2, 50, None, Some(&c), |_| unreachable!()),
+            Verdict::Rewound("truncated")
+        );
     }
 
     #[test]
     fn full_match_is_unchanged_and_pending_falls_through() {
         let c = cursor(100, 100, 7, 5);
         // 全提交且未变:零读快路径(seal 闭包不得被调用)。
-        assert_eq!(judge(5, 100, None, Some(&c), |_| panic!("Unchanged 不得读窗口")),
-            Verdict::Unchanged);
+        assert_eq!(
+            judge(5, 100, None, Some(&c), |_| panic!("Unchanged 不得读窗口")),
+            Verdict::Unchanged
+        );
         // 上轮 pending 残留(byte_offset < size)且无任何变更 → 必须走 AppendFrom 续读。
         let pending = cursor(100, 80, 7, 5);
-        assert_eq!(judge(5, 100, None, Some(&pending), |_| Ok(7)),
-            Verdict::AppendFrom { offset: 80 });
+        assert_eq!(
+            judge(5, 100, None, Some(&pending), |_| Ok(7)),
+            Verdict::AppendFrom { offset: 80 }
+        );
     }
 
     #[test]
     fn identity_mismatch_beats_unchanged() {
         let mut c = cursor(100, 100, 7, 5);
         c.identity = Some("a/b/1".into());
-        assert_eq!(judge(5, 100, Some("a/b/2"), Some(&c), |_| unreachable!()),
-            Verdict::Rewound("identity"));
-        assert_eq!(judge(5, 100, Some("a/b/1"), Some(&c), |_| unreachable!()),
-            Verdict::Unchanged);
+        assert_eq!(
+            judge(5, 100, Some("a/b/2"), Some(&c), |_| unreachable!()),
+            Verdict::Rewound("identity")
+        );
+        assert_eq!(
+            judge(5, 100, Some("a/b/1"), Some(&c), |_| unreachable!()),
+            Verdict::Unchanged
+        );
     }
 
     #[test]
     fn seal_mismatch_or_err_is_rewound() {
         let c = cursor(200, 80, 7, 5);
-        assert_eq!(judge(9, 201, None, Some(&c), |_| Ok(8)),
-            Verdict::Rewound("seal-mismatch"));
-        assert_eq!(judge(9, 201, None, Some(&c), |_| Err(std::io::Error::other("x"))),
-            Verdict::Rewound("seal-mismatch"));
-        assert_eq!(judge(9, 201, None, Some(&c), |_| Ok(7)),
-            Verdict::AppendFrom { offset: 80 });
+        assert_eq!(
+            judge(9, 201, None, Some(&c), |_| Ok(8)),
+            Verdict::Rewound("seal-mismatch")
+        );
+        assert_eq!(
+            judge(9, 201, None, Some(&c), |_| Err(std::io::Error::other("x"))),
+            Verdict::Rewound("seal-mismatch")
+        );
+        assert_eq!(
+            judge(9, 201, None, Some(&c), |_| Ok(7)),
+            Verdict::AppendFrom { offset: 80 }
+        );
     }
 
     #[test]
     fn reload_judge_is_two_valued() {
         let c = cursor(100, 100, 0, 5);
         assert_eq!(judge_reload(5, 100, None, Some(&c)), Verdict::Unchanged);
-        assert_eq!(judge_reload(6, 100, None, Some(&c)), Verdict::Rewound("reload"));
-        assert_eq!(judge_reload(5, 120, None, Some(&c)), Verdict::Rewound("reload"));
+        assert_eq!(
+            judge_reload(6, 100, None, Some(&c)),
+            Verdict::Rewound("reload")
+        );
+        assert_eq!(
+            judge_reload(5, 120, None, Some(&c)),
+            Verdict::Rewound("reload")
+        );
         assert_eq!(judge_reload(5, 100, None, None), Verdict::Fresh);
     }
 

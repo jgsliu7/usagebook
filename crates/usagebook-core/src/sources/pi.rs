@@ -76,7 +76,7 @@ fn coerce_ts(v: Option<&Value>) -> Option<i64> {
 /// 单文件解析状态:session 头真实 id 流式捕获(首行,§2"无损 cwd/id")。
 struct FileCtx {
     header_id: Option<String>,
-    root: String,   // 发现根(键组成部分,防多根同 stem 碰撞)
+    root: String, // 发现根(键组成部分,防多根同 stem 碰撞)
     file_stem: String,
     line_no: u64,
 }
@@ -99,7 +99,11 @@ impl UsageSource for PiSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             stats
@@ -163,7 +167,7 @@ impl UsageSource for PiSource {
                 .unwrap_or_else(|| "unknown".into());
             let root = path
                 .ancestors()
-                .nth(3)   // <root>/<org?>/<session>/entries.jsonl → 根;不足三层时回退父目录链
+                .nth(3) // <root>/<org?>/<session>/entries.jsonl → 根;不足三层时回退父目录链
                 .or(path.parent())
                 .and_then(|p| p.to_str())
                 .unwrap_or("")
@@ -216,16 +220,12 @@ impl UsageSource for PiSource {
                                 let r = u
                                     .get("reasoning")
                                     .and_then(|x| x.as_u64())
-                                    .or_else(|| {
-                                        u.get("reasoningTokens").and_then(|x| x.as_u64())
-                                    })
+                                    .or_else(|| u.get("reasoningTokens").and_then(|x| x.as_u64()))
                                     .unwrap_or(0)
                                     .min(o);
                                 // totalTokens 恒等式校验(= 前四桶和,reasoning 不进 total,§3/§4)
-                                let sum4 = i
-                                    .saturating_add(cr)
-                                    .saturating_add(cw)
-                                    .saturating_add(o);
+                                let sum4 =
+                                    i.saturating_add(cr).saturating_add(cw).saturating_add(o);
                                 match u.get("totalTokens").and_then(|x| x.as_u64()) {
                                     Some(t) => {
                                         identity_checked += 1;
@@ -236,7 +236,7 @@ impl UsageSource for PiSource {
                                     }
                                     None => {
                                         zero_skipped += 1; // 无 totalTokens 视同不可信信封,跳过上报
-                                        return;   // 跳过即不入账:此前只计数未 return,审计口径失真(2026-10-17 修)
+                                        return; // 跳过即不入账:此前只计数未 return,审计口径失真(2026-10-17 修)
                                     }
                                 }
                                 // cacheWrite1h:恒不并入 cache_write;非 0 单独上报待考证(§4/§8)
@@ -271,10 +271,15 @@ impl UsageSource for PiSource {
                                 // 键掺入根路径(2026-10-17):多根(主目录+项目目录)同 stem 文件
                                 // 此前跨根碰撞、大者胜丢记录
                                 let key = match v.get("id").and_then(|x| x.as_str()) {
-                                    Some(eid) => format!("pi:{}:{}:{}", ctx.root, ctx.file_stem, eid),
+                                    Some(eid) => {
+                                        format!("pi:{}:{}:{}", ctx.root, ctx.file_stem, eid)
+                                    }
                                     None => {
                                         no_entry_id += 1;
-                                        format!("pi:{}:{}:L{}", ctx.root, ctx.file_stem, ctx.line_no)
+                                        format!(
+                                            "pi:{}:{}:L{}",
+                                            ctx.root, ctx.file_stem, ctx.line_no
+                                        )
                                     }
                                 };
                                 let rec = UsageRecord {
@@ -326,10 +331,7 @@ impl UsageSource for PiSource {
         for (root, n) in per_root {
             stats.notes.push(format!("根 {}:{} 个会话 jsonl", root, n));
         }
-        let sessions: HashSet<&str> = dedup
-            .values()
-            .map(|r| r.session_id.as_str())
-            .collect();
+        let sessions: HashSet<&str> = dedup.values().map(|r| r.session_id.as_str()).collect();
         stats.notes.push(format!(
             "会话 {} · 模型 {} · provider {}",
             sessions.len(),
@@ -353,13 +355,15 @@ impl UsageSource for PiSource {
         ));
         // 成本合计(客户端估算口径,非官方账单,§4)
         let cost_sum: f64 = dedup.values().filter_map(|r| r.cost_usd).sum();
-        stats
-            .notes
-            .push(format!("成本合计 ${:.8}(客户端估算口径,非官方账单)", cost_sum));
+        stats.notes.push(format!(
+            "成本合计 ${:.8}(客户端估算口径,非官方账单)",
+            cost_sum
+        ));
         if zero_skipped > 0 {
-            stats
-                .notes
-                .push(format!("全零/缺 usage/缺 totalTokens 跳过 {} 条(§5.3)", zero_skipped));
+            stats.notes.push(format!(
+                "全零/缺 usage/缺 totalTokens 跳过 {} 条(§5.3)",
+                zero_skipped
+            ));
         }
         if cw1h_nonzero > 0 {
             stats.notes.push(format!(
@@ -378,9 +382,10 @@ impl UsageSource for PiSource {
                 .push(format!("行级 id 缺失 {} 条(去重键退化为行号)", no_entry_id));
         }
         if model_fallback > 0 {
-            stats
-                .notes
-                .push(format!("model 缺失兜底 pi-unknown {} 条(§5.7)", model_fallback));
+            stats.notes.push(format!(
+                "model 缺失兜底 pi-unknown {} 条(§5.7)",
+                model_fallback
+            ));
         }
         (dedup.into_values().collect(), stats)
     }

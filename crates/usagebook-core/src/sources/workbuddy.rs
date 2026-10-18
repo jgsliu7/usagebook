@@ -69,7 +69,11 @@ fn ts_to_ms(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => {
             let t = n.as_i64().or_else(|| n.as_f64().map(|f| f as i64))?;
-            Some(if t > 0 && t < 1_000_000_000_000 { t * 1000 } else { t })
+            Some(if t > 0 && t < 1_000_000_000_000 {
+                t * 1000
+            } else {
+                t
+            })
         }
         Value::String(s) => iso_to_ms(s),
         _ => None,
@@ -98,11 +102,18 @@ fn from_raw_usage(u: &Value) -> Buckets {
         .pointer("/completion_tokens_details/reasoning_tokens")
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
-    let cache_read = [det_cached, num(u, "prompt_cache_hit_tokens"), num(u, "cache_read_input_tokens")]
-        .into_iter()
-        .find(|v| *v > 0)
-        .unwrap_or(0);
-    let cache_write = first_positive(u, &["prompt_cache_write_tokens", "cache_creation_input_tokens"]);
+    let cache_read = [
+        det_cached,
+        num(u, "prompt_cache_hit_tokens"),
+        num(u, "cache_read_input_tokens"),
+    ]
+    .into_iter()
+    .find(|v| *v > 0)
+    .unwrap_or(0);
+    let cache_write = first_positive(
+        u,
+        &["prompt_cache_write_tokens", "cache_creation_input_tokens"],
+    );
     let reasoning = [det_reason, num(u, "completion_thinking_tokens")]
         .into_iter()
         .find(|v| *v > 0)
@@ -123,10 +134,13 @@ fn from_raw_usage(u: &Value) -> Buckets {
 fn from_provider_usage(u: &Value) -> Buckets {
     let input = num(u, "inputTokens");
     let output = num(u, "outputTokens");
-    let cache_read = [det_num(u, "/inputTokensDetails", "cached_tokens"), num(u, "cacheReadTokens")]
-        .into_iter()
-        .find(|v| *v > 0)
-        .unwrap_or(0);
+    let cache_read = [
+        det_num(u, "/inputTokensDetails", "cached_tokens"),
+        num(u, "cacheReadTokens"),
+    ]
+    .into_iter()
+    .find(|v| *v > 0)
+    .unwrap_or(0);
     let (in_unc, out) = split_inclusive(input, output, num(u, "totalTokens"), cache_read);
     let reasoning = det_num(u, "/outputTokensDetails", "reasoning_tokens").min(out);
     Buckets {
@@ -176,17 +190,26 @@ impl UsageSource for WorkbuddySource {
         self.roots()
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
-            stats.notes.push("未发现 ~/.workbuddy 或 WORKBUDDY_HOME".into());
+            stats
+                .notes
+                .push("未发现 ~/.workbuddy 或 WORKBUDDY_HOME".into());
             return (vec![], stats);
         }
         let mut files = Vec::new();
         for r in roots {
             let d = r.join("projects");
             if d.is_dir() {
-                files.extend(walk_jsonl(&d, max_files.map(|m| m.saturating_sub(files.len()))));
+                files.extend(walk_jsonl(
+                    &d,
+                    max_files.map(|m| m.saturating_sub(files.len())),
+                ));
             }
         }
         // 回滚日志非转录,防御排除(档案 §5.5;.ndjson 本就不入 walk_jsonl)
@@ -219,8 +242,11 @@ impl UsageSource for WorkbuddySource {
                     "message" => v.get("role").and_then(|x| x.as_str()) == Some("assistant"),
                     "function_call" => true,
                     // 已知非用量行(本机全集实证):user 消息/工具结果/思考/快照/元数据/标题
-                    "function_call_result" | "reasoning" | "file-history-snapshot"
-                    | "session-meta" | "ai-title" => return,
+                    "function_call_result"
+                    | "reasoning"
+                    | "file-history-snapshot"
+                    | "session-meta"
+                    | "ai-title" => return,
                     _ => {
                         stats.lines_unknown_type += 1;
                         return;
@@ -243,7 +269,9 @@ impl UsageSource for WorkbuddySource {
                 }
                 // usage 优先级(档案 §4 硬约束:rawUsage 最优先,防 Anthropic 名/OpenAI 义双计)
                 let pd = v.get("providerData");
-                let (buckets, which) = if let Some(raw) = pd.and_then(|p| p.get("rawUsage")).filter(|u| u.is_object()) {
+                let (buckets, which) = if let Some(raw) =
+                    pd.and_then(|p| p.get("rawUsage")).filter(|u| u.is_object())
+                {
                     (from_raw_usage(raw), 0)
                 } else if let Some(u) = pd.and_then(|p| p.get("usage")).filter(|u| u.is_object()) {
                     (from_provider_usage(u), 1)
@@ -320,9 +348,10 @@ impl UsageSource for WorkbuddySource {
             "usage 来源命中:rawUsage {} / providerData.usage {} / message.usage {}",
             src_hits[0], src_hits[1], src_hits[2]
         ));
-        stats
-            .notes
-            .push(format!("status 缺失 {} 行(视为 completed),非 completed 跳过 {} 行", status_missing, status_filtered));
+        stats.notes.push(format!(
+            "status 缺失 {} 行(视为 completed),非 completed 跳过 {} 行",
+            status_missing, status_filtered
+        ));
         if ts_missing > 0 {
             stats.notes.push(format!("{} 行缺时间戳跳过", ts_missing));
         }

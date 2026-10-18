@@ -10,7 +10,7 @@
 //! 去重:月度 qwen:monthly:{id};chats qwen:{uuid},内容键兜底(§4)
 
 use crate::common::{env_roots, home, iso_to_ms, walk_with};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -30,19 +30,23 @@ impl UsageSource for QwenSource {
         roots.extend(env_roots("QWEN_HOME"));
         roots.push(home().join(".qwen"));
         let mut seen = HashSet::new();
-        roots.retain(|p| {
-            p.is_dir() && p.canonicalize().ok().is_some_and(|c| seen.insert(c))
-        });
+        roots.retain(|p| p.is_dir() && p.canonicalize().ok().is_some_and(|c| seen.insert(c)));
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         let mut records: Vec<UsageRecord> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut no_ts = 0u64;
         if roots.is_empty() {
-            stats.notes.push("未发现 ~/.qwen 或 QWEN_RUNTIME_DIR/QWEN_HOME".into());
+            stats
+                .notes
+                .push("未发现 ~/.qwen 或 QWEN_RUNTIME_DIR/QWEN_HOME".into());
             return (records, stats);
         }
         // —— 首选通道:usage/token-usage-*.jsonl 月度文件(§7.2,含后台辅助调用)——
@@ -62,9 +66,10 @@ impl UsageSource for QwenSource {
                 scan_monthly_file(path, &mut records, &mut seen, &mut stats, &mut no_ts);
                 stats.files_parsed += 1;
             }
-            stats
-                .notes
-                .push(format!("月度 token-usage 通道 {} 文件(§7.2,chats 通道让位防双计)", monthly.len()));
+            stats.notes.push(format!(
+                "月度 token-usage 通道 {} 文件(§7.2,chats 通道让位防双计)",
+                monthly.len()
+            ));
             return (records, stats);
         }
 
@@ -89,7 +94,8 @@ impl UsageSource for QwenSource {
         let mut all_zero = 0u64;
         let mut dup_dropped = 0u64;
         // §7.4:同 uuid 多行 fragment 聚合 last-wins —— 用 map 后写覆盖,循环结束统一出账
-        let mut pending: std::collections::HashMap<String, UsageRecord> = std::collections::HashMap::new();
+        let mut pending: std::collections::HashMap<String, UsageRecord> =
+            std::collections::HashMap::new();
 
         for path in &files {
             // 文件 mtime 兜底时间戳(§2)
@@ -100,7 +106,11 @@ impl UsageSource for QwenSource {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
             crate::common::for_each_line(path, |line| {
                 stats.lines_total += 1;
                 let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -135,7 +145,7 @@ impl UsageSource for QwenSource {
                     prompt - cached
                 };
                 let output = cand.saturating_sub(thoughts);
-                let thoughts = thoughts.min(cand);   // 估算值可能超过 output,同月度通道钳制(2026-10-17)
+                let thoughts = thoughts.min(cand); // 估算值可能超过 output,同月度通道钳制(2026-10-17)
                 let ts_ms = v
                     .get("timestamp")
                     .and_then(|x| x.as_str())
@@ -196,16 +206,24 @@ impl UsageSource for QwenSource {
             stats.notes.push(format!("根 {}:{n} 个 jsonl", root));
         }
         if all_zero > 0 {
-            stats.notes.push(format!("全零 usageMetadata 跳过 {all_zero} 行(§2)"));
+            stats
+                .notes
+                .push(format!("全零 usageMetadata 跳过 {all_zero} 行(§2)"));
         }
         if shape_guard > 0 {
-            stats.notes.push(format!("cached>prompt 改判 exclusive {shape_guard} 行(形状守卫,§6)"));
+            stats.notes.push(format!(
+                "cached>prompt 改判 exclusive {shape_guard} 行(形状守卫,§6)"
+            ));
         }
         if no_ts > 0 {
-            stats.notes.push(format!("无时间戳回退文件 mtime {no_ts} 行(§2)"));
+            stats
+                .notes
+                .push(format!("无时间戳回退文件 mtime {no_ts} 行(§2)"));
         }
         if dup_dropped > 0 {
-            stats.notes.push(format!("去重键命中丢弃 {dup_dropped} 行(§4)"));
+            stats
+                .notes
+                .push(format!("去重键命中丢弃 {dup_dropped} 行(§4)"));
         }
         (records, stats)
     }
@@ -277,7 +295,10 @@ fn scan_monthly_file(
         // 去重(§7.2):月度行自带 uuid id
         let key = match v.get("id").and_then(|x| x.as_str()) {
             Some(id) => format!("qwen:monthly:{id}"),
-            None => format!("qwen:monthly:{}:{}:{model}:{ts_ms}:{input}:{output}", session_id, cached),
+            None => format!(
+                "qwen:monthly:{}:{}:{model}:{ts_ms}:{input}:{output}",
+                session_id, cached
+            ),
         };
         if !seen.insert(key.clone()) {
             return;

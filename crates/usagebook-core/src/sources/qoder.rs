@@ -9,7 +9,7 @@
 //! 去重键(§4):qoder:ide:{db}:{id} / qoder:{message.id}
 
 use crate::common::{for_each_line, home, iso_to_ms, json_u64, secs_or_ms, walk_with};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use rusqlite::types::Value as SqlValue;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -27,12 +27,19 @@ fn v_text(v: &SqlValue) -> Option<String> {
 }
 
 /// IDE 通道(§2):local.db chat_message 表。
-fn scan_ide_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut HashSet<String>, stats: &mut ScanStats) {
+fn scan_ide_db(
+    db: &std::path::Path,
+    records: &mut Vec<UsageRecord>,
+    seen: &mut HashSet<String>,
+    stats: &mut ScanStats,
+) {
     stats.files_seen += 1;
     let conn = match crate::common::open_sqlite_readonly(db) {
         Ok(c) => c,
         Err(e) => {
-            stats.notes.push(format!("{} 打开失败: {}", db.display(), e));
+            stats
+                .notes
+                .push(format!("{} 打开失败: {}", db.display(), e));
             stats.failed = true;
             return;
         }
@@ -51,7 +58,9 @@ fn scan_ide_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut 
         )
         .unwrap_or(0);
     if has_table == 0 {
-        stats.notes.push(format!("{} 无 chat_message 表,忽略", db.display()));
+        stats
+            .notes
+            .push(format!("{} 无 chat_message 表,忽略", db.display()));
         return;
     }
     let sql = "SELECT m.id, m.gmt_create, m.token_info, m.model_info, m.session_id \
@@ -69,7 +78,9 @@ fn scan_ide_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut 
     };
     stats.files_parsed += 1;
     while let Ok(Some(row)) = rows.next() {
-        let vals: Vec<SqlValue> = (0..5).filter_map(|i| row.get::<_, SqlValue>(i).ok()).collect();
+        let vals: Vec<SqlValue> = (0..5)
+            .filter_map(|i| row.get::<_, SqlValue>(i).ok())
+            .collect();
         if vals.len() < 5 {
             stats.lines_bad_json += 1;
             continue;
@@ -80,7 +91,8 @@ fn scan_ide_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut 
         };
         stats.lines_total += 1;
         // token_info JSON 文本(§2)
-        let Some(Ok(ti)) = v_text(&vals[2]).map(|s| serde_json::from_str::<serde_json::Value>(&s)) else {
+        let Some(Ok(ti)) = v_text(&vals[2]).map(|s| serde_json::from_str::<serde_json::Value>(&s))
+        else {
             stats.lines_bad_json += 1;
             continue;
         };
@@ -157,7 +169,11 @@ impl UsageSource for QoderSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             stats
@@ -177,11 +193,15 @@ impl UsageSource for QoderSource {
                 continue;
             }
             // CLI 通道(§3):目录 → 递归 *.jsonl
-            let files = walk_with(root, max_files, &|p| p.extension().is_some_and(|x| x == "jsonl"));
+            let files = walk_with(root, max_files, &|p| {
+                p.extension().is_some_and(|x| x == "jsonl")
+            });
             stats.files_seen += files.len();
-            stats
-                .notes
-                .push(format!("CLI 根 {}:{} 个 *.jsonl", root.display(), files.len()));
+            stats.notes.push(format!(
+                "CLI 根 {}:{} 个 *.jsonl",
+                root.display(),
+                files.len()
+            ));
             for path in &files {
                 let (total, bad) = for_each_line(path, |line| {
                     let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -190,9 +210,14 @@ impl UsageSource for QoderSource {
                     if obj.get("type").and_then(|x| x.as_str()) != Some("assistant") {
                         return;
                     }
-                    let Some(msg) = obj.get("message") else { return };
+                    let Some(msg) = obj.get("message") else {
+                        return;
+                    };
                     let Some(u) = msg.get("usage") else { return };
-                    let (i, o) = (json_u64(u.get("input_tokens")), json_u64(u.get("output_tokens")));
+                    let (i, o) = (
+                        json_u64(u.get("input_tokens")),
+                        json_u64(u.get("output_tokens")),
+                    );
                     let cr = json_u64(u.get("cache_read_input_tokens"));
                     let cw = json_u64(u.get("cache_creation_input_tokens"));
                     if i == 0 && o == 0 && cr == 0 && cw == 0 {
@@ -247,7 +272,9 @@ impl UsageSource for QoderSource {
         }
 
         if dup_dropped > 0 {
-            stats.notes.push(format!("去重键命中丢弃 {dup_dropped} 条(§4)"));
+            stats
+                .notes
+                .push(format!("去重键命中丢弃 {dup_dropped} 条(§4)"));
         }
         (records, stats)
     }

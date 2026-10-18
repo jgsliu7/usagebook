@@ -74,10 +74,14 @@ enum OpenError {
 }
 
 impl From<rusqlite::Error> for OpenError {
-    fn from(e: rusqlite::Error) -> Self { Self::Sql(e) }
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Sql(e)
+    }
 }
 impl From<std::io::Error> for OpenError {
-    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 impl std::error::Error for OpenError {}
 
@@ -87,13 +91,19 @@ impl std::fmt::Display for OpenError {
             Self::Sql(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
             Self::FutureSchema(v) => write!(f, "future schema {v}"),
-            Self::Incompatible => write!(f, "cache metadata does not match its compatibility namespace"),
+            Self::Incompatible => write!(
+                f,
+                "cache metadata does not match its compatibility namespace"
+            ),
         }
     }
 }
 
 fn is_corruption(error: &rusqlite::Error) -> bool {
-    matches!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+    )
 }
 
 fn state_from_error(error: &OpenError) -> StoreState {
@@ -106,7 +116,9 @@ fn state_from_error(error: &OpenError) -> StoreState {
 }
 
 fn init_state() -> StoreState {
-    if !incremental_enabled() { return StoreState::Disabled; }
+    if !incremental_enabled() {
+        return StoreState::Disabled;
+    }
     match open_shared() {
         Ok(active) => StoreState::Enabled(active),
         Err(OpenError::Sql(error)) if is_corruption(&error) => recover_exclusive(),
@@ -117,7 +129,10 @@ fn init_state() -> StoreState {
 fn open_shared() -> Result<ActiveStore, OpenError> {
     let lease = Lease::shared(&state_lock_path())?;
     let conn = open_connection()?;
-    Ok(ActiveStore { conn, _lease: lease })
+    Ok(ActiveStore {
+        conn,
+        _lease: lease,
+    })
 }
 
 /// The caller must hold either lifecycle lease. This function never rotates.
@@ -126,9 +141,13 @@ fn open_connection() -> Result<Connection, OpenError> {
     // Read the main-file header before SQLite can touch WAL/SHM. The following
     // connection check also catches a newer version still present only in WAL.
     if let Some(version) = probe_schema_version(&path)? {
-        if version > effective_schema_version() { return Err(OpenError::FutureSchema(version)); }
+        if version > effective_schema_version() {
+            return Err(OpenError::FutureSchema(version));
+        }
     }
-    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let conn = Connection::open(&path)?;
     // 库文件收紧到属主读写(2026-10-17 安全审计):库含项目全路径/会话 ID/用量元数据,
     // 多用户机器上 0644 可被其他本地账户读取;WAL/SHM 由 SQLite 以主库权限创建。
@@ -141,30 +160,50 @@ fn open_connection() -> Result<Connection, OpenError> {
         // sidecar 不会自愈,而 checkpoint 前全部载荷在 WAL 中——每次打开顺带修权
         let mut side = path.clone().into_os_string();
         side.push("-wal");
-        let _ = std::fs::set_permissions(std::path::PathBuf::from(side), std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(
+            std::path::PathBuf::from(side),
+            std::fs::Permissions::from_mode(0o600),
+        );
         let mut side = path.clone().into_os_string();
         side.push("-shm");
-        let _ = std::fs::set_permissions(std::path::PathBuf::from(side), std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(
+            std::path::PathBuf::from(side),
+            std::fs::Permissions::from_mode(0o600),
+        );
     }
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let version = get_schema_version(&conn)?;
     check_schema(version)?;
-    if version != 0 { check_parser(&conn)?; }
+    if version != 0 {
+        check_parser(&conn)?;
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    if version == 0 { init_schema(&conn)?; }
+    if version == 0 {
+        init_schema(&conn)?;
+    }
     Ok(conn)
 }
 
 fn check_schema(version: i32) -> Result<(), OpenError> {
-    if version > effective_schema_version() { return Err(OpenError::FutureSchema(version)); }
-    if version != 0 && version != effective_schema_version() { return Err(OpenError::Incompatible); }
+    if version > effective_schema_version() {
+        return Err(OpenError::FutureSchema(version));
+    }
+    if version != 0 && version != effective_schema_version() {
+        return Err(OpenError::Incompatible);
+    }
     Ok(())
 }
 
 fn check_parser(conn: &Connection) -> Result<(), OpenError> {
-    let stored: Option<String> = conn.query_row("SELECT v FROM kv WHERE k='parser_version'", [], |r| r.get(0)).optional()?;
-    if stored.as_deref() != Some(PARSER_VERSION) { return Err(OpenError::Incompatible); }
+    let stored: Option<String> = conn
+        .query_row("SELECT v FROM kv WHERE k='parser_version'", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if stored.as_deref() != Some(PARSER_VERSION) {
+        return Err(OpenError::Incompatible);
+    }
     Ok(())
 }
 
@@ -175,7 +214,10 @@ fn init_schema(conn: &Connection) -> Result<(), OpenError> {
     check_schema(version)?;
     if version == 0 {
         tx.execute_batch(SCHEMA_SQL)?;
-        tx.execute("INSERT INTO kv(k,v) VALUES ('parser_version',?1)", [PARSER_VERSION])?;
+        tx.execute(
+            "INSERT INTO kv(k,v) VALUES ('parser_version',?1)",
+            [PARSER_VERSION],
+        )?;
         tx.pragma_update(None, "user_version", effective_schema_version())?;
     } else {
         check_parser(&tx)?;
@@ -197,7 +239,9 @@ fn probe_schema_version(path: &Path) -> Result<Option<i32>, std::io::Error> {
     };
     let mut header = [0u8; 64];
     match file.read_exact(&mut header) {
-        Ok(()) if &header[..16] == b"SQLite format 3\0" => Ok(Some(i32::from_be_bytes(header[60..64].try_into().unwrap()))),
+        Ok(()) if &header[..16] == b"SQLite format 3\0" => {
+            Ok(Some(i32::from_be_bytes(header[60..64].try_into().unwrap())))
+        }
         Ok(()) => Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
         Err(e) => Err(e),
@@ -207,14 +251,21 @@ fn probe_schema_version(path: &Path) -> Result<Option<i32>, std::io::Error> {
 /// USAGEBOOK_STATE_DB is a logical base, not a physical SQLite filename.
 /// Append the namespace without interpreting any user-provided suffix.
 fn state_dir() -> PathBuf {
-    let base = std::env::var_os("USAGEBOOK_STATE_DB").filter(|v| !v.is_empty())
-        .map(PathBuf::from).unwrap_or_else(|| crate::common::data_dir().join("state.db"));
+    let base = std::env::var_os("USAGEBOOK_STATE_DB")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::common::data_dir().join("state.db"));
     let mut name = base.into_os_string();
-    name.push(format!(".cache-p{PARSER_VERSION}-s{}-l{LOCK_PROTOCOL_VERSION}", effective_schema_version()));
+    name.push(format!(
+        ".cache-p{PARSER_VERSION}-s{}-l{LOCK_PROTOCOL_VERSION}",
+        effective_schema_version()
+    ));
     PathBuf::from(name)
 }
 
-pub fn state_db_path() -> PathBuf { state_dir().join("state.db") }
+pub fn state_db_path() -> PathBuf {
+    state_dir().join("state.db")
+}
 pub fn state_lock_path() -> PathBuf {
     let mut path = state_dir().into_os_string();
     path.push(".lock");
@@ -223,7 +274,10 @@ pub fn state_lock_path() -> PathBuf {
 
 pub fn incremental_enabled() -> bool {
     match std::env::var("USAGEBOOK_INCREMENTAL") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false"
+        ),
         Err(_) => true,
     }
 }
@@ -250,9 +304,14 @@ fn recover_exclusive() -> StoreState {
         Err(error) => return state_from_error(&error),
     };
     if corrupt {
-        if let Err(error) = rotate_directory() { return state_from_error(&OpenError::Io(error)); }
+        if let Err(error) = rotate_directory() {
+            return state_from_error(&OpenError::Io(error));
+        }
         match open_connection() {
-            Ok(conn) => { record_rotation(&conn); drop(conn); }
+            Ok(conn) => {
+                record_rotation(&conn);
+                drop(conn);
+            }
             Err(error) => return state_from_error(&error),
         }
         prune_bad_backups_locked();
@@ -268,40 +327,63 @@ fn recover_exclusive() -> StoreState {
 
 fn rotate_directory() -> std::io::Result<()> {
     let dir = state_dir();
-    let parent = dir.parent().ok_or_else(|| std::io::Error::other("cache directory has no parent"))?;
-    let name = dir.file_name().ok_or_else(|| std::io::Error::other("cache directory has no name"))?;
+    let parent = dir
+        .parent()
+        .ok_or_else(|| std::io::Error::other("cache directory has no parent"))?;
+    let name = dir
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("cache directory has no name"))?;
     let now = chrono::Local::now().timestamp_millis();
     for serial in 0..1000u32 {
         let mut destination = name.to_os_string();
         destination.push(format!(".bad-{now}-{serial}"));
         let destination = parent.join(destination);
-        if destination.try_exists()? { continue; }
+        if destination.try_exists()? {
+            continue;
+        }
         // One rename covers the main database and every sidecar. Any failure is
         // terminal for this recovery attempt; never blindly create at the old name.
         return std::fs::rename(&dir, destination);
     }
-    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "cache backup names exhausted"))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "cache backup names exhausted",
+    ))
 }
 
 /// Only this compatibility namespace's backups are eligible for cleanup.
 pub fn prune_bad_backups() {
-    if !incremental_enabled() { return; }
-    let Ok(_lease) = Lease::exclusive(&state_lock_path()) else { return };
+    if !incremental_enabled() {
+        return;
+    }
+    let Ok(_lease) = Lease::exclusive(&state_lock_path()) else {
+        return;
+    };
     prune_bad_backups_locked();
 }
 
 fn prune_bad_backups_locked() {
     let path = state_dir();
     let Some(parent) = path.parent() else { return };
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return };
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
     let prefix = format!("{name}.bad-");
-    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
     let mut backups = Vec::new();
     for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) { continue; }
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         let name = entry.file_name();
-        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else { continue };
-        let Some((stamp, serial)) = rest.split_once('-') else { continue };
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let Some((stamp, serial)) = rest.split_once('-') else {
+            continue;
+        };
         if let (Ok(stamp), Ok(serial)) = (stamp.parse::<i64>(), serial.parse::<u32>()) {
             backups.push(((stamp, serial), entry.path()));
         }
@@ -310,7 +392,10 @@ fn prune_bad_backups_locked() {
     let remove_count = backups.len().saturating_sub(3);
     for (_, path) in backups.into_iter().take(remove_count) {
         if let Err(error) = std::fs::remove_dir_all(&path) {
-            tracing::warn!("轮转残片清理失败({error} {})", crate::logging::abbrev_home(&path));
+            tracing::warn!(
+                "轮转残片清理失败({error} {})",
+                crate::logging::abbrev_home(&path)
+            );
         }
     }
 }
@@ -378,7 +463,11 @@ fn ready() -> bool {
 static TEST_SCHEMA_VERSION: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 fn effective_schema_version() -> i32 {
     let v = TEST_SCHEMA_VERSION.load(std::sync::atomic::Ordering::Relaxed);
-    if v > 0 { v } else { SCHEMA_VERSION }
+    if v > 0 {
+        v
+    } else {
+        SCHEMA_VERSION
+    }
 }
 
 /// 测试口:临时改写版本比较值(>0 生效;0=未覆盖)。
@@ -414,13 +503,18 @@ pub struct FileObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileCommit { Committed, Conflict, Unavailable }
+pub enum FileCommit {
+    Committed,
+    Conflict,
+    Unavailable,
+}
 
 fn next_revision(conn: &Connection) -> Result<String, rusqlite::Error> {
     let (epoch, counter): (String, i64) = conn.query_row(
         "UPDATE revision_clock SET counter=counter+1
          WHERE singleton=1 AND counter<9223372036854775807 RETURNING epoch,counter",
-        [], |r| Ok((r.get(0)?, r.get(1)?)),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     // Monotonic inside one database; a fresh 256-bit epoch isolates recovery.
     Ok(format!("{epoch}:{counter}"))
@@ -428,17 +522,23 @@ fn next_revision(conn: &Connection) -> Result<String, rusqlite::Error> {
 
 pub fn observe_file(source: &str, path: &Path) -> Option<FileObservation> {
     with_conn(|conn| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        let revision: Option<String> = tx.query_row(
-            "SELECT revision FROM file_versions WHERE source=?1 AND path=?2",
-            rusqlite::params![source, path.to_string_lossy()], |r| r.get(0),
-        ).optional()?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let revision: Option<String> = tx
+            .query_row(
+                "SELECT revision FROM file_versions WHERE source=?1 AND path=?2",
+                rusqlite::params![source, path.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .optional()?;
         let revision = match revision {
             Some(revision) => revision,
             None => {
                 let revision = next_revision(&tx)?;
-                tx.execute("INSERT INTO file_versions(source,path,revision) VALUES (?1,?2,?3)",
-                    rusqlite::params![source, path.to_string_lossy(), revision])?;
+                tx.execute(
+                    "INSERT INTO file_versions(source,path,revision) VALUES (?1,?2,?3)",
+                    rusqlite::params![source, path.to_string_lossy(), revision],
+                )?;
                 revision
             }
         };
@@ -453,22 +553,31 @@ pub fn file_row(source: &str, path: &Path) -> Option<FileRow> {
     with_conn(|conn| read_file_row(conn, source, path)).flatten()
 }
 
-fn read_file_row(conn: &Connection, source: &str, path: &Path) -> Result<Option<FileRow>, rusqlite::Error> {
+fn read_file_row(
+    conn: &Connection,
+    source: &str,
+    path: &Path,
+) -> Result<Option<FileRow>, rusqlite::Error> {
     conn.query_row(
         "SELECT mtime_ns,size,byte_offset,tail_seal,identity,events,events_len,lines_total
          FROM file_state WHERE source=?1 AND path=?2",
         rusqlite::params![source, path.to_string_lossy()],
-        |r| Ok(FileRow {
-            cursor: FileCursor {
-                mtime_ns: r.get(0)?, size: r.get::<_, i64>(1)? as u64,
-                byte_offset: r.get::<_, i64>(2)? as u64,
-                tail_seal: r.get(3)?, identity: r.get(4)?,
-            },
-            events: r.get::<_, Vec<u8>>(5)?.into_boxed_slice().into(),
-            events_len: r.get::<_, i64>(6)? as usize,
-            lines_total: r.get(7)?,
-        }),
-    ).optional()
+        |r| {
+            Ok(FileRow {
+                cursor: FileCursor {
+                    mtime_ns: r.get(0)?,
+                    size: r.get::<_, i64>(1)? as u64,
+                    byte_offset: r.get::<_, i64>(2)? as u64,
+                    tail_seal: r.get(3)?,
+                    identity: r.get(4)?,
+                },
+                events: r.get::<_, Vec<u8>>(5)?.into_boxed_slice().into(),
+                events_len: r.get::<_, i64>(6)? as usize,
+                lines_total: r.get(7)?,
+            })
+        },
+    )
+    .optional()
 }
 
 pub struct FileWrite<'a> {
@@ -509,10 +618,16 @@ fn insert_file(
 
 /// Replace an entire projection only while its observed generation still owns
 /// this path. Fresh, replay, append and damaged-row repair share this operation.
-pub fn replace_file(source: &str, path: &Path, expected_revision: &str, w: FileWrite) -> FileCommit {
+pub fn replace_file(
+    source: &str,
+    path: &Path,
+    expected_revision: &str,
+    w: FileWrite,
+) -> FileCommit {
     let now = chrono::Local::now().timestamp_millis();
     with_conn(|conn| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let revision = next_revision(&tx)?;
         let changed = tx.execute(
             "UPDATE file_versions SET revision=?1 WHERE source=?2 AND path=?3 AND revision=?4",
@@ -522,12 +637,15 @@ pub fn replace_file(source: &str, path: &Path, expected_revision: &str, w: FileW
             tx.rollback()?;
             return Ok(FileCommit::Conflict);
         }
-        tx.execute("DELETE FROM file_state WHERE source=?1 AND path=?2",
-            rusqlite::params![source, path.to_string_lossy()])?;
+        tx.execute(
+            "DELETE FROM file_state WHERE source=?1 AND path=?2",
+            rusqlite::params![source, path.to_string_lossy()],
+        )?;
         insert_file(&tx, source, path, &w, now)?;
         tx.commit()?;
         Ok(FileCommit::Committed)
-    }).unwrap_or(FileCommit::Unavailable)
+    })
+    .unwrap_or(FileCommit::Unavailable)
 }
 
 pub fn append_file(source: &str, path: &Path, expected_revision: &str, w: FileWrite) -> FileCommit {
@@ -554,13 +672,17 @@ pub fn gc_source(source: &str, live: &[PathBuf]) -> usize {
         // never physically removed while this compatibility namespace is in use.
         let dead: Vec<String> = {
             let mut query = tx.prepare("SELECT path FROM file_versions WHERE source=?1 AND path NOT IN (SELECT k FROM gc_live)")?;
-            let rows = query.query_map([source], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?;
+            let rows = query
+                .query_map([source], |r| r.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
             rows
         };
         for path in dead {
             let revision = next_revision(&tx)?;
-            tx.execute("UPDATE file_versions SET revision=?1 WHERE source=?2 AND path=?3",
-                rusqlite::params![revision, source, path])?;
+            tx.execute(
+                "UPDATE file_versions SET revision=?1 WHERE source=?2 AND path=?3",
+                rusqlite::params![revision, source, path],
+            )?;
         }
         let n = tx.execute(
             "DELETE FROM file_state WHERE source = ?1 AND path NOT IN (SELECT k FROM gc_live)",
@@ -691,7 +813,10 @@ impl From<&crate::model::UsageRecord> for StoredRecord {
 }
 
 fn static_source_id(id: &str) -> &'static str {
-    let found = crate::SOURCE_CATALOG.iter().find(|s| s.id == id).map(|s| s.id);
+    let found = crate::SOURCE_CATALOG
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.id);
     debug_assert!(found.is_some(), "records 载荷出现未注册源: {id}");
     found.unwrap_or("unknown")
 }
@@ -721,10 +846,7 @@ impl From<StoredRecord> for crate::model::UsageRecord {
     }
 }
 
-pub fn encode_records(
-    records: &[crate::model::UsageRecord],
-    stats: &ScanStats,
-) -> Option<Vec<u8>> {
+pub fn encode_records(records: &[crate::model::UsageRecord], stats: &ScanStats) -> Option<Vec<u8>> {
     let mirror: Vec<StoredRecord> = records.iter().map(StoredRecord::from).collect();
     encode(&(mirror, stats)).map(|(b, _)| b)
 }
@@ -732,7 +854,13 @@ pub fn encode_records(
 pub fn decode_records(blob: &[u8]) -> Option<(Vec<crate::model::UsageRecord>, ScanStats)> {
     let bytes = zstd::stream::decode_all(blob).ok()?;
     let (mirror, stats): (Vec<StoredRecord>, ScanStats) = serde_json::from_slice(&bytes).ok()?;
-    Some((mirror.into_iter().map(crate::model::UsageRecord::from).collect(), stats))
+    Some((
+        mirror
+            .into_iter()
+            .map(crate::model::UsageRecord::from)
+            .collect(),
+        stats,
+    ))
 }
 
 pub fn store_ready() -> bool {
@@ -808,15 +936,20 @@ pub fn doctor_snapshot() -> DoctorSnapshot {
         )?;
         snap.files_by_source = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get(2)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        let mut stmt = conn.prepare("SELECT source, updated_ms FROM source_state ORDER BY source")?;
+        let mut stmt =
+            conn.prepare("SELECT source, updated_ms FROM source_state ORDER BY source")?;
         snap.sources = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
-        let newest: Option<i64> = conn.query_row(
-            "SELECT MAX(updated_ms) FROM file_state", [], |r| r.get(0))?;
+        let newest: Option<i64> =
+            conn.query_row("SELECT MAX(updated_ms) FROM file_state", [], |r| r.get(0))?;
         let now = chrono::Local::now().timestamp_millis();
         snap.cursor_lag_ms = newest.map(|ms| now - ms);
         for (k, want) in [
@@ -824,8 +957,9 @@ pub fn doctor_snapshot() -> DoctorSnapshot {
             ("capped_files", &mut snap.capped_files),
             ("gc_files", &mut snap.gc_files),
         ] {
-            let v: Option<String> =
-                conn.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok();
+            let v: Option<String> = conn
+                .query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0))
+                .ok();
             *want = v.and_then(|s| s.parse().ok()).unwrap_or(0);
         }
         Ok::<(), rusqlite::Error>(())

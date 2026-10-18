@@ -94,7 +94,11 @@ impl UsageSource for ZcodeSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], _max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        _max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         // max_files 对本源无意义:sqlite 单库全量读,只 SELECT 需要的列
         let mut stats = ScanStats::default();
         if roots.is_empty() {
@@ -121,7 +125,9 @@ impl UsageSource for ZcodeSource {
             let db = root.join("cli/db/db.sqlite");
             stats.files_seen += rollout + 1;
             if !db.is_file() {
-                stats.notes.push(format!("根 {} 下无 cli/db/db.sqlite", root.display()));
+                stats
+                    .notes
+                    .push(format!("根 {} 下无 cli/db/db.sqlite", root.display()));
                 continue;
             }
 
@@ -141,12 +147,24 @@ impl UsageSource for ZcodeSource {
             let _ = conn.pragma_update(None, "query_only", true);
 
             let Some(cols) = probe_columns(&conn) else {
-                stats.notes.push("库中无 model_usage 表,忽略(非 ZCode 账本)".into());
+                stats
+                    .notes
+                    .push("库中无 model_usage 表,忽略(非 ZCode 账本)".into());
                 continue;
             };
-            const REQUIRED: [&str; 6] =
-                ["id", "session_id", "model_id", "started_at", "input_tokens", "output_tokens"];
-            let missing: Vec<&str> = REQUIRED.iter().filter(|c| !cols.contains(&c.to_string())).cloned().collect();
+            const REQUIRED: [&str; 6] = [
+                "id",
+                "session_id",
+                "model_id",
+                "started_at",
+                "input_tokens",
+                "output_tokens",
+            ];
+            let missing: Vec<&str> = REQUIRED
+                .iter()
+                .filter(|c| !cols.contains(&c.to_string()))
+                .cloned()
+                .collect();
             if !missing.is_empty() {
                 stats.notes.push(format!(
                     "model_usage 缺必需列 {:?},整库忽略(布局待适配)",
@@ -164,9 +182,11 @@ impl UsageSource for ZcodeSource {
                         .any(|c| c == "version"))
                 })
                 .unwrap_or(false);
-            stats
-                .notes
-                .push(format!("布局判定: {}(session.version 列{})", if layout { "modern" } else { "legacy" }, if layout { "在" } else { "缺" }));
+            stats.notes.push(format!(
+                "布局判定: {}(session.version 列{})",
+                if layout { "modern" } else { "legacy" },
+                if layout { "在" } else { "缺" }
+            ));
 
             // 状态分布(error/cancelled 跳过但要计数,档案 §5.1)
             let has = |c: &str| cols.contains(&c.to_string());
@@ -187,7 +207,13 @@ impl UsageSource for ZcodeSource {
             }
 
             // 固定列序 SELECT:可选列缺失用 NULL 占位 → 行索引恒定
-            let opt = |c: &str| if has(c) { c.to_string() } else { "NULL".to_string() };
+            let opt = |c: &str| {
+                if has(c) {
+                    c.to_string()
+                } else {
+                    "NULL".to_string()
+                }
+            };
             let sql = format!(
                 "SELECT id, session_id, model_id, started_at, input_tokens, output_tokens, \
                  {}, {}, {}, {}, {}, {} FROM model_usage{}",
@@ -197,7 +223,11 @@ impl UsageSource for ZcodeSource {
                 opt("completed_at"),
                 opt("duration_ms"),
                 opt("status"),
-                if has("status") { " WHERE status='completed'" } else { "" }
+                if has("status") {
+                    " WHERE status='completed'"
+                } else {
+                    ""
+                }
             );
             let Ok(mut stmt) = conn.prepare(&sql) else {
                 stats.notes.push("model_usage 查询构建失败".into());
@@ -212,7 +242,9 @@ impl UsageSource for ZcodeSource {
             while let Ok(Some(row)) = rows.next() {
                 // 0 id, 1 session_id, 2 model_id, 3 started_at, 4 input, 5 output,
                 // 6 reasoning, 7 cache_read, 8 cache_write, 9 completed_at, 10 duration_ms, 11 status
-                let vals: Vec<SqlValue> = (0..12).filter_map(|i| row.get::<_, SqlValue>(i).ok()).collect();
+                let vals: Vec<SqlValue> = (0..12)
+                    .filter_map(|i| row.get::<_, SqlValue>(i).ok())
+                    .collect();
                 if vals.len() < 12 {
                     stats.lines_bad_json += 1;
                     continue;
@@ -284,9 +316,10 @@ impl UsageSource for ZcodeSource {
             ));
         }
         if skipped_no_time > 0 {
-            stats
-                .notes
-                .push(format!("{} 行无可用时间戳(started_at/completed_at 均缺),跳过", skipped_no_time));
+            stats.notes.push(format!(
+                "{} 行无可用时间戳(started_at/completed_at 均缺),跳过",
+                skipped_no_time
+            ));
         }
         (records, stats)
     }

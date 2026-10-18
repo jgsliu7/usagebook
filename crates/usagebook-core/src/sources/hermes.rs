@@ -7,7 +7,7 @@
 //! 去重键:hermes:{db路径}:{id}(§5,多 profile 同 id 不撞)
 
 use crate::common::{env_roots, home};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -116,7 +116,11 @@ impl UsageSource for HermesSource {
         dbs
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], _max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        _max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         // max_files 对本源无意义:sqlite 单库全量读
         let mut stats = ScanStats::default();
         if roots.is_empty() {
@@ -136,33 +140,44 @@ impl UsageSource for HermesSource {
                 continue;
             };
             if !has_table(&conn, "sessions") {
-                stats.notes.push(format!("{} 无 sessions 表,忽略", db.display()));
+                stats
+                    .notes
+                    .push(format!("{} 无 sessions 表,忽略", db.display()));
                 continue;
             }
             // §6.2:官方 usage_totals 行判据(parent NULL + msg≥1 + 未归档),列缺省防御
             let mut sql = "SELECT id, model, started_at, input_tokens, output_tokens, \
                        cache_read_tokens, cache_write_tokens, reasoning_tokens, \
-                       actual_cost_usd, estimated_cost_usd FROM sessions".to_string();
+                       actual_cost_usd, estimated_cost_usd FROM sessions"
+                .to_string();
             if has_column(&conn, "sessions", "parent_session_id")
                 && has_column(&conn, "sessions", "message_count")
                 && has_column(&conn, "sessions", "archived")
             {
-                sql.push_str(" WHERE parent_session_id IS NULL \
-                       AND COALESCE(message_count,0) >= 1 AND COALESCE(archived,0) = 0");
+                sql.push_str(
+                    " WHERE parent_session_id IS NULL \
+                       AND COALESCE(message_count,0) >= 1 AND COALESCE(archived,0) = 0",
+                );
             }
             let Ok(mut stmt) = conn.prepare(&sql) else {
-                stats.notes.push(format!("{} sessions 查询构建失败", db.display()));
+                stats
+                    .notes
+                    .push(format!("{} sessions 查询构建失败", db.display()));
                 stats.failed = true;
                 continue;
             };
             let Ok(mut rows) = stmt.query([]) else {
-                stats.notes.push(format!("{} sessions 查询执行失败", db.display()));
+                stats
+                    .notes
+                    .push(format!("{} sessions 查询执行失败", db.display()));
                 stats.failed = true;
                 continue;
             };
             stats.files_parsed += 1;
             while let Ok(Some(row)) = rows.next() {
-                let vals: Vec<SqlValue> = (0..10).filter_map(|i| row.get::<_, SqlValue>(i).ok()).collect();
+                let vals: Vec<SqlValue> = (0..10)
+                    .filter_map(|i| row.get::<_, SqlValue>(i).ok())
+                    .collect();
                 if vals.len() < 10 {
                     stats.lines_bad_json += 1;
                     continue;
@@ -185,7 +200,12 @@ impl UsageSource for HermesSource {
                 let ts_ms = match &vals[2] {
                     SqlValue::Real(f) if *f > 0.0 => Some((*f * 1000.0) as i64),
                     SqlValue::Integer(n) if *n > 0 => Some(crate::common::secs_or_ms(*n)),
-                    SqlValue::Text(s) => s.trim().parse::<f64>().ok().filter(|f| *f > 0.0).map(|f| (f * 1000.0) as i64),
+                    SqlValue::Text(s) => s
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|f| *f > 0.0)
+                        .map(|f| (f * 1000.0) as i64),
                     _ => None,
                 };
                 let Some(ts_ms) = ts_ms else {

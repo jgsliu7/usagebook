@@ -62,13 +62,17 @@ impl UsageSource for MinimaxSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], _max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        _max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         // max_files 对本源无意义:sqlite 单库全量读,只 SELECT 需要的列
         let mut stats = ScanStats::default();
         if roots.is_empty() {
-            stats
-                .notes
-                .push("未发现 ~/.minimax* 或 MINIMAX_CODE_HOME/MINIMAX_DATA_DIR/MAVIS_DATA_DIR".into());
+            stats.notes.push(
+                "未发现 ~/.minimax* 或 MINIMAX_CODE_HOME/MINIMAX_DATA_DIR/MAVIS_DATA_DIR".into(),
+            );
             return (vec![], stats);
         }
 
@@ -99,20 +103,21 @@ impl UsageSource for MinimaxSource {
             let db = root.join("v2/sqlite/runtime-state.sqlite");
             stats.files_seen += sessions_jsonl + obs_jsonl + 1;
             if !db.is_file() {
-                stats
-                    .notes
-                    .push(format!("根 {} 下无 v2/sqlite/runtime-state.sqlite(空 profile 根,跳过)", root.display()));
+                stats.notes.push(format!(
+                    "根 {} 下无 v2/sqlite/runtime-state.sqlite(空 profile 根,跳过)",
+                    root.display()
+                ));
                 continue;
             }
 
             // 只读打开 + busy_timeout + query_only;失败重试一次;不动 journal mode(档案 §5.5/§8)
-            let try_open = || {
-                crate::common::open_sqlite_readonly(&db)
-            };
+            let try_open = || crate::common::open_sqlite_readonly(&db);
             let conn = match try_open().or_else(|_| try_open()) {
                 Ok(c) => c,
                 Err(e) => {
-                    stats.notes.push(format!("runtime-state.sqlite 打开失败: {}", e));
+                    stats
+                        .notes
+                        .push(format!("runtime-state.sqlite 打开失败: {}", e));
                     stats.failed = true;
                     continue;
                 }
@@ -133,16 +138,20 @@ impl UsageSource for MinimaxSource {
                 .map(|n| n > 0)
                 .unwrap_or(false);
             if !has_table {
-                stats
-                    .notes
-                    .push("库中无 local_runtime_token_usage 表,整库跳过(非账本/干扰库,档案 §5.6)".into());
+                stats.notes.push(
+                    "库中无 local_runtime_token_usage 表,整库跳过(非账本/干扰库,档案 §5.6)".into(),
+                );
                 continue;
             }
 
             // 列探测:缺必需列 → 整库忽略(两代 schema 防御,档案 §8)
             let usage_cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(local_runtime_token_usage)")
-                .and_then(|mut s| Ok(s.query_map([], |r| r.get::<_, String>(1))?.flatten().collect()))
+                .and_then(|mut s| {
+                    Ok(s.query_map([], |r| r.get::<_, String>(1))?
+                        .flatten()
+                        .collect())
+                })
                 .unwrap_or_default();
             const REQUIRED: [&str; 9] = [
                 "id",
@@ -175,7 +184,11 @@ impl UsageSource for MinimaxSource {
             let mut record_bad = 0u64; // record_json 解析失败/无 workspaceDir 的会话数
             let sess_cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(local_runtime_sessions)")
-                .and_then(|mut s| Ok(s.query_map([], |r| r.get::<_, String>(1))?.flatten().collect()))
+                .and_then(|mut s| {
+                    Ok(s.query_map([], |r| r.get::<_, String>(1))?
+                        .flatten()
+                        .collect())
+                })
                 .unwrap_or_default();
             let sess_has = |c: &str| cols_contains(&sess_cols, c);
             if sess_has("record_json") {
@@ -207,10 +220,15 @@ impl UsageSource for MinimaxSource {
                     }
                 }
             } else if sess_has("workspace_dir") || sess_has("project_workspace_dir") {
-                let col = if sess_has("workspace_dir") { "workspace_dir" } else { "project_workspace_dir" };
-                stats
-                    .notes
-                    .push(format!("项目归属: local_runtime_sessions 直列 {}(档案 §8)", col));
+                let col = if sess_has("workspace_dir") {
+                    "workspace_dir"
+                } else {
+                    "project_workspace_dir"
+                };
+                stats.notes.push(format!(
+                    "项目归属: local_runtime_sessions 直列 {}(档案 §8)",
+                    col
+                ));
                 let sql = format!("SELECT session_id, {} FROM local_runtime_sessions", col);
                 if let Ok(mut stmt) = conn.prepare(&sql) {
                     if let Ok(mut rows) = stmt.query([]) {
@@ -225,14 +243,15 @@ impl UsageSource for MinimaxSource {
                     }
                 }
             } else {
-                stats
-                    .notes
-                    .push("sessions 表无 record_json 亦无直列 workspace,项目归属不可得(档案 §8)".into());
+                stats.notes.push(
+                    "sessions 表无 record_json 亦无直列 workspace,项目归属不可得(档案 §8)".into(),
+                );
             }
             if record_bad > 0 {
-                stats
-                    .notes
-                    .push(format!("{} 个会话 record_json 坏行/无 workspaceDir,归属记空", record_bad));
+                stats.notes.push(format!(
+                    "{} 个会话 record_json 坏行/无 workspaceDir,归属记空",
+                    record_bad
+                ));
             }
 
             // 用量主查询:固定列序直取(五列 exclusive,档案 §4);ORDER BY id 保证确定性
@@ -240,21 +259,27 @@ impl UsageSource for MinimaxSource {
                        reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
                        FROM local_runtime_token_usage ORDER BY id";
             let Ok(mut stmt) = conn.prepare(sql) else {
-                stats.notes.push("local_runtime_token_usage 查询构建失败".into());
+                stats
+                    .notes
+                    .push("local_runtime_token_usage 查询构建失败".into());
                 stats.failed = true;
                 continue;
             };
             let Ok(mut rows) = stmt.query([]) else {
-                stats.notes.push("local_runtime_token_usage 查询执行失败".into());
+                stats
+                    .notes
+                    .push("local_runtime_token_usage 查询执行失败".into());
                 stats.failed = true;
                 continue;
             };
             while let Ok(Some(row)) = rows.next() {
                 // 0 id, 1 session_id, 2 agent_name, 3 model, 4 ts,
                 // 5 input, 6 output, 7 reasoning, 8 cache_read, 9 cache_write, 10 cost_usd
-                let (Ok(id), Ok(session_id), Ok(agent_name)) =
-                    (row.get::<_, i64>(0), row.get::<_, String>(1), row.get::<_, String>(2))
-                else {
+                let (Ok(id), Ok(session_id), Ok(agent_name)) = (
+                    row.get::<_, i64>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                ) else {
                     stats.lines_bad_json += 1;
                     continue;
                 };
@@ -341,17 +366,21 @@ impl UsageSource for MinimaxSource {
             ));
             stats.notes.push(format!("agent 分布: {}", agents));
             // 项目归属分布(统一模型暂无项目字段,以注记上报;档案 §5.2 分歧点的落地形态)
-            stats
-                .notes
-                .push(format!("项目归属(workspaceDir): {}", sorted_dist(&workspace_dist)));
+            stats.notes.push(format!(
+                "项目归属(workspaceDir): {}",
+                sorted_dist(&workspace_dist)
+            ));
         }
         if skipped_no_time > 0 {
-            stats
-                .notes
-                .push(format!("{} 行无有效时间戳(ts 缺失/非正),跳过", skipped_no_time));
+            stats.notes.push(format!(
+                "{} 行无有效时间戳(ts 缺失/非正),跳过",
+                skipped_no_time
+            ));
         }
         if skipped_zero > 0 {
-            stats.notes.push(format!("{} 行全零 usage,跳过(三跳过纪律)", skipped_zero));
+            stats
+                .notes
+                .push(format!("{} 行全零 usage,跳过(三跳过纪律)", skipped_zero));
         }
         if unknown_model > 0 {
             stats
@@ -359,14 +388,16 @@ impl UsageSource for MinimaxSource {
                 .push(format!("{} 行 model 为 NULL,记 unknown(messages.jsonl 回填路径无实测样本,v1 不实现,档案 §8)", unknown_model));
         }
         if cost_nonzero > 0 {
-            stats
-                .notes
-                .push(format!("{} 行 cost_usd 非零,作源自带成本采入(本机档案实证为全 0)", cost_nonzero));
+            stats.notes.push(format!(
+                "{} 行 cost_usd 非零,作源自带成本采入(本机档案实证为全 0)",
+                cost_nonzero
+            ));
         }
         if no_workspace > 0 {
-            stats
-                .notes
-                .push(format!("{} 行用量查不到 workspace 归属(sessions 表缺该会话)", no_workspace));
+            stats.notes.push(format!(
+                "{} 行用量查不到 workspace 归属(sessions 表缺该会话)",
+                no_workspace
+            ));
         }
         (records, stats)
     }

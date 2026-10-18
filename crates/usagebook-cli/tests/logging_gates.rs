@@ -17,17 +17,29 @@ fn bin() -> &'static str {
 struct TmpGuard(PathBuf);
 impl std::ops::Deref for TmpGuard {
     type Target = Path;
-    fn deref(&self) -> &Path { &self.0 }
+    fn deref(&self) -> &Path {
+        &self.0
+    }
 }
 impl AsRef<Path> for TmpGuard {
-    fn as_ref(&self) -> &Path { &self.0 }
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
 }
 impl Drop for TmpGuard {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 fn tmpdir(tag: &str) -> TmpGuard {
-    let d = std::env::temp_dir().join(format!("ub-log-it-{tag}-{}-{}", std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
+    let d = std::env::temp_dir().join(format!(
+        "ub-log-it-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
     std::fs::create_dir_all(&d).unwrap();
     TmpGuard(d)
 }
@@ -40,8 +52,12 @@ impl ServeGuard {
         let _ = self.0.kill();
         let mut out = String::new();
         let mut err = String::new();
-        if let Some(mut o) = self.0.stdout.take() { o.read_to_string(&mut out).ok(); }
-        if let Some(mut e) = self.0.stderr.take() { e.read_to_string(&mut err).ok(); }
+        if let Some(mut o) = self.0.stdout.take() {
+            o.read_to_string(&mut out).ok();
+        }
+        if let Some(mut e) = self.0.stderr.take() {
+            e.read_to_string(&mut err).ok();
+        }
         let _ = self.0.wait();
         (out, err)
     }
@@ -54,7 +70,11 @@ impl Drop for ServeGuard {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
+    TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// 消除 free_port 竞态:两个测试并行时可能分到同一端口,输家秒退。
@@ -87,7 +107,10 @@ fn spawn_serve(port: u16, data_dir: &Path, extra_env: &[(&str, &str)]) -> Child 
 
 /// Fixture for the current compatibility generation; legacy paths remain untouched.
 fn cache_dir(data: &Path) -> PathBuf {
-    data.join(format!("state.db.cache-p{}-s2-l1", usagebook_core::store::PARSER_VERSION))
+    data.join(format!(
+        "state.db.cache-p{}-s2-l1",
+        usagebook_core::store::PARSER_VERSION
+    ))
 }
 
 fn backup_dir(data: &Path, timestamp: i64) -> PathBuf {
@@ -135,8 +158,12 @@ fn today_log(dir: &Path) -> PathBuf {
     let mut best: Option<(String, PathBuf)> = None;
     for e in std::fs::read_dir(dir).unwrap().flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        let Some(rest) = name.strip_prefix("usagebook.") else { continue };
-        let Some(date) = rest.strip_suffix(".log") else { continue };
+        let Some(rest) = name.strip_prefix("usagebook.") else {
+            continue;
+        };
+        let Some(date) = rest.strip_suffix(".log") else {
+            continue;
+        };
         if date.len() == 8
             && date.bytes().all(|b| b.is_ascii_digit())
             && best.as_ref().map(|(d, _)| date > d).unwrap_or(true)
@@ -153,7 +180,9 @@ fn wait_panic_entry(logs: &Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(25);
     while Instant::now() < deadline {
         if let Ok(c) = std::fs::read_to_string(&panic_log) {
-            if c.contains("PANIC") { return c; }
+            if c.contains("PANIC") {
+                return c;
+            }
         }
         std::thread::sleep(Duration::from_millis(300));
     }
@@ -181,24 +210,39 @@ fn mode_of(p: &Path) -> u32 {
 #[test]
 fn version_output_exact() {
     let out = Command::new(bin()).arg("--version").output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "usagebook 0.1.0");
-    assert!(out.stderr.is_empty(), "--version 的 stderr 必须为空(初始化抢跑即破坏契约),实为: {}",
-        String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "usagebook 0.1.0"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "--version 的 stderr 必须为空(初始化抢跑即破坏契约),实为: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// 非法日志环境变量 + 一次性命令:不解析不警告(stderr 与基线一致,--json 管道零污染)。
 #[test]
 fn invalid_log_env_silent_for_onetshot() {
     let dir = tmpdir("oneshot-log-env");
-    let base = isolated_report(&dir.join("base-data"), &dir.join("base-claude")).output().unwrap();
+    let base = isolated_report(&dir.join("base-data"), &dir.join("base-claude"))
+        .output()
+        .unwrap();
     let with_env = isolated_report(&dir.join("env-data"), &dir.join("env-claude"))
         .env("USAGEBOOK_LOG_KEEP_DAYS", "abc")
         .env("USAGEBOOK_LOG_MAX_TOTAL", "xyz")
-        .output().unwrap();
-    assert_eq!(base.stderr, with_env.stderr, "非法日志变量不得给一次性命令的 stderr 增加任何行");
-    serde_json::from_slice::<serde_json::Value>(&base.stdout).expect("基线 stdout 必须是完整 JSON(双向校验)");
-    serde_json::from_slice::<serde_json::Value>(&with_env.stdout).expect("带非法变量时 stdout 必须仍是完整 JSON(双向校验)");
-    serde_json::from_slice::<serde_json::Value>(&with_env.stdout).expect("--json stdout 必须完整可解析");
+        .output()
+        .unwrap();
+    assert_eq!(
+        base.stderr, with_env.stderr,
+        "非法日志变量不得给一次性命令的 stderr 增加任何行"
+    );
+    serde_json::from_slice::<serde_json::Value>(&base.stdout)
+        .expect("基线 stdout 必须是完整 JSON(双向校验)");
+    serde_json::from_slice::<serde_json::Value>(&with_env.stdout)
+        .expect("带非法变量时 stdout 必须仍是完整 JSON(双向校验)");
+    serde_json::from_slice::<serde_json::Value>(&with_env.stdout)
+        .expect("--json stdout 必须完整可解析");
 }
 
 /// store 降级 fixture(cfg(unix)):垃圾库 + 目录只读 → 轮转失败 → "降级直读"进 stderr;
@@ -227,7 +271,10 @@ fn json_stdout_pure_with_store_degrade() {
     assert!(err.contains("降级"), "store 降级信息必须留在 stderr: {err}");
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)
         .expect("--json 模式 stdout 必须纯净可解析(store 降级不得污染管道)");
-    assert!(v.is_object() && v.get("totals").is_some(), "JSON 结构存在且含 totals");
+    assert!(
+        v.is_object() && v.get("totals").is_some(),
+        "JSON 结构存在且含 totals"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +293,10 @@ fn serve_startup_marker_rotation_and_permissions() {
     let main = today_log(&logs);
     assert!(main.exists(), "当日主日志文件必须存在");
     let content = std::fs::read_to_string(&main).unwrap();
-    assert!(content.contains("启动标记"), "启动标记(运行边界)必须落盘: {content}");
+    assert!(
+        content.contains("启动标记"),
+        "启动标记(运行边界)必须落盘: {content}"
+    );
     assert!(content.contains(env!("CARGO_PKG_VERSION")));
     // 时间戳规范:每行首字段可被 RFC3339 严格解析(必含时区偏移)。
     for line in content.lines().filter(|l| !l.trim().is_empty()) {
@@ -255,8 +305,20 @@ fn serve_startup_marker_rotation_and_permissions() {
             .unwrap_or_else(|e| panic!("行首应为 RFC3339 时间戳({e}): {line}"));
     }
     // 禁密断言(回归下限):主日志不得含凭据标记。
-    for marker in ["sk-", "ghp_", "github_pat_", "Bearer ", "Authorization:", "token=", "session=", "-----BEGIN"] {
-        assert!(!content.contains(marker), "日志含禁密标记 {marker}: {content}");
+    for marker in [
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "Bearer ",
+        "Authorization:",
+        "token=",
+        "session=",
+        "-----BEGIN",
+    ] {
+        assert!(
+            !content.contains(marker),
+            "日志含禁密标记 {marker}: {content}"
+        );
     }
     // "code=" 出现在 panic 留档断言中;主日志单独排除 code= (启动摘要不含)。
     assert!(!content.contains("code="));
@@ -273,12 +335,18 @@ fn serve_startup_marker_rotation_and_permissions() {
 fn startup_summary_never_logs_unknown_env_values() {
     let data = tmpdir("serve-decoy");
     let logs = data.join("logs");
-    let (mut child, port) = spawn_serve_alive(&data, &[("USAGEBOOK_DECOY_SECRET", "decoy-secret-value-42")]);
+    let (mut child, port) = spawn_serve_alive(
+        &data,
+        &[("USAGEBOOK_DECOY_SECRET", "decoy-secret-value-42")],
+    );
     assert!(wait_port(port, Duration::from_secs(15)));
     std::thread::sleep(Duration::from_millis(400));
     kill(&mut child);
     let content = std::fs::read_to_string(today_log(&logs)).unwrap();
-    assert!(!content.contains("decoy-secret-value-42"), "未知 USAGEBOOK_* 的值不得入日志: {content}");
+    assert!(
+        !content.contains("decoy-secret-value-42"),
+        "未知 USAGEBOOK_* 的值不得入日志: {content}"
+    );
 }
 
 /// 双实例(不同端口 + 同一 DATA_DIR):第二实例文件层降级,两个看板都可用。
@@ -288,12 +356,18 @@ fn dual_instance_second_degrades_file_layer() {
     let (mut a, port_a) = spawn_serve_alive(&data, &[]);
     assert!(wait_port(port_a, Duration::from_secs(15)));
     let (mut b, port_b) = spawn_serve_alive(&data, &[]);
-    assert!(wait_port(port_b, Duration::from_secs(15)), "第二实例看板必须照常服务");
+    assert!(
+        wait_port(port_b, Duration::from_secs(15)),
+        "第二实例看板必须照常服务"
+    );
     std::thread::sleep(Duration::from_millis(400));
     let resp = http_get(port_a, "/api/data").expect("第一实例仍响应");
     assert!(resp.contains("200"), "第一实例 /api/data: {resp}");
     let (_bo, be) = kill(&mut b);
-    assert!(be.contains("文件日志降级") || be.contains("日志目录锁"), "第二实例 stderr 应含降级提示: {be}");
+    assert!(
+        be.contains("文件日志降级") || be.contains("日志目录锁"),
+        "第二实例 stderr 应含降级提示: {be}"
+    );
     kill(&mut a);
 }
 
@@ -307,11 +381,23 @@ fn panic_channel_scrubs_and_persists() {
     let content = wait_panic_entry(&logs);
     let (_out, err) = kill(&mut child);
     assert!(content.contains("test panic"), "panic 条目存在: {content}");
-    assert!(!content.contains("UBCANARY"), "canary 必须被脱敏: {content}");
-    assert!(!content.contains("sk-testsecret"), "密钥标记词必须整体脱敏: {content}");
+    assert!(
+        !content.contains("UBCANARY"),
+        "canary 必须被脱敏: {content}"
+    );
+    assert!(
+        !content.contains("sk-testsecret"),
+        "密钥标记词必须整体脱敏: {content}"
+    );
     // stderr 副本同规脱敏(不再调默认 hook 打原始 payload)。
-    assert!(!err.contains("UBCANARY") && !err.contains("sk-testsecret"), "stderr 副本必须同规脱敏: {err}");
-    assert!(err.contains("test panic") || err.contains("panic"), "stderr 应有净化后的崩溃摘要: {err}");
+    assert!(
+        !err.contains("UBCANARY") && !err.contains("sk-testsecret"),
+        "stderr 副本必须同规脱敏: {err}"
+    );
+    assert!(
+        err.contains("test panic") || err.contains("panic"),
+        "stderr 应有净化后的崩溃摘要: {err}"
+    );
     #[cfg(unix)]
     assert_eq!(mode_of(&logs.join("panic.log")), 0o600);
 }
@@ -339,12 +425,24 @@ fn bad_backups_pruned_to_three_groups() {
         assert!(!backup_dir(&data, ms).exists(), "最老两组应被清理");
     }
     for ms in [3000, 4000, 5000] {
-        assert!(backup_dir(&data, ms).join("state.db").exists(), "最新 3 组保留");
-        assert!(backup_dir(&data, ms).join("state.db-wal").exists(), "整组保留(含侧车)");
+        assert!(
+            backup_dir(&data, ms).join("state.db").exists(),
+            "最新 3 组保留"
+        );
+        assert!(
+            backup_dir(&data, ms).join("state.db-wal").exists(),
+            "整组保留(含侧车)"
+        );
     }
     assert!(unrelated.exists(), "围栏外文件不动");
-    assert_eq!(std::fs::read(data.join("state.db.bad-1000")).unwrap(), b"legacy");
-    assert_eq!(std::fs::read(other_generation.join("state.db")).unwrap(), b"other generation");
+    assert_eq!(
+        std::fs::read(data.join("state.db.bad-1000")).unwrap(),
+        b"legacy"
+    );
+    assert_eq!(
+        std::fs::read(other_generation.join("state.db")).unwrap(),
+        b"other generation"
+    );
 }
 
 /// LOG_DIR=off:文件层关闭(无 logs/ 目录),看板照常服务,.bad 清理仍执行。
@@ -356,17 +454,31 @@ fn log_dir_off_disables_file_layer_but_prunes() {
     }
     std::fs::write(data.join("state.db.bad-100"), b"legacy").unwrap();
     let (mut child, port) = spawn_serve_alive(&data, &[("USAGEBOOK_LOG_DIR", "off")]);
-    assert!(wait_port(port, Duration::from_secs(15)), "off 模式看板照常服务");
+    assert!(
+        wait_port(port, Duration::from_secs(15)),
+        "off 模式看板照常服务"
+    );
     std::thread::sleep(Duration::from_millis(300));
     kill(&mut child);
     assert!(!data.join("logs").exists(), "off 模式不得创建日志目录");
-    assert!(!backup_dir(&data, 100).exists() && !backup_dir(&data, 200).exists(),
-        "off 用户同样执行 .bad 清理(最老两组删除)");
+    assert!(
+        !backup_dir(&data, 100).exists() && !backup_dir(&data, 200).exists(),
+        "off 用户同样执行 .bad 清理(最老两组删除)"
+    );
     for ms in [300i64, 400, 500] {
-        assert!(backup_dir(&data, ms).join("state.db").exists(), "最新 3 组保留(keep=3 语义)");
-        assert!(backup_dir(&data, ms).join("state.db-wal").exists(), "侧车随目录保留");
+        assert!(
+            backup_dir(&data, ms).join("state.db").exists(),
+            "最新 3 组保留(keep=3 语义)"
+        );
+        assert!(
+            backup_dir(&data, ms).join("state.db-wal").exists(),
+            "侧车随目录保留"
+        );
     }
-    assert_eq!(std::fs::read(data.join("state.db.bad-100")).unwrap(), b"legacy");
+    assert_eq!(
+        std::fs::read(data.join("state.db.bad-100")).unwrap(),
+        b"legacy"
+    );
 }
 
 /// 轮转触发配方(20MiB 内置常量无法自然写满):预置超限当日主文件 → 启动 stat 校准
@@ -377,7 +489,11 @@ fn rotation_triggered_by_startup_calibration() {
     let logs = data.join("logs");
     std::fs::create_dir_all(&logs).unwrap();
     let today = chrono::Local::now().format("%Y%m%d").to_string();
-    std::fs::write(logs.join(format!("usagebook.{today}.log")), vec![b'x'; 21 * 1024 * 1024]).unwrap();
+    std::fs::write(
+        logs.join(format!("usagebook.{today}.log")),
+        vec![b'x'; 21 * 1024 * 1024],
+    )
+    .unwrap();
     let (mut child, port) = spawn_serve_alive(&data, &[]);
     assert!(wait_port(port, Duration::from_secs(15)));
     std::thread::sleep(Duration::from_millis(500));
@@ -385,7 +501,10 @@ fn rotation_triggered_by_startup_calibration() {
     let shard = logs.join(format!("usagebook.{today}.001.log"));
     assert!(shard.exists(), "超限主文件应轮转出 .001 分片");
     let new_main_len = std::fs::metadata(today_log(&logs)).unwrap().len();
-    assert!(new_main_len < 1024 * 1024, "新主文件应为小文件(仅含启动后的新条目): {new_main_len}");
+    assert!(
+        new_main_len < 1024 * 1024,
+        "新主文件应为小文件(仅含启动后的新条目): {new_main_len}"
+    );
 }
 
 /// 两轮 serve(顺序起停):追加模式 + 两个启动标记(运行边界可数)。
@@ -411,7 +530,11 @@ fn two_rounds_two_startup_markers() {
         }
     }
     let content = std::fs::read_to_string(today_log(&logs)).unwrap();
-    assert_eq!(content.matches("启动标记").count(), 2, "两轮两个启动标记(锁年龄回退后二次取锁): {content}");
+    assert_eq!(
+        content.matches("启动标记").count(),
+        2,
+        "两轮两个启动标记(锁年龄回退后二次取锁): {content}"
+    );
 }
 
 /// panic.log 超 5MiB 时改名归档(panic.log.old,0600),新文件重建。
@@ -425,7 +548,11 @@ fn panic_archive_rollover_at_5mib() {
     {
         use std::os::unix::fs::PermissionsExt;
         // 以本程序产物的权限预建(0600);归档保留原权限,外来文件不强制收紧(与目录同款语义)。
-        std::fs::set_permissions(logs.join("panic.log"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(
+            logs.join("panic.log"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
     }
     let (mut child, port) = spawn_serve_alive(&data, &[("USAGEBOOK_TEST_PANIC", "1")]);
     assert!(wait_port(port, Duration::from_secs(15)));
@@ -437,7 +564,10 @@ fn panic_archive_rollover_at_5mib() {
     kill(&mut child);
     assert!(old.exists(), "5MiB 超限后改名归档 panic.log.old");
     let cur_len = std::fs::metadata(logs.join("panic.log")).unwrap().len();
-    assert!(cur_len < 1024 * 1024, "重建后的 panic.log 为小文件: {cur_len}");
+    assert!(
+        cur_len < 1024 * 1024,
+        "重建后的 panic.log 为小文件: {cur_len}"
+    );
     #[cfg(unix)]
     {
         assert_eq!(mode_of(&old), 0o600);
@@ -451,11 +581,15 @@ fn unwritable_log_dir_degrades_console_warns() {
     let data = tmpdir("serve-baddir");
     let blocker = data.join("not-a-dir"); // 已存在的文件 → create_dir 失败
     std::fs::write(&blocker, b"x").unwrap();
-    let (mut child, port) = spawn_serve_alive(&data, &[("USAGEBOOK_LOG_DIR", blocker.to_str().unwrap())]);
+    let (mut child, port) =
+        spawn_serve_alive(&data, &[("USAGEBOOK_LOG_DIR", blocker.to_str().unwrap())]);
     assert!(wait_port(port, Duration::from_secs(15)), "降级不阻断看板");
     std::thread::sleep(Duration::from_millis(400));
     let (_o, e) = kill(&mut child);
-    assert!(e.contains("文件日志降级") || e.contains("不可用"), "stderr 应含降级提示: {e}");
+    assert!(
+        e.contains("文件日志降级") || e.contains("不可用"),
+        "stderr 应含降级提示: {e}"
+    );
 }
 
 /// 主日志不出现未缩略的家目录路径(日志路径统一 ~ 缩略)。
@@ -469,15 +603,25 @@ fn home_path_never_appears_unabbreviated() {
     kill(&mut child);
     let content = std::fs::read_to_string(today_log(&logs)).unwrap();
     if let Ok(home) = std::env::var("HOME") {
-        assert!(!content.contains(&home), "日志中的路径必须已做 ~ 缩略: {content}");
+        assert!(
+            !content.contains(&home),
+            "日志中的路径必须已做 ~ 缩略: {content}"
+        );
     }
 }
 
 /// -v 与 --version 组合:clap 先退出,初始化零影响。
 #[test]
 fn verbose_flag_keeps_version_exact() {
-    let out = Command::new(bin()).arg("-v").arg("--version").output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "usagebook 0.1.0");
+    let out = Command::new(bin())
+        .arg("-v")
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "usagebook 0.1.0"
+    );
     assert!(out.stderr.is_empty());
 }
 
@@ -509,8 +653,15 @@ fn symlink_main_log_degrades_end_to_end() {
     assert!(wait_port(port, Duration::from_secs(15)), "降级不阻断看板");
     std::thread::sleep(Duration::from_millis(400));
     let (_o, e) = kill(&mut child);
-    assert!(e.contains("文件日志降级") || e.contains("不可用"), "stderr 应含降级提示: {e}");
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "do not touch", "symlink 目标零写入");
+    assert!(
+        e.contains("文件日志降级") || e.contains("不可用"),
+        "stderr 应含降级提示: {e}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "do not touch",
+        "symlink 目标零写入"
+    );
 }
 
 /// panic 注入消息含换行与 ESC:端到端净化(文件层与 stderr 双路转义为可见字面)。
@@ -528,7 +679,10 @@ fn panic_message_control_chars_sanitized_end_to_end() {
     assert!(content.contains("\\n"), "内容换行转义为字面: {content}");
     assert!(!content.contains('\u{1b}'), "不得残留原始 ESC");
     assert!(!content.contains("UBCANARY") && !content.contains("sk-testsecret"));
-    assert!(!err.contains('\u{1b}') && !err.contains("UBCANARY"), "stderr 同规: {err}");
+    assert!(
+        !err.contains('\u{1b}') && !err.contains("UBCANARY"),
+        "stderr 同规: {err}"
+    );
 }
 
 /// RUST_BACKTRACE=1 时 backtrace 落盘且同样过脱敏。
@@ -536,11 +690,16 @@ fn panic_message_control_chars_sanitized_end_to_end() {
 fn panic_backtrace_recorded_and_scrubbed() {
     let data = tmpdir("serve-bt");
     let logs = data.join("logs");
-    let (mut child, port) = spawn_serve_alive(&data,
-        &[("USAGEBOOK_TEST_PANIC", "1"), ("RUST_BACKTRACE", "1")]);
+    let (mut child, port) = spawn_serve_alive(
+        &data,
+        &[("USAGEBOOK_TEST_PANIC", "1"), ("RUST_BACKTRACE", "1")],
+    );
     assert!(wait_port(port, Duration::from_secs(15)));
     let content = wait_panic_entry(&logs);
     let (_o, _e) = kill(&mut child);
-    assert!(content.contains("backtrace"), "RUST_BACKTRACE=1 时应有 backtrace 段: {content}");
+    assert!(
+        content.contains("backtrace"),
+        "RUST_BACKTRACE=1 时应有 backtrace 段: {content}"
+    );
     assert!(!content.contains("UBCANARY") && !content.contains("sk-testsecret"));
 }

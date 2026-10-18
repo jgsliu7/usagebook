@@ -8,7 +8,7 @@
 //! 去重键(§4):opencode:{db名}:{id}(JSON 兜底用文件路径);fork 复制行 v0.1 不处理,注记上报
 
 use crate::common::{env_roots, home, json_u64, walk_with};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use rusqlite::types::Value as SqlValue;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -72,7 +72,11 @@ struct OcTime {
 
 fn parse_msg(m: &OcMsg) -> Option<Payload> {
     let tk = m.tokens.as_ref()?;
-    let (i, o, rs) = (tk.input.unwrap_or(0), tk.output.unwrap_or(0), tk.reasoning.unwrap_or(0));
+    let (i, o, rs) = (
+        tk.input.unwrap_or(0),
+        tk.output.unwrap_or(0),
+        tk.reasoning.unwrap_or(0),
+    );
     let (cr, cw) = match tk.cache.as_ref() {
         Some(c) => (c.read.unwrap_or(0), c.write.unwrap_or(0)),
         None => (0, 0),
@@ -85,7 +89,12 @@ fn parse_msg(m: &OcMsg) -> Option<Payload> {
         .or(m.model.as_ref().and_then(|x| x.id))
         .unwrap_or("unknown")
         .to_string();
-    let ts_ms = m.time.as_ref().and_then(|t| t.created).map(crate::common::secs_or_ms).unwrap_or(0);
+    let ts_ms = m
+        .time
+        .as_ref()
+        .and_then(|t| t.created)
+        .map(crate::common::secs_or_ms)
+        .unwrap_or(0);
     Some(Payload {
         input: i,
         cache_read: cr,
@@ -122,7 +131,7 @@ fn parse_payload(doc: &serde_json::Value) -> Option<Payload> {
         .pointer("/time/created")
         .and_then(|x| x.as_i64())
         .map(crate::common::secs_or_ms)
-        .unwrap_or(0);   // 缺失不再静默丢行:落 0 由调用方计数上报(2026-10-17,对齐 claude 处理)
+        .unwrap_or(0); // 缺失不再静默丢行:落 0 由调用方计数上报(2026-10-17,对齐 claude 处理)
     Some(Payload {
         input: i,
         cache_read: cr,
@@ -137,10 +146,20 @@ fn parse_payload(doc: &serde_json::Value) -> Option<Payload> {
 
 /// 单个 db 内三通道互斥探测(§2,本机实证):session_message(v2)> message(v1)>
 /// session 聚合兜底。聚合 = 明细之和(本机对拍五列全吻合),同取两通道必双计。
-fn scan_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut HashSet<String>, stats: &mut ScanStats) -> bool {
-    let Ok(conn) = crate::common::open_sqlite_readonly(db) else { return false; };
+fn scan_db(
+    db: &std::path::Path,
+    records: &mut Vec<UsageRecord>,
+    seen: &mut HashSet<String>,
+    stats: &mut ScanStats,
+) -> bool {
+    let Ok(conn) = crate::common::open_sqlite_readonly(db) else {
+        return false;
+    };
 
-    let db_alias = db.file_name().and_then(|s| s.to_str()).unwrap_or("opencode.db");
+    let db_alias = db
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("opencode.db");
     // 通道一/二:逐行明细(v2 session_message 判 type;v1 message 判 role)
     for (table, v2) in [("session_message", true), ("message", false)] {
         let exists = conn
@@ -154,12 +173,17 @@ fn scan_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut Hash
             continue;
         }
         let nonempty: i64 = conn
-            .query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"), [], |r| r.get(0))
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
         if nonempty == 0 {
             continue; // 空表(本机实证:v2 表建好未用)→ 下一通道
         }
-        let Ok(mut stmt) = conn.prepare(&format!("SELECT id, session_id, data FROM {table}")) else {
+        let Ok(mut stmt) = conn.prepare(&format!("SELECT id, session_id, data FROM {table}"))
+        else {
             continue;
         };
         let Ok(mut rows) = stmt.query([]) else {
@@ -172,13 +196,20 @@ fn scan_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut Hash
             // (用户行占大头,宽松匹配误报只多一次解析,零正确性风险)
             let (Some(id), session) = (
                 row.get_ref(0).ok().and_then(|r| match r {
-                    rusqlite::types::ValueRef::Text(t) => std::str::from_utf8(t).ok().map(str::to_string),
+                    rusqlite::types::ValueRef::Text(t) => {
+                        std::str::from_utf8(t).ok().map(str::to_string)
+                    }
                     _ => None,
                 }),
-                row.get_ref(1).ok().and_then(|r| match r {
-                    rusqlite::types::ValueRef::Text(t) => std::str::from_utf8(t).ok().map(str::to_string),
-                    _ => None,
-                }).unwrap_or_default(),
+                row.get_ref(1)
+                    .ok()
+                    .and_then(|r| match r {
+                        rusqlite::types::ValueRef::Text(t) => {
+                            std::str::from_utf8(t).ok().map(str::to_string)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
             ) else {
                 stats.lines_bad_json += 1;
                 continue;
@@ -208,7 +239,9 @@ fn scan_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut Hash
                 continue; // v1 "role"/v2 "type" 经 alias 归一
             }
             let Some(p) = parse_msg(&doc) else { continue };
-            if p.ts_ms == 0 { stats.lines_unknown_type += 1; }   // 缺时间戳:入账但计数可见
+            if p.ts_ms == 0 {
+                stats.lines_unknown_type += 1;
+            } // 缺时间戳:入账但计数可见
             let key = format!("opencode:{}:{}", db_alias, id);
             if seen.insert(key.clone()) {
                 records.push(UsageRecord {
@@ -230,9 +263,13 @@ fn scan_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut Hash
             }
         }
         if table_rows > 0 {
-            stats
-                .notes
-                .push(format!("{} {} 表 {} 行(v{})", db.display(), table, table_rows, if v2 { 2 } else { 1 }));
+            stats.notes.push(format!(
+                "{} {} 表 {} 行(v{})",
+                db.display(),
+                table,
+                table_rows,
+                if v2 { 2 } else { 1 }
+            ));
             stats.files_parsed += 1;
             return true; // 通道互斥(§2)
         }
@@ -251,11 +288,17 @@ fn scan_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut Hash
                    tokens_cache_read, tokens_cache_write, time_created FROM session \
                    WHERE tokens_input>0 OR tokens_output>0 OR tokens_reasoning>0 \
                       OR tokens_cache_read>0 OR tokens_cache_write>0";
-        let Ok(mut stmt) = conn.prepare(sql) else { return false };
-        let Ok(mut rows) = stmt.query([]) else { return false };
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            return false;
+        };
+        let Ok(mut rows) = stmt.query([]) else {
+            return false;
+        };
         let mut n = 0u64;
         while let Ok(Some(row)) = rows.next() {
-            let vals: Vec<SqlValue> = (0..9).filter_map(|i| row.get::<_, SqlValue>(i).ok()).collect();
+            let vals: Vec<SqlValue> = (0..9)
+                .filter_map(|i| row.get::<_, SqlValue>(i).ok())
+                .collect();
             if vals.len() < 9 {
                 continue;
             }
@@ -308,9 +351,11 @@ fn scan_db(db: &std::path::Path, records: &mut Vec<UsageRecord>, seen: &mut Hash
             }
         }
         if n > 0 {
-            stats
-                .notes
-                .push(format!("{} session 聚合 {} 行(明细表空,兜底通道)", db.display(), n));
+            stats.notes.push(format!(
+                "{} session 聚合 {} 行(明细表空,兜底通道)",
+                db.display(),
+                n
+            ));
             stats.files_parsed += 1;
             return true;
         }
@@ -348,7 +393,11 @@ impl UsageSource for OpencodeSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], _max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        _max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         // max_files 对本源无意义:sqlite 全量读;JSON 兜底量小
         let mut stats = ScanStats::default();
         if roots.is_empty() {
@@ -403,7 +452,9 @@ impl UsageSource for OpencodeSource {
             // JSON 兜底(§2):storage/message/**/*.json
             let msg_dir = root.join("storage/message");
             if msg_dir.is_dir() {
-                let files = walk_with(&msg_dir, None, &|p| p.extension().is_some_and(|x| x == "json"));
+                let files = walk_with(&msg_dir, None, &|p| {
+                    p.extension().is_some_and(|x| x == "json")
+                });
                 stats.files_seen += files.len();
                 let mut parsed = 0u64;
                 for path in &files {
@@ -419,9 +470,13 @@ impl UsageSource for OpencodeSource {
                     if role.and_then(|x| x.as_str()) != Some("assistant") {
                         continue;
                     }
-                    let Some(p) = parse_payload(&doc) else { continue };
-                    if p.ts_ms == 0 { stats.lines_unknown_type += 1; }   // 缺时间戳:入账但计数可见(2026-10-17)
-                    // 会话 id = storage/message/<sid>/<mid>.json 的上级目录
+                    let Some(p) = parse_payload(&doc) else {
+                        continue;
+                    };
+                    if p.ts_ms == 0 {
+                        stats.lines_unknown_type += 1;
+                    } // 缺时间戳:入账但计数可见(2026-10-17)
+                      // 会话 id = storage/message/<sid>/<mid>.json 的上级目录
                     let session = path
                         .parent()
                         .and_then(|d| d.file_name())
@@ -451,10 +506,15 @@ impl UsageSource for OpencodeSource {
                 }
                 stats.files_parsed += files.len();
                 if parsed > 0 {
-                    stats.notes.push(format!("JSON 兜底 {} 条(storage/message)", parsed));
+                    stats
+                        .notes
+                        .push(format!("JSON 兜底 {} 条(storage/message)", parsed));
                 }
             } else if !main.is_file() && !done {
-                stats.notes.push(format!("根 {} 下无 opencode.db/opencode-*.db/storage", root.display()));
+                stats.notes.push(format!(
+                    "根 {} 下无 opencode.db/opencode-*.db/storage",
+                    root.display()
+                ));
             }
         }
 

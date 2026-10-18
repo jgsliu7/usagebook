@@ -6,8 +6,8 @@
 //! 共用的序列化形状,字段增删需兼容已有消费方,不可轻动。
 
 use crate::model::{Caliber, ScanStats, SourceTier, UsageRecord};
+use crate::{common, registered_sources, SOURCE_CATALOG};
 use chrono::TimeZone;
-use crate::{registered_sources, common, SOURCE_CATALOG};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -138,16 +138,26 @@ pub fn build_snapshot(refresh_secs: u64, verbose: bool) -> Snapshot {
             let (recs, stats) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let roots = a.discover_roots();
                 common::scan_source_cached(a.as_ref(), &roots)
-            })).unwrap_or_else(|_| (vec![], ScanStats {
-                failed: true,
-                notes: vec!["此数据源扫描异常,本轮未计入;其他数据源继续统计".into()],
-                ..Default::default()
-            }));
+            }))
+            .unwrap_or_else(|_| {
+                (
+                    vec![],
+                    ScanStats {
+                        failed: true,
+                        notes: vec!["此数据源扫描异常,本轮未计入;其他数据源继续统计".into()],
+                        ..Default::default()
+                    },
+                )
+            });
             (a.id().to_string(), recs, stats)
         })
         .collect();
     for (source, recs, stats) in results {
-        source_scans.push(SourceScan { source, records: recs.len(), stats });
+        source_scans.push(SourceScan {
+            source,
+            records: recs.len(),
+            stats,
+        });
         records.extend(recs);
     }
     let mut snap = snapshot_from_records(&records, refresh_secs, generated_at_ms, source_scans);
@@ -157,23 +167,41 @@ pub fn build_snapshot(refresh_secs: u64, verbose: bool) -> Snapshot {
 
 /// Pure aggregation seam: a single fixed cutoff controls both today's hours and
 /// yesterday's same-local-time comparison. Future rows cannot skew either side.
-pub fn snapshot_from_records(records: &[UsageRecord], refresh_secs: u64, generated_at_ms: i64, source_scans: Vec<SourceScan>) -> Snapshot {
-    let now = chrono::Local.timestamp_millis_opt(generated_at_ms).single()
+pub fn snapshot_from_records(
+    records: &[UsageRecord],
+    refresh_secs: u64,
+    generated_at_ms: i64,
+    source_scans: Vec<SourceScan>,
+) -> Snapshot {
+    let now = chrono::Local
+        .timestamp_millis_opt(generated_at_ms)
+        .single()
         .expect("snapshot cutoff is a valid epoch timestamp");
     let prior_bounds = now.date_naive().pred_opt().and_then(|day| {
-        let start = chrono::Local.from_local_datetime(&day.and_hms_opt(0, 0, 0)?).earliest()?;
+        let start = chrono::Local
+            .from_local_datetime(&day.and_hms_opt(0, 0, 0)?)
+            .earliest()?;
         // end 保持 earliest()(2026-10-17 复核回退):chrono 的 Ambiguous 按偏移升序构造,
         // earliest=第二遍(较大 epoch)——含 DST 折叠的整个墙钟同期;latest 反而截掉第二遍。
         // 非 DST 时区两者恒等(实测),中国时区不受影响
-        let end = chrono::Local.from_local_datetime(&day.and_time(now.time())).earliest()?;
+        let end = chrono::Local
+            .from_local_datetime(&day.and_time(now.time()))
+            .earliest()?;
         Some((start.timestamp_millis(), end.timestamp_millis()))
     });
     let mut prior: BTreeMap<(String, String), Buckets> = BTreeMap::new();
-    let src_files: BTreeMap<String, u64> = source_scans.iter()
-        .map(|s| (s.source.clone(), s.stats.files_parsed as u64)).collect();
-    let mut notes: Vec<String> = source_scans.iter().filter(|s| !s.stats.notes.is_empty())
-        .map(|s| format!("[{}] {}", s.source, s.stats.notes.join(";"))).collect();
-    if prior_bounds.is_none() { notes.push("昨日本地同期时刻不可表示(时区切换),同期桶为空".into()); }
+    let src_files: BTreeMap<String, u64> = source_scans
+        .iter()
+        .map(|s| (s.source.clone(), s.stats.files_parsed as u64))
+        .collect();
+    let mut notes: Vec<String> = source_scans
+        .iter()
+        .filter(|s| !s.stats.notes.is_empty())
+        .map(|s| format!("[{}] {}", s.source, s.stats.notes.join(";")))
+        .collect();
+    if prior_bounds.is_none() {
+        notes.push("昨日本地同期时刻不可表示(时区切换),同期桶为空".into());
+    }
 
     let mut hours: BTreeMap<(String, String, String), Buckets> = BTreeMap::new();
     let mut by_source: BTreeMap<String, Buckets> = BTreeMap::new();
@@ -189,7 +217,9 @@ pub fn snapshot_from_records(records: &[UsageRecord], refresh_secs: u64, generat
     let mut cost_by_session: HashMap<String, f64> = HashMap::new();
 
     for r in records {
-        if r.ts_ms > generated_at_ms { continue; }
+        if r.ts_ms > generated_at_ms {
+            continue;
+        }
         if r.caliber == Caliber::RequestDelta {
             let hour = common::ms_to_local_hour(r.ts_ms);
             let mkey = r.model.to_lowercase();
@@ -208,7 +238,10 @@ pub fn snapshot_from_records(records: &[UsageRecord], refresh_secs: u64, generat
                 .add(r);
             by_source.entry(r.source.to_string()).or_default().add(r);
             if prior_bounds.is_some_and(|(start, end)| r.ts_ms >= start && r.ts_ms <= end) {
-                prior.entry((r.source.to_string(), mkey.clone())).or_default().add(r);
+                prior
+                    .entry((r.source.to_string(), mkey.clone()))
+                    .or_default()
+                    .add(r);
             }
             by_model.entry(mkey).or_default().add(r);
             src_sessions
@@ -253,9 +286,16 @@ pub fn snapshot_from_records(records: &[UsageRecord], refresh_secs: u64, generat
         ready: true,
         generated_at_ms,
         local_date: now.format("%Y-%m-%d").to_string(),
-        prior_day_to_now: prior_bounds.map(|_| prior.into_iter().map(|((s, m), b)| PriorDayRow {
-            s, m: model_disp.get(&m).cloned().unwrap_or(m), b,
-        }).collect()),
+        prior_day_to_now: prior_bounds.map(|_| {
+            prior
+                .into_iter()
+                .map(|((s, m), b)| PriorDayRow {
+                    s,
+                    m: model_disp.get(&m).cloned().unwrap_or(m),
+                    b,
+                })
+                .collect()
+        }),
         source_scans,
         scan_ms: 0,
         refresh_secs,
@@ -281,7 +321,9 @@ pub fn snapshot_from_records(records: &[UsageRecord], refresh_secs: u64, generat
             .into_iter()
             .map(|(m, b)| ModelAgg {
                 m: model_disp.get(&m).cloned().unwrap_or_else(|| m.clone()),
-                sources: model_sources.remove(&m).map_or(vec![], |x| x.into_iter().collect()),
+                sources: model_sources
+                    .remove(&m)
+                    .map_or(vec![], |x| x.into_iter().collect()),
                 b,
             })
             .collect(),

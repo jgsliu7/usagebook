@@ -5,11 +5,7 @@ use usagebook_core::sources::qwen;
 use usagebook_core::UsageSource;
 
 fn temp_root(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "usagebook-fixture-{}-{}",
-        tag,
-        std::process::id()
-    ));
+    let d = std::env::temp_dir().join(format!("usagebook-fixture-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -40,17 +36,40 @@ fn qwen_monthly_channel_priority() {
     .unwrap();
 
     let (records, stats) = qwen::QwenSource.scan_roots(std::slice::from_ref(&root), None);
-    assert_eq!(records.len(), 3, "全零行跳过+chats 让位;notes: {:?}", stats.notes);
-    let u1 = records.iter().find(|r| r.dedup_key == "qwen:monthly:u1").unwrap();
+    assert_eq!(
+        records.len(),
+        3,
+        "全零行跳过+chats 让位;notes: {:?}",
+        stats.notes
+    );
+    let u1 = records
+        .iter()
+        .find(|r| r.dedup_key == "qwen:monthly:u1")
+        .unwrap();
     // inclusive:26244 − 25984;openai 协议:output 98 − thoughts 17(§7.3)
     assert_eq!(
-        (u1.input_uncached, u1.cache_read, u1.output, u1.reasoning_output),
+        (
+            u1.input_uncached,
+            u1.cache_read,
+            u1.output,
+            u1.reasoning_output
+        ),
         (260, 25984, 81, 17)
     );
     assert_eq!(u1.ts_ms, 1791338342949, "timestamp ISO → 毫秒");
-    let u2 = records.iter().find(|r| r.dedup_key == "qwen:monthly:u2").unwrap();
-    assert_eq!(u2.agent.as_deref(), Some("managed-auto-memory-extractor"), "后台辅助归因(§7.2)");
-    let u3 = records.iter().find(|r| r.dedup_key == "qwen:monthly:u3").unwrap();
+    let u2 = records
+        .iter()
+        .find(|r| r.dedup_key == "qwen:monthly:u2")
+        .unwrap();
+    assert_eq!(
+        u2.agent.as_deref(),
+        Some("managed-auto-memory-extractor"),
+        "后台辅助归因(§7.2)"
+    );
+    let u3 = records
+        .iter()
+        .find(|r| r.dedup_key == "qwen:monthly:u3")
+        .unwrap();
     // gemini 协议:output 不含 thoughts → 300 直取(§7.3)
     assert_eq!((u3.output, u3.reasoning_output), (300, 50));
     assert_eq!(u3.cache_read, 100);
@@ -73,6 +92,14 @@ fn qwen_chats_fallback() {
     assert_eq!(records.len(), 1, "notes: {:?}", stats.notes);
     let c9 = &records[0];
     assert_eq!(c9.dedup_key, "qwen:c9");
-    assert_eq!((c9.input_uncached, c9.cache_read, c9.output, c9.reasoning_output), (70, 30, 30, 20));
+    assert_eq!(
+        (
+            c9.input_uncached,
+            c9.cache_read,
+            c9.output,
+            c9.reasoning_output
+        ),
+        (70, 30, 30, 20)
+    );
     let _ = std::fs::remove_dir_all(root);
 }

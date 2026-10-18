@@ -8,7 +8,7 @@
 //! 去重键:grok:{eventId}:{model},无 eventId 用内容键(§4)
 
 use crate::common::{env_roots, home, json_u64, walk_with};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -18,11 +18,23 @@ pub struct GrokSource;
 /// 单模型 usage 条目 → 五桶 + 成本(§3)。
 fn map_usage(u: &Value) -> ([u64; 4], Option<f64>) {
     let g = |k: &str| json_u64(u.get(k));
-    let (input, cr, cw, out) = (g("inputTokens"), g("cachedReadTokens"), g("cacheCreationTokens"), g("outputTokens"));
+    let (input, cr, cw, out) = (
+        g("inputTokens"),
+        g("cachedReadTokens"),
+        g("cacheCreationTokens"),
+        g("outputTokens"),
+    );
     let uncached = input.saturating_sub(cr); // inclusive 减除(§3)
     let cache_write = cw.min(uncached); // 钳制到剩余 uncached(ccusage)
-    let ticks = u.get("costUsdTicks").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    let cost = if ticks != 0.0 { Some(ticks * 1e-10) } else { None }; // 1 tick = 1e-10 USD
+    let ticks = u
+        .get("costUsdTicks")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0);
+    let cost = if ticks != 0.0 {
+        Some(ticks * 1e-10)
+    } else {
+        None
+    }; // 1 tick = 1e-10 USD
     ([uncached, cr, cache_write, out], cost)
 }
 
@@ -42,7 +54,11 @@ impl UsageSource for GrokSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             stats.notes.push("未发现 ~/.grok 或 GROK_HOME".into());
@@ -99,7 +115,11 @@ impl UsageSource for GrokSource {
                 let ts_ms = params
                     .pointer("/_meta/agentTimestampMs")
                     .and_then(|x| x.as_i64())
-                    .or_else(|| v.get("timestamp").and_then(|x| x.as_i64()).map(|s| s.saturating_mul(1000)))
+                    .or_else(|| {
+                        v.get("timestamp")
+                            .and_then(|x| x.as_i64())
+                            .map(|s| s.saturating_mul(1000))
+                    })
                     .unwrap_or(0);
                 if ts_ms == 0 {
                     no_ts += 1;
@@ -109,18 +129,26 @@ impl UsageSource for GrokSource {
                     .and_then(|x| x.as_str())
                     .unwrap_or(&dir_session)
                     .to_string();
-                let event_id = params.pointer("/_meta/eventId").and_then(|x| x.as_str()).unwrap_or("");
+                let event_id = params
+                    .pointer("/_meta/eventId")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 // 逐模型展开 or 单条(§2)
-                let model_entries: Vec<(String, &Value)> =
-                    match usage.get("modelUsage").and_then(|m| m.as_object()) {
-                        Some(mu) if !mu.is_empty() => mu.iter().map(|(k, u)| (k.clone(), u)).collect(),
-                        _ => vec![("unknown".into(), usage)],
-                    };
+                let model_entries: Vec<(String, &Value)> = match usage
+                    .get("modelUsage")
+                    .and_then(|m| m.as_object())
+                {
+                    Some(mu) if !mu.is_empty() => mu.iter().map(|(k, u)| (k.clone(), u)).collect(),
+                    _ => vec![("unknown".into(), usage)],
+                };
                 for (model, u) in model_entries {
                     let ([i, cr, cw, o], cost) = map_usage(u);
                     // reasoning 是 output 子集,丢弃防双计(§3)
                     let key = if event_id.is_empty() {
-                        format!("grok:{session_id}:{ts_ms}:{model}:{}:{}:{}:{}", i, cr, cw, o)
+                        format!(
+                            "grok:{session_id}:{ts_ms}:{model}:{}:{}:{}:{}",
+                            i, cr, cw, o
+                        )
                     } else {
                         format!("grok:{event_id}:{model}")
                     };
@@ -150,13 +178,19 @@ impl UsageSource for GrokSource {
         }
 
         for (root, n) in per_root {
-            stats.notes.push(format!("根 {}:{n} 个 updates.jsonl", root));
+            stats
+                .notes
+                .push(format!("根 {}:{n} 个 updates.jsonl", root));
         }
         if no_ts > 0 {
-            stats.notes.push(format!("无时间戳行 {no_ts} 条(ts=0 记账,§4)"));
+            stats
+                .notes
+                .push(format!("无时间戳行 {no_ts} 条(ts=0 记账,§4)"));
         }
         if dup_dropped > 0 {
-            stats.notes.push(format!("去重键命中丢弃 {dup_dropped} 条(§4)"));
+            stats
+                .notes
+                .push(format!("去重键命中丢弃 {dup_dropped} 条(§4)"));
         }
         (records, stats)
     }

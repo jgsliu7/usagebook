@@ -15,8 +15,10 @@
 //!       identity 主取 msg:{message.id};fork 拷贝全同 → 跨文件折叠,tokscale dsh.rs:345-442)
 //! 口径:DSH 不落任何成本字段(§4),cost_usd 恒 None
 
-use crate::common::{env_roots, home, usage_projection, cached_usage_file, prune_usage_cache, UsageLines};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::common::{
+    cached_usage_file, env_roots, home, prune_usage_cache, usage_projection, UsageLines,
+};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
@@ -96,7 +98,11 @@ struct FileCtx {
 /// trim 后非空才返回(tokscale non_empty_string 同义)。
 fn non_empty_str(s: &str) -> Option<&str> {
     let t = s.trim();
-    if t.is_empty() { None } else { Some(t) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
 }
 
 /// Value → trim 后非空的 &str。
@@ -124,7 +130,9 @@ fn session_fname_info(name: &str) -> Option<(u32, bool)> {
 
 /// 递归收集会话数据文件候选(不假设目录深度;排序保证确定性)。
 fn walk_candidates(root: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let Ok(ft) = e.file_type() else { continue };
@@ -227,17 +235,44 @@ fn last_stream_usage(v: &Value) -> Option<&Value> {
 
 fn project_usage(v: &Value) -> Option<Value> {
     let ev = v.get("type").and_then(Value::as_str).unwrap_or("");
-    if KNOWN_TYPES.contains(&ev) && ev != "assistant/chunk" { return None; }
-    let mut out = usage_projection(v, &[
-        "/type", "/id", "/origin", "/agentPreset", "/seedLength", "/seq", "/time", "/surfaceOp",
-        "/data/header/config/provider", "/data/header/config/model", "/data/turn", "/data/step",
-        "/data/message/id", "/data/message/source/provider", "/data/message/source/model",
-        "/data/message/source/replayState/response/responseModel", "/data/attemptId", "/data/retryId", "/data/compactionId",
-    ]);
+    if KNOWN_TYPES.contains(&ev) && ev != "assistant/chunk" {
+        return None;
+    }
+    let mut out = usage_projection(
+        v,
+        &[
+            "/type",
+            "/id",
+            "/origin",
+            "/agentPreset",
+            "/seedLength",
+            "/seq",
+            "/time",
+            "/surfaceOp",
+            "/data/header/config/provider",
+            "/data/header/config/model",
+            "/data/turn",
+            "/data/step",
+            "/data/message/id",
+            "/data/message/source/provider",
+            "/data/message/source/model",
+            "/data/message/source/replayState/response/responseModel",
+            "/data/attemptId",
+            "/data/retryId",
+            "/data/compactionId",
+        ],
+    );
     if let Some(usage) = usage_for_event(v, ev) {
-        out["usagebook_usage"] = usage_projection(usage, &[
-            "/inputTokens", "/outputTokens", "/cacheReadTokens", "/cacheWriteTokens", "/reasoningTokens",
-        ]);
+        out["usagebook_usage"] = usage_projection(
+            usage,
+            &[
+                "/inputTokens",
+                "/outputTokens",
+                "/cacheReadTokens",
+                "/cacheWriteTokens",
+                "/reasoningTokens",
+            ],
+        );
     }
     Some(out)
 }
@@ -257,13 +292,15 @@ impl UsageSource for DshSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             prune_usage_cache("dsh", &[]);
-            stats
-                .notes
-                .push("未发现 ~/.dsh 或 DSH_HOME".into());
+            stats.notes.push("未发现 ~/.dsh 或 DSH_HOME".into());
             return (vec![], stats);
         }
 
@@ -282,9 +319,9 @@ impl UsageSource for DshSource {
         candidates.sort();
         let mut per_dir: BTreeMap<PathBuf, Vec<(u32, bool, PathBuf)>> = BTreeMap::new();
         for p in candidates {
-            let Some(info) = session_fname_info(
-                p.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
-            ) else {
+            let Some(info) =
+                session_fname_info(p.file_name().and_then(|s| s.to_str()).unwrap_or_default())
+            else {
                 continue; // 理论不可达(walk_candidates 同规则过滤);防御性跳过并计 unknown
             };
             per_dir
@@ -342,19 +379,29 @@ impl UsageSource for DshSource {
                     Ok((bytes, torn)) => {
                         out.readable = true;
                         out.bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                        if torn { out.notes.push(format!("{dir_name}: 活跃写入尾帧撕裂,保留已解前缀(§8)")); }
-                        for raw in bytes.split(|&b| b == b'\n') { out.push(&String::from_utf8_lossy(raw), project_usage); }
+                        if torn {
+                            out.notes
+                                .push(format!("{dir_name}: 活跃写入尾帧撕裂,保留已解前缀(§8)"));
+                        }
+                        for raw in bytes.split(|&b| b == b'\n') {
+                            out.push(&String::from_utf8_lossy(raw), project_usage);
+                        }
                         // reload-on-change 契约:整文件视为已提交,边界随返回值携带。
                         out.committed_bytes = out.bytes;
                         out.committed_lines = out.total;
                         out.committed_bad = out.bad;
                     }
-                    Err(e) => { out.bad = 1; out.notes.push(format!("跳过会话文件({e})")); }
+                    Err(e) => {
+                        out.bad = 1;
+                        out.notes.push(format!("跳过会话文件({e})"));
+                    }
                 }
                 out
             });
             lines.account(&mut stats, outcome);
-            if !lines.readable { continue; }
+            if !lines.readable {
+                continue;
+            }
             stats.files_parsed += 1;
             for (_, v) in &lines.events {
                 let Some(ev) = v.get("type").and_then(|x| x.as_str()) else {
@@ -413,8 +460,7 @@ impl UsageSource for DshSource {
                         }
                         // fork 前缀双计防御(§3b.5)
                         if ctx.seed_length > 0
-                            && v
-                                .get("seq")
+                            && v.get("seq")
                                 .and_then(|x| x.as_i64())
                                 .is_some_and(|seq| seq < ctx.seed_length)
                         {
@@ -497,10 +543,8 @@ impl UsageSource for DshSource {
                                         .map(|seq| format!("attempt-session:{sid}:seq:{seq}"))
                                 })
                                 .or_else(|| {
-                                    let turn =
-                                        v.pointer("/data/turn").and_then(|x| x.as_i64())?;
-                                    let step =
-                                        v.pointer("/data/step").and_then(|x| x.as_i64())?;
+                                    let turn = v.pointer("/data/turn").and_then(|x| x.as_i64())?;
+                                    let step = v.pointer("/data/step").and_then(|x| x.as_i64())?;
                                     Some(format!(
                                         "attempt-session:{sid}:turn:{turn}:step:{step}:{ts_raw}"
                                     ))
@@ -564,7 +608,7 @@ impl UsageSource for DshSource {
                             model: model.clone(),
                             ts_ms,
                             caliber: Caliber::RequestDelta, // request_delta(§4 映射表)
-                            input_uncached: i, // 硬约束一:已是 exclusive,直取勿减
+                            input_uncached: i,              // 硬约束一:已是 exclusive,直取勿减
                             cache_read: cr,
                             cache_write: cw,
                             cache_write_1h: 0,
@@ -615,7 +659,9 @@ impl UsageSource for DshSource {
         for r in roots {
             let n = files.iter().filter(|f| f.starts_with(r)).count();
             if n > 0 {
-                stats.notes.push(format!("根 {}:{} 个会话文件", r.display(), n));
+                stats
+                    .notes
+                    .push(format!("根 {}:{} 个会话文件", r.display(), n));
             }
         }
         if alternates > 0 {
@@ -625,27 +671,33 @@ impl UsageSource for DshSource {
             ));
         }
         if mirror_chunks > 0 {
-            stats
-                .notes
-                .push(format!("assistant/chunk 用量镜像 {} 行不计(§3b.1)", mirror_chunks));
+            stats.notes.push(format!(
+                "assistant/chunk 用量镜像 {} 行不计(§3b.1)",
+                mirror_chunks
+            ));
         }
         if attempt_rows > 0 {
-            stats
-                .notes
-                .push(format!("assistant/attempt {} 行(失败重试日志,全零自然跳过)", attempt_rows));
+            stats.notes.push(format!(
+                "assistant/attempt {} 行(失败重试日志,全零自然跳过)",
+                attempt_rows
+            ));
         }
         if summary_rows > 0 {
-            stats
-                .notes
-                .push(format!("compaction/summary {} 行(压缩摘要计费调用)", summary_rows));
+            stats.notes.push(format!(
+                "compaction/summary {} 行(压缩摘要计费调用)",
+                summary_rows
+            ));
         }
         if seed_skipped > 0 {
-            stats
-                .notes
-                .push(format!("fork 继承前缀跳过 {} 条(seedLength,§3b.5)", seed_skipped));
+            stats.notes.push(format!(
+                "fork 继承前缀跳过 {} 条(seedLength,§3b.5)",
+                seed_skipped
+            ));
         }
         if zero_skipped > 0 {
-            stats.notes.push(format!("全零 usage 跳过 {} 条(§5.4)", zero_skipped));
+            stats
+                .notes
+                .push(format!("全零 usage 跳过 {} 条(§5.4)", zero_skipped));
         }
         if no_usage_skipped > 0 {
             stats
@@ -658,9 +710,10 @@ impl UsageSource for DshSource {
                 .push(format!("缺时间戳跳过 {} 条(§5.3)", no_time_skipped));
         }
         if surface_skipped > 0 {
-            stats
-                .notes
-                .push(format!("surfaceOp 非 append 跳过 {} 条(§5.4)", surface_skipped));
+            stats.notes.push(format!(
+                "surfaceOp 非 append 跳过 {} 条(§5.4)",
+                surface_skipped
+            ));
         }
         stats.notes.push(format!(
             "会话 {} · 模型 {} · 子代理会话归 agent 字段",

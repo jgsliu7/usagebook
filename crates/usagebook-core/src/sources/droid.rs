@@ -8,7 +8,7 @@
 //! 去重:droid:{sessionId},同 id 多文件保总量最大者(§5)
 
 use crate::common::{env_roots, home, iso_to_ms, json_u64, walk_with};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -63,7 +63,11 @@ impl UsageSource for DroidSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             stats
@@ -113,15 +117,24 @@ impl UsageSource for DroidSource {
             stats.files_parsed += 1;
             stats.lines_total += 1;
             let g = |k: &str| json_u64(tu.get(k));
-            let (mut i, o, cw, cr, rs) =
-                (g("inputTokens"), g("outputTokens"), g("cacheCreationTokens"), g("cacheReadTokens"), g("thinkingTokens"));
+            let (mut i, o, cw, cr, rs) = (
+                g("inputTokens"),
+                g("outputTokens"),
+                g("cacheCreationTokens"),
+                g("cacheReadTokens"),
+                g("thinkingTokens"),
+            );
             if i == 0 && o == 0 && cw == 0 && cr == 0 && rs == 0 {
                 continue;
             }
             // totalTokens 差额兜底(§4)
             let sum = i + o + cw + cr + rs;
             let total = g("totalTokens");
-            let output = if total > sum && o == 0 { total - sum } else { o };
+            let output = if total > sum && o == 0 {
+                total - sum
+            } else {
+                o
+            };
             let _ = &mut i;
             // 时间戳(§3):providerLockTimestamp 稳定优先;mtime 回退有漂移风险,计数上报
             let ts_ms = doc
@@ -148,7 +161,11 @@ impl UsageSource for DroidSource {
             // 同 id 多文件保总量最大者(§5)
             let replace = match best.get(&session_id) {
                 Some(prev) => {
-                    prev.input_uncached + prev.output + prev.cache_read + prev.cache_write + prev.reasoning_output
+                    prev.input_uncached
+                        + prev.output
+                        + prev.cache_read
+                        + prev.cache_write
+                        + prev.reasoning_output
                         <= total_buckets
                 }
                 None => true,
@@ -181,7 +198,9 @@ impl UsageSource for DroidSource {
         let records: Vec<UsageRecord> = keys.into_iter().filter_map(|k| best.remove(&k)).collect();
 
         for (root, n) in per_root {
-            stats.notes.push(format!("根 {}:{n} 个 *.settings.json", root));
+            stats
+                .notes
+                .push(format!("根 {}:{n} 个 *.settings.json", root));
         }
         if mtime_fallback > 0 {
             stats.notes.push(format!(

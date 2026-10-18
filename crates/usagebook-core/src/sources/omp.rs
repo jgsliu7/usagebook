@@ -110,7 +110,11 @@ impl UsageSource for OmpSource {
         }
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             stats
@@ -243,7 +247,11 @@ impl UsageSource for OmpSource {
                 };
                 let ts = match ts_from_msg {
                     Some(t) => Some(t),
-                    None => match v.get("timestamp").and_then(|x| x.as_str()).and_then(iso_to_ms) {
+                    None => match v
+                        .get("timestamp")
+                        .and_then(|x| x.as_str())
+                        .and_then(iso_to_ms)
+                    {
                         Some(t) => {
                             ts_line_fallback += 1;
                             Some(t)
@@ -345,14 +353,16 @@ impl UsageSource for OmpSource {
                 .push(format!("cost.total 缺失记 0 共 {} 条(§8)", cost_missing));
         }
         if usage_missing > 0 {
-            stats
-                .notes
-                .push(format!("assistant 行缺 usage 对象 {} 条(跳过)", usage_missing));
+            stats.notes.push(format!(
+                "assistant 行缺 usage 对象 {} 条(跳过)",
+                usage_missing
+            ));
         }
         if ts_line_fallback > 0 {
-            stats
-                .notes
-                .push(format!("message.timestamp 缺失退化行级时间戳 {} 条", ts_line_fallback));
+            stats.notes.push(format!(
+                "message.timestamp 缺失退化行级时间戳 {} 条",
+                ts_line_fallback
+            ));
         }
         if no_time_skipped > 0 {
             stats

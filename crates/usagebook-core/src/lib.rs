@@ -26,40 +26,140 @@ pub mod snapshot;
 pub mod sources;
 pub mod store;
 
-pub use model::{Caliber, ScanStats, SourceTier, UsageSource, UsageRecord};
-pub use snapshot::{SourceInfo, Snapshot};
+pub use model::{Caliber, ScanStats, SourceTier, UsageRecord, UsageSource};
+pub use snapshot::{Snapshot, SourceInfo};
 
 /// 源元数据目录(显示名/实证等级)。与 registered_sources() 的 id 一一对应,
 /// 由单元测试保证不漂移;新增源 = 适配器 + 注册行 + 目录行,共三处。
 pub const SOURCE_CATALOG: &[SourceInfo] = &[
-    SourceInfo { id: "claude",    label: "Claude Code",    tier: SourceTier::Verified },
-    SourceInfo { id: "codex",     label: "Codex CLI",      tier: SourceTier::Verified },
-    SourceInfo { id: "kimi",      label: "Kimi Code",      tier: SourceTier::Verified },
-    SourceInfo { id: "zcode",     label: "ZCode",          tier: SourceTier::Verified },
-    SourceInfo { id: "workbuddy", label: "WorkBuddy",      tier: SourceTier::Verified },
-    SourceInfo { id: "dsh",       label: "DeepSeek Harness", tier: SourceTier::Verified },
-    SourceInfo { id: "minimax",   label: "MiniMax Code",   tier: SourceTier::Verified },
-    SourceInfo { id: "omp",       label: "oh-my-pi",       tier: SourceTier::Verified },
-    SourceInfo { id: "pi",        label: "pi",             tier: SourceTier::Verified },
-    SourceInfo { id: "cline",     label: "Cline",          tier: SourceTier::Verified },
+    SourceInfo {
+        id: "claude",
+        label: "Claude Code",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "codex",
+        label: "Codex CLI",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "kimi",
+        label: "Kimi Code",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "zcode",
+        label: "ZCode",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "workbuddy",
+        label: "WorkBuddy",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "dsh",
+        label: "DeepSeek Harness",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "minimax",
+        label: "MiniMax Code",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "omp",
+        label: "oh-my-pi",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "pi",
+        label: "pi",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "cline",
+        label: "Cline",
+        tier: SourceTier::Verified,
+    },
     // —— Community 源:依开源实现/官方文档取证,未经本机实证(档案各自标注)——
-    SourceInfo { id: "qwen",      label: "Qwen Code",      tier: SourceTier::Verified },
-    SourceInfo { id: "grok",      label: "Grok Build",     tier: SourceTier::Community },
-    SourceInfo { id: "amp",       label: "Amp",            tier: SourceTier::Community },
-    SourceInfo { id: "openclaw",  label: "OpenClaw",       tier: SourceTier::Verified },
-    SourceInfo { id: "gemini",    label: "Gemini CLI",     tier: SourceTier::Community },
-    SourceInfo { id: "copilot",   label: "Copilot CLI",    tier: SourceTier::Verified },
-    SourceInfo { id: "roocode",   label: "Roo Code",        tier: SourceTier::Community },
-    SourceInfo { id: "codebuff",  label: "Codebuff",        tier: SourceTier::Community },
-    SourceInfo { id: "droid",     label: "Droid",           tier: SourceTier::Community },
-    SourceInfo { id: "goose",     label: "Goose",            tier: SourceTier::Verified },
-    SourceInfo { id: "kilo",      label: "Kilo Code",        tier: SourceTier::Verified },
-    SourceInfo { id: "hermes",    label: "Hermes",            tier: SourceTier::Verified },
+    SourceInfo {
+        id: "qwen",
+        label: "Qwen Code",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "grok",
+        label: "Grok Build",
+        tier: SourceTier::Community,
+    },
+    SourceInfo {
+        id: "amp",
+        label: "Amp",
+        tier: SourceTier::Community,
+    },
+    SourceInfo {
+        id: "openclaw",
+        label: "OpenClaw",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "gemini",
+        label: "Gemini CLI",
+        tier: SourceTier::Community,
+    },
+    SourceInfo {
+        id: "copilot",
+        label: "Copilot CLI",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "roocode",
+        label: "Roo Code",
+        tier: SourceTier::Community,
+    },
+    SourceInfo {
+        id: "codebuff",
+        label: "Codebuff",
+        tier: SourceTier::Community,
+    },
+    SourceInfo {
+        id: "droid",
+        label: "Droid",
+        tier: SourceTier::Community,
+    },
+    SourceInfo {
+        id: "goose",
+        label: "Goose",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "kilo",
+        label: "Kilo Code",
+        tier: SourceTier::Verified,
+    },
+    SourceInfo {
+        id: "hermes",
+        label: "Hermes",
+        tier: SourceTier::Verified,
+    },
     // 暂停支持(实装终审,档案 26):现行版本本地只落计费 credits,无 token;
     // conversations_v2 通道 0 行。恢复条件:上游恢复 token 落盘,或立 kiro-credits 成本通道。
-    SourceInfo { id: "kiro",      label: "Kiro",              tier: SourceTier::Suspended },
-    SourceInfo { id: "qoder",     label: "Qoder",              tier: SourceTier::Community },
-    SourceInfo { id: "opencode",  label: "OpenCode",           tier: SourceTier::Verified },
+    SourceInfo {
+        id: "kiro",
+        label: "Kiro",
+        tier: SourceTier::Suspended,
+    },
+    SourceInfo {
+        id: "qoder",
+        label: "Qoder",
+        tier: SourceTier::Community,
+    },
+    SourceInfo {
+        id: "opencode",
+        label: "OpenCode",
+        tier: SourceTier::Verified,
+    },
 ];
 
 /// 全部已登记数据源(顺序即报表顺序,与 SOURCE_CATALOG 保持一致)。
@@ -102,6 +202,9 @@ mod tests {
     fn catalog_matches_registry() {
         let reg: Vec<&str> = registered_sources().iter().map(|s| s.id()).collect();
         let cat: Vec<&str> = SOURCE_CATALOG.iter().map(|s| s.id).collect();
-        assert_eq!(reg, cat, "registered_sources() 与 SOURCE_CATALOG 顺序/内容不一致");
+        assert_eq!(
+            reg, cat,
+            "registered_sources() 与 SOURCE_CATALOG 顺序/内容不一致"
+        );
     }
 }

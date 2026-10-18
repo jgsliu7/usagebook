@@ -95,9 +95,8 @@ pub struct Agg {
 }
 
 fn aggregate(records: &[UsageRecord], days: Option<usize>) -> Agg {
-    let cutoff = days.map(|n| {
-        (chrono::Local::now() - chrono::Duration::days(n as i64)).timestamp_millis()
-    });
+    let cutoff =
+        days.map(|n| (chrono::Local::now() - chrono::Duration::days(n as i64)).timestamp_millis());
     let delta: Vec<&UsageRecord> = records
         .iter()
         .filter(|r| r.caliber == Caliber::RequestDelta && cutoff.is_none_or(|c| r.ts_ms >= c))
@@ -161,7 +160,10 @@ pub fn print_report(records: &[UsageRecord], days: Option<usize>) {
     print_table("▎按模型", "模型", agg.by_model);
     let cw1h = agg.totals.cache_write_1h;
     if cw1h > 0 {
-        println!("\n注:缓存写合计中含 1 小时 TTL 写入 {}(子集,已计入缓存写列,不重复相加)。", fmt(cw1h));
+        println!(
+            "\n注:缓存写合计中含 1 小时 TTL 写入 {}(子集,已计入缓存写列,不重复相加)。",
+            fmt(cw1h)
+        );
     }
 
     if agg.baseline_count > 0 {
@@ -214,7 +216,9 @@ pub fn json_report(records: &[UsageRecord], days: Option<usize>) -> String {
     };
     let agg = aggregate(records, days);
     let out = Out {
-        generated_at: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        generated_at: chrono::Local::now()
+            .format("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string(),
         window_days: days,
         totals: agg.totals,
         by_day: rows(agg.by_day),

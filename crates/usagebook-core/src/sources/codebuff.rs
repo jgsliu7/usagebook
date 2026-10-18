@@ -10,7 +10,7 @@
 //! 去重键:codebuff:{chatId}:{message.id}(§4)
 
 use crate::common::{env_roots, home, iso_to_ms, json_u64, walk_with};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -40,7 +40,10 @@ fn merge_usage(meta: &Value) -> Value {
         sources.push(u);
     }
     // messageHistory 倒序第一个 assistant 的 providerOptions.usage(§2)
-    if let Some(hist) = meta.pointer("/runState/sessionState/mainAgentState/messageHistory").and_then(|h| h.as_array()) {
+    if let Some(hist) = meta
+        .pointer("/runState/sessionState/mainAgentState/messageHistory")
+        .and_then(|h| h.as_array())
+    {
         for m in hist.iter().rev() {
             if m.get("role").and_then(|x| x.as_str()) != Some("assistant") {
                 continue;
@@ -56,9 +59,7 @@ fn merge_usage(meta: &Value) -> Value {
     for s in sources {
         if let Some(obj) = s.as_object() {
             for (k, val) in obj {
-                let is_zero = acc
-                    .get(k)
-                    .is_none_or(|prev| json_u64(Some(prev)) == 0);
+                let is_zero = acc.get(k).is_none_or(|prev| json_u64(Some(prev)) == 0);
                 if is_zero && !val.is_null() {
                     acc.insert(k.clone(), val.clone());
                 }
@@ -96,7 +97,11 @@ impl UsageSource for CodebuffSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             stats
@@ -182,12 +187,29 @@ impl UsageSource for CodebuffSource {
                 if u.as_object().is_none_or(|o| o.is_empty()) {
                     continue;
                 }
-                let i = alias(&u, &["inputTokens", "input_tokens", "promptTokens", "prompt_tokens"]);
-                let o = alias(&u, &["outputTokens", "output_tokens", "completionTokens", "completion_tokens"]);
-                let cr = alias(&u, &["cacheReadInputTokens", "cache_read_input_tokens"]).max(json_u64(
-                    u.pointer("/promptTokensDetails/cachedTokens")
-                        .or_else(|| u.pointer("/prompt_tokens_details/cached_tokens")),
-                ));
+                let i = alias(
+                    &u,
+                    &[
+                        "inputTokens",
+                        "input_tokens",
+                        "promptTokens",
+                        "prompt_tokens",
+                    ],
+                );
+                let o = alias(
+                    &u,
+                    &[
+                        "outputTokens",
+                        "output_tokens",
+                        "completionTokens",
+                        "completion_tokens",
+                    ],
+                );
+                let cr =
+                    alias(&u, &["cacheReadInputTokens", "cache_read_input_tokens"]).max(json_u64(
+                        u.pointer("/promptTokensDetails/cachedTokens")
+                            .or_else(|| u.pointer("/prompt_tokens_details/cached_tokens")),
+                    ));
                 let cw = alias(
                     &u,
                     &[
@@ -205,7 +227,11 @@ impl UsageSource for CodebuffSource {
                 // totalTokens 差额兜底(§3):output==0 时补 output,否则忽略计数
                 let sum = i + o + cr + cw;
                 let total = alias(&u, &["totalTokens", "total_tokens", "total"]);
-                let output = if total > sum && o == 0 { total - sum } else { o };
+                let output = if total > sum && o == 0 {
+                    total - sum
+                } else {
+                    o
+                };
                 if total > sum && o != 0 {
                     total_gap += 1;
                 }
@@ -255,15 +281,19 @@ impl UsageSource for CodebuffSource {
         }
 
         for (root, n) in per_root {
-            stats.notes.push(format!("根 {}:{n} 个 chat-messages.json", root));
-        }
-        if total_gap > 0 {
             stats
                 .notes
-                .push(format!("totalTokens 差额超四桶之和且 output≠0,忽略差额 {total_gap} 行(§3)"));
+                .push(format!("根 {}:{n} 个 chat-messages.json", root));
+        }
+        if total_gap > 0 {
+            stats.notes.push(format!(
+                "totalTokens 差额超四桶之和且 output≠0,忽略差额 {total_gap} 行(§3)"
+            ));
         }
         if dup_dropped > 0 {
-            stats.notes.push(format!("去重键命中丢弃 {dup_dropped} 条(§4)"));
+            stats
+                .notes
+                .push(format!("去重键命中丢弃 {dup_dropped} 条(§4)"));
         }
         (records, stats)
     }

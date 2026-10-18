@@ -7,7 +7,7 @@
 //! 去重键:kilo:{id 列}(§5,主键幂等;流式更新重扫取每 id 终值)
 
 use crate::common::{env_roots, home, json_u64};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use rusqlite::types::Value as SqlValue;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -43,7 +43,11 @@ impl UsageSource for KiloSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], _max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        _max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         // max_files 对本源无意义:sqlite 单库全量读
         let mut stats = ScanStats::default();
         if roots.is_empty() {
@@ -62,7 +66,9 @@ impl UsageSource for KiloSource {
             let db = root.join("kilo.db");
             stats.files_seen += 1;
             if !db.is_file() {
-                stats.notes.push(format!("根 {} 下无 kilo.db", root.display()));
+                stats
+                    .notes
+                    .push(format!("根 {} 下无 kilo.db", root.display()));
                 continue;
             }
             let conn = match crate::common::open_sqlite_readonly(&db) {
@@ -82,7 +88,9 @@ impl UsageSource for KiloSource {
                 )
                 .unwrap_or(0);
             if has_table == 0 {
-                stats.notes.push(format!("{} 无 message 表,忽略", db.display()));
+                stats
+                    .notes
+                    .push(format!("{} 无 message 表,忽略", db.display()));
                 continue;
             }
             let sql = "SELECT id, session_id, data FROM message";
@@ -98,16 +106,16 @@ impl UsageSource for KiloSource {
             };
             stats.files_parsed += 1;
             while let Ok(Some(row)) = rows.next() {
-                let vals: Vec<SqlValue> = (0..3).filter_map(|i| row.get::<_, SqlValue>(i).ok()).collect();
+                let vals: Vec<SqlValue> = (0..3)
+                    .filter_map(|i| row.get::<_, SqlValue>(i).ok())
+                    .collect();
                 if vals.len() < 3 {
                     stats.lines_bad_json += 1;
                     continue;
                 }
-                let (Some(id), Some(session), Some(data)) = (
-                    v_text(&vals[0]),
-                    v_text(&vals[1]),
-                    v_text(&vals[2]),
-                ) else {
+                let (Some(id), Some(session), Some(data)) =
+                    (v_text(&vals[0]), v_text(&vals[1]), v_text(&vals[2]))
+                else {
                     stats.lines_bad_json += 1;
                     continue;
                 };
@@ -120,7 +128,9 @@ impl UsageSource for KiloSource {
                 if doc.get("role").and_then(|x| x.as_str()) != Some("assistant") {
                     continue;
                 }
-                let Some(tk) = doc.get("tokens") else { continue };
+                let Some(tk) = doc.get("tokens") else {
+                    continue;
+                };
                 let (i, o) = (json_u64(tk.get("input")), json_u64(tk.get("output")));
                 let (cr, cw) = match tk.get("cache") {
                     Some(c) if c.is_object() => (json_u64(c.get("read")), json_u64(c.get("write"))),
@@ -182,14 +192,15 @@ impl UsageSource for KiloSource {
         }
 
         if skipped_no_time > 0 {
-            stats
-                .notes
-                .push(format!("{} 行 time.completed/created 均缺,跳过", skipped_no_time));
+            stats.notes.push(format!(
+                "{} 行 time.completed/created 均缺,跳过",
+                skipped_no_time
+            ));
         }
         if total_gap > 0 {
-            stats
-                .notes
-                .push(format!("total 差额超五桶和且 output≠0,忽略差额 {total_gap} 行(§3)"));
+            stats.notes.push(format!(
+                "total 差额超五桶和且 output≠0,忽略差额 {total_gap} 行(§3)"
+            ));
         }
         (records, stats)
     }

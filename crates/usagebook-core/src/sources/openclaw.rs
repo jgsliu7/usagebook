@@ -10,7 +10,7 @@
 //! 去重(§7.4):openclaw:{agentId}:{session}:{event_id},(session,seq) 兜底。
 
 use crate::common::{env_roots, flex_to_ms, home, json_u64};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -38,8 +38,18 @@ fn alias(v: &Value, keys: &[&str]) -> u64 {
 /// 从 assistant message 的 usage 构造五桶(exclusive 语义,§7.3)。
 fn buckets_from_usage(usage: &Value) -> Option<(u64, u64, u64, u64, u64)> {
     let i = alias(usage, &["input", "inputTokens", "input_tokens"]);
-    let cr = alias(usage, &["cacheRead", "cache_read_input_tokens", "cachedTokens"]);
-    let cw = alias(usage, &["cacheWrite", "cache_creation_input_tokens", "cacheCreationTokens"]);
+    let cr = alias(
+        usage,
+        &["cacheRead", "cache_read_input_tokens", "cachedTokens"],
+    );
+    let cw = alias(
+        usage,
+        &[
+            "cacheWrite",
+            "cache_creation_input_tokens",
+            "cacheCreationTokens",
+        ],
+    );
     let o = alias(usage, &["output", "outputTokens", "output_tokens"]);
     let rs = alias(usage, &["reasoningTokens", "reasoning_tokens", "reasoning"]);
     if i == 0 && cr == 0 && cw == 0 && o == 0 {
@@ -72,10 +82,16 @@ impl UsageSource for OpenclawSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], _max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        _max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
-            stats.notes.push("未发现 ~/.openclaw 或 OPENCLAW_STATE_DIR".into());
+            stats
+                .notes
+                .push("未发现 ~/.openclaw 或 OPENCLAW_STATE_DIR".into());
             return (vec![], stats);
         }
 
@@ -87,7 +103,9 @@ impl UsageSource for OpenclawSource {
 
         for root in roots {
             let agents_dir = root.join("agents");
-            let Ok(rd) = std::fs::read_dir(&agents_dir) else { continue };
+            let Ok(rd) = std::fs::read_dir(&agents_dir) else {
+                continue;
+            };
             let mut agent_ids: Vec<String> = rd
                 .flatten()
                 .filter(|e| e.path().is_dir())
@@ -98,14 +116,23 @@ impl UsageSource for OpenclawSource {
             for agent_id in agent_ids {
                 let agent_dir = agents_dir.join(&agent_id);
                 let db = agent_dir.join("agent").join("openclaw-agent.sqlite");
-                let agent_tag = if agent_id == "main" { None } else { Some(agent_id.clone()) };
+                let agent_tag = if agent_id == "main" {
+                    None
+                } else {
+                    Some(agent_id.clone())
+                };
 
                 if db.is_file() {
                     // ===== 正典通道:SQLite transcript_events(§7.2)=====
                     sqlite_agents += 1;
                     scan_sqlite_agent(
-                        &db, &agent_id, agent_tag.as_deref(), &mut records, &mut seen,
-                        &mut stats, &mut zstd_decoded,
+                        &db,
+                        &agent_id,
+                        agent_tag.as_deref(),
+                        &mut records,
+                        &mut seen,
+                        &mut stats,
+                        &mut zstd_decoded,
                     );
                 } else {
                     // ===== 遗留通道:agents/<id>/sessions/*.jsonl(§7.2 冷层)=====
@@ -128,7 +155,14 @@ impl UsageSource for OpenclawSource {
                     if !files.is_empty() {
                         jsonl_agents += 1;
                         files.sort();
-                        scan_jsonl_agent(&files, &agent_id, agent_tag.as_deref(), &mut records, &mut seen, &mut stats);
+                        scan_jsonl_agent(
+                            &files,
+                            &agent_id,
+                            agent_tag.as_deref(),
+                            &mut records,
+                            &mut seen,
+                            &mut stats,
+                        );
                     }
                 }
             }
@@ -136,9 +170,13 @@ impl UsageSource for OpenclawSource {
 
         stats.files_seen = (sqlite_agents + jsonl_agents) as usize;
         stats.files_parsed = stats.files_seen;
-        stats.notes.push(format!("SQLite 正典 agent {sqlite_agents} 个 / JSONL 遗留 agent {jsonl_agents} 个(§7.2)"));
+        stats.notes.push(format!(
+            "SQLite 正典 agent {sqlite_agents} 个 / JSONL 遗留 agent {jsonl_agents} 个(§7.2)"
+        ));
         if zstd_decoded > 0 {
-            stats.notes.push(format!("event_zstd 解压 {zstd_decoded} 行"));
+            stats
+                .notes
+                .push(format!("event_zstd 解压 {zstd_decoded} 行"));
         }
         (records, stats)
     }
@@ -155,12 +193,17 @@ fn scan_sqlite_agent(
     zstd_decoded: &mut u64,
 ) {
     let Some(conn) = open_ro(db) else {
-        stats.notes.push(format!("{} 打开失败,已跳过(若该库应有数据请提 issue)", db.display()));
+        stats.notes.push(format!(
+            "{} 打开失败,已跳过(若该库应有数据请提 issue)",
+            db.display()
+        ));
         stats.failed = true;
         return;
     };
     if !has_table(&conn, "transcript_events") {
-        stats.notes.push(format!("{} 无 transcript_events,忽略", db.display()));
+        stats
+            .notes
+            .push(format!("{} 无 transcript_events,忽略", db.display()));
         return;
     }
     let mut stmt = match conn.prepare(
@@ -177,7 +220,9 @@ fn scan_sqlite_agent(
     let mut rows = match stmt.query([]) {
         Ok(r) => r,
         Err(_) => {
-            stats.notes.push(format!("{} transcript_events 查询执行失败", db.display()));
+            stats
+                .notes
+                .push(format!("{} transcript_events 查询执行失败", db.display()));
             stats.failed = true;
             return;
         }
@@ -221,7 +266,9 @@ fn scan_sqlite_agent(
             continue; // assistant 无 usage = 非请求行
         };
         let Some((i, cr, cw, out_net, rs)) = buckets_from_usage(usage) else {
-            stats.notes.push(format!("session {session_id} 全零 usage 跳过(§7.2)"));
+            stats
+                .notes
+                .push(format!("session {session_id} 全零 usage 跳过(§7.2)"));
             continue;
         };
         // ts:message.timestamp(epoch 毫秒数字)优先,回退事件 envelope timestamp(ISO)(§7.4)
@@ -264,9 +311,16 @@ fn scan_sqlite_agent(
             cost_usd: usage
                 .pointer("/cost/totalOrigin")
                 .and_then(|x| x.as_str())
-                .and_then(|o| if o == "provider-billed" {
-                    usage.pointer("/cost/total").and_then(|x| x.as_f64()).filter(|c| *c > 0.0)
-                } else { None }),
+                .and_then(|o| {
+                    if o == "provider-billed" {
+                        usage
+                            .pointer("/cost/total")
+                            .and_then(|x| x.as_f64())
+                            .filter(|c| *c > 0.0)
+                    } else {
+                        None
+                    }
+                }),
             dedup_key: key,
         });
     }
@@ -318,8 +372,10 @@ fn scan_jsonl_agent(
                 .unwrap_or_else(|| "unknown".into());
             let event_id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let key = if event_id.is_empty() {
-                format!("openclaw:{agent_id}:{session_id}:{}:{ts_ms}:{i}:{cr}:{cw}:{out_net}:{rs}",
-                    msg.get("id").and_then(|x| x.as_str()).unwrap_or(""))
+                format!(
+                    "openclaw:{agent_id}:{session_id}:{}:{ts_ms}:{i}:{cr}:{cw}:{out_net}:{rs}",
+                    msg.get("id").and_then(|x| x.as_str()).unwrap_or("")
+                )
             } else {
                 format!("openclaw:{agent_id}:{session_id}:{event_id}")
             };
@@ -339,17 +395,19 @@ fn scan_jsonl_agent(
                 cache_write_1h: 0,
                 output: out_net,
                 reasoning_output: rs,
-                cost_usd: usage   // 成本分治同 SQLite 通道(2026-10-17)
-
+                cost_usd: usage // 成本分治同 SQLite 通道(2026-10-17)
                     .pointer("/cost/totalOrigin")
-
                     .and_then(|x| x.as_str())
-
-                    .and_then(|o| if o == "provider-billed" {
-
-                        usage.pointer("/cost/total").and_then(|x| x.as_f64()).filter(|c| *c > 0.0)
-
-                    } else { None }),
+                    .and_then(|o| {
+                        if o == "provider-billed" {
+                            usage
+                                .pointer("/cost/total")
+                                .and_then(|x| x.as_f64())
+                                .filter(|c| *c > 0.0)
+                        } else {
+                            None
+                        }
+                    }),
                 dedup_key: key,
             });
         });

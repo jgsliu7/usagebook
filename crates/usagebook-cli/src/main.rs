@@ -5,11 +5,11 @@
 //!   usagebook serve      本地看板(自动刷新,曲线/来源/模型)
 //!   usagebook doctor     本机数据源自检(哪些源会生效/在哪/多大)
 
-use usagebook_core::{registered_sources, report};
 use clap::{Parser, Subcommand};
+use usagebook_core::{registered_sources, report};
 
-mod serve;
 mod logging_setup;
+mod serve;
 
 #[derive(Subcommand)]
 enum Command {
@@ -33,7 +33,11 @@ enum Command {
 }
 
 #[derive(Parser)]
-#[command(name = "usagebook", version, about = "Mac/Windows 上各 AI 编程工具 token 用量统计")]
+#[command(
+    name = "usagebook",
+    version,
+    about = "Mac/Windows 上各 AI 编程工具 token 用量统计"
+)]
 struct Args {
     /// 只统计指定数据源(源 id 见 usagebook doctor;仅终端报表生效,看板恒为全部)
     #[arg(long, default_value = "all")]
@@ -113,11 +117,12 @@ fn main() {
                 doctor(check, args.json);
                 return;
             }
-            Command::Serve { port, refresh_secs, open } => {
-                if args.source != "all"
-                    || args.days.is_some()
-                    || args.max_files.is_some()
-                {
+            Command::Serve {
+                port,
+                refresh_secs,
+                open,
+            } => {
+                if args.source != "all" || args.days.is_some() || args.max_files.is_some() {
                     eprintln!(
                         "错误:--source / --days / --max-files 与 serve 不兼容(看板始终统计全部来源),\n请去掉这些参数后重试,例:usagebook serve --port 8080"
                     );
@@ -134,7 +139,11 @@ fn main() {
         eprintln!(
             "错误:未知源 '{}';可用值:all 或 {}",
             args.source,
-            adapters.iter().map(|a| a.id()).collect::<Vec<_>>().join(" / ")
+            adapters
+                .iter()
+                .map(|a| a.id())
+                .collect::<Vec<_>>()
+                .join(" / ")
         );
         std::process::exit(2);
     }
@@ -232,20 +241,32 @@ fn store_panel_json(s: &usagebook_core::store::DoctorSnapshot) -> serde_json::Va
 }
 
 fn print_store_panel(s: &usagebook_core::store::DoctorSnapshot) {
-    println!("\n增量状态库 —— mode={} · {} ({})",
-        s.mode, s.db_path.display(), human_size(s.db_bytes));
+    println!(
+        "\n增量状态库 —— mode={} · {} ({})",
+        s.mode,
+        s.db_path.display(),
+        human_size(s.db_bytes)
+    );
     match s.quick_check_ok {
         Some(true) => println!("  quick_check: ok"),
-        Some(false) if s.mode == "failed" =>
-            println!("  quick_check: 未执行(本进程已降级直读;此前轮转未成功,检查磁盘/权限,下次启动将重试)"),
+        Some(false) if s.mode == "failed" => println!(
+            "  quick_check: 未执行(本进程已降级直读;此前轮转未成功,检查磁盘/权限,下次启动将重试)"
+        ),
         Some(false) => println!("  quick_check: 异常(库将自动轮转重建;真相在源文件)"),
-        None if s.mode == "future-schema" =>
-            println!("  quick_check: 未执行(状态库由更新版本的 usagebook 创建,本进程停用增量缓存)"),
+        None if s.mode == "future-schema" => {
+            println!("  quick_check: 未执行(状态库由更新版本的 usagebook 创建,本进程停用增量缓存)")
+        }
         None => println!("  quick_check: 未执行(off 模式)"),
     }
-    println!("  轮转 {} · 超限全读 {} · GC 清理 {} · 游标滞后 {}",
-        s.rotations, s.capped_files, s.gc_files,
-        s.cursor_lag_ms.map(|ms| format!("{ms}ms")).unwrap_or_else(|| "—".into()));
+    println!(
+        "  轮转 {} · 超限全读 {} · GC 清理 {} · 游标滞后 {}",
+        s.rotations,
+        s.capped_files,
+        s.gc_files,
+        s.cursor_lag_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "—".into())
+    );
     for (src, n, ms) in &s.files_by_source {
         println!("  file_state  {:<10} {} 个游标 · 最近更新 {}", src, n, ms);
     }
@@ -260,13 +281,18 @@ fn doctor(check: bool, json: bool) {
         let mut rows = Vec::new();
         for a in registered_sources() {
             let roots = a.discover_roots();
-            let tier = usagebook_core::SOURCE_CATALOG.iter().find(|s| s.id == a.id()).map(|s| s.tier);
+            let tier = usagebook_core::SOURCE_CATALOG
+                .iter()
+                .find(|s| s.id == a.id())
+                .map(|s| s.tier);
             let suspended = tier == Some(usagebook_core::SourceTier::Suspended);
             let mut row = serde_json::json!({"source": a.id(), "tier": tier,
                 "discovered": !roots.is_empty(), "roots": roots, "checked": false});
             if check && !roots.is_empty() && !suspended {
                 let t0 = std::time::Instant::now();
-                let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.scan_roots(&roots, None)));
+                let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    a.scan_roots(&roots, None)
+                }));
                 let (records, stats) = match parsed {
                     Ok(result) => result,
                     Err(_) => {
@@ -294,9 +320,25 @@ fn doctor(check: bool, json: bool) {
                 row["failed"] = stats.failed.into();
                 row["notes"] = serde_json::json!(stats.notes);
                 row["elapsed_ms"] = (t0.elapsed().as_millis() as u64).into();
-                row["status"] = if stats.failed { "failed" } else if stats.lines_bad_json > 0 { "partial" } else if records.is_empty() { "no_usage" } else { "parsed" }.into();
+                row["status"] = if stats.failed {
+                    "failed"
+                } else if stats.lines_bad_json > 0 {
+                    "partial"
+                } else if records.is_empty() {
+                    "no_usage"
+                } else {
+                    "parsed"
+                }
+                .into();
             } else {
-                row["status"] = if suspended { "unsupported_usage" } else if roots.is_empty() { "not_found" } else { "discovered" }.into();
+                row["status"] = if suspended {
+                    "unsupported_usage"
+                } else if roots.is_empty() {
+                    "not_found"
+                } else {
+                    "discovered"
+                }
+                .into();
             }
             rows.push(row);
         }
@@ -304,28 +346,43 @@ fn doctor(check: bool, json: bool) {
         let store = store_panel_json(&snap);
         // 数据性失败(退出码 3):任一源 failed / store 真损坏 / 本进程打开两连败 / 库由更新版本创建
         let store_failed = store["quick_check_ok"].as_bool() == Some(false)
-            || store["mode"].as_str().is_some_and(|m| m == "failed" || m == "future-schema");
+            || store["mode"]
+                .as_str()
+                .is_some_and(|m| m == "failed" || m == "future-schema");
         let any_failed = rows.iter().any(|r| r["status"] == "failed");
         if json {
-            println!("{}", serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "sources": rows,
-                "store": store,
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "sources": rows,
+                    "store": store,
+                })
+            );
         } else {
             println!("usagebook 解析检查（只读本机记录）");
             for row in rows {
                 let status = match row["status"].as_str().unwrap_or_default() {
-                    "parsed" => "已解析", "partial" => "已解析，部分行无法读取",
-                    "no_usage" => "未读到用量", "not_found" => "未发现目录",
-                    "unsupported_usage" => "上游无可用 token 数据", "failed" => "扫描失败(详情见 notes)", _ => "已发现目录",
+                    "parsed" => "已解析",
+                    "partial" => "已解析，部分行无法读取",
+                    "no_usage" => "未读到用量",
+                    "not_found" => "未发现目录",
+                    "unsupported_usage" => "上游无可用 token 数据",
+                    "failed" => "扫描失败(详情见 notes)",
+                    _ => "已发现目录",
                 };
-                println!("{:<10} {} · 记录 {} · 坏行 {} · 未识别事件 {}",
-                    row["source"].as_str().unwrap_or_default(), status,
-                    row["records"].as_u64().unwrap_or(0), row["bad_lines"].as_u64().unwrap_or(0),
-                    row["unknown_lines"].as_u64().unwrap_or(0));
+                println!(
+                    "{:<10} {} · 记录 {} · 坏行 {} · 未识别事件 {}",
+                    row["source"].as_str().unwrap_or_default(),
+                    status,
+                    row["records"].as_u64().unwrap_or(0),
+                    row["bad_lines"].as_u64().unwrap_or(0),
+                    row["unknown_lines"].as_u64().unwrap_or(0)
+                );
                 if let Some(notes) = row["notes"].as_array() {
-                    for note in notes { println!("  {}", note.as_str().unwrap_or_default()); }
+                    for note in notes {
+                        println!("  {}", note.as_str().unwrap_or_default());
+                    }
                 }
             }
             println!("未识别事件不一定含用量；坏行可能是尚未写完或损坏的记录。反馈时只提供诊断计数，不提供原始对话。");
@@ -347,10 +404,18 @@ fn doctor(check: bool, json: bool) {
         }
         found += 1;
         for p in &roots {
-            println!("✅ {:<10} {:>8}  {}", a.id(), human_size(dir_size(p)), p.display());
+            println!(
+                "✅ {:<10} {:>8}  {}",
+                a.id(),
+                human_size(dir_size(p)),
+                p.display()
+            );
         }
     }
-    println!("\n发现 {} 个数据源目录；运行 `usagebook doctor --check` 检查实际解析结果。", found);
+    println!(
+        "\n发现 {} 个数据源目录；运行 `usagebook doctor --check` 检查实际解析结果。",
+        found
+    );
     if found == 0 {
         println!("本机没有任何受支持的数据源,统计将无结果;参见 README 的支持列表。");
     }
@@ -400,7 +465,9 @@ fn doctor(check: bool, json: bool) {
     }
     // 运行日志体检(最小版):目录路径 + 当前总量 + 报障指引。
     match usagebook_core::logging::resolve_dir_quiet() {
-        usagebook_core::logging::LogDir::Off => println!("\n运行日志:已关闭(USAGEBOOK_LOG_DIR=off)"),
+        usagebook_core::logging::LogDir::Off => {
+            println!("\n运行日志:已关闭(USAGEBOOK_LOG_DIR=off)")
+        }
         usagebook_core::logging::LogDir::At(dir) => {
             let size = if dir.is_dir() { dir_size(&dir) } else { 0 };
             println!("\n运行日志:{} · 当前 {}", dir.display(), human_size(size));

@@ -1,8 +1,8 @@
 //! 跨源公共工具:环境变量多根解析、递归发现、时间解析、累计快照差分。
 
 use serde_json::Value;
-use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // Only serve's snapshot scans opt in. One-shot CLI/fixture scans remain uncached.
@@ -11,7 +11,9 @@ thread_local! { static INCREMENTAL: std::cell::Cell<bool> = const { std::cell::C
 pub fn with_incremental_cache<T>(f: impl FnOnce() -> T) -> T {
     struct Reset(bool);
     impl Drop for Reset {
-        fn drop(&mut self) { INCREMENTAL.with(|v| v.set(self.0)); }
+        fn drop(&mut self) {
+            INCREMENTAL.with(|v| v.set(self.0));
+        }
     }
     let _reset = Reset(INCREMENTAL.with(|v| v.replace(true)));
     f()
@@ -48,8 +50,14 @@ pub fn file_stamp(path: &Path) -> Option<FileStamp> {
     #[cfg(windows)]
     let file = std::fs::File::open(path).ok();
     metadata_stamp(&m, {
-        #[cfg(windows)] { file.as_ref() }
-        #[cfg(not(windows))] { None }
+        #[cfg(windows)]
+        {
+            file.as_ref()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
     })
 }
 
@@ -57,21 +65,36 @@ fn metadata_stamp(m: &std::fs::Metadata, _file: Option<&std::fs::File>) -> Optio
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     #[cfg(unix)]
-    let identity = Some(format!("{}/{}/{}/{}", m.dev(), m.ino(), m.ctime(), m.ctime_nsec()));
+    let identity = Some(format!(
+        "{}/{}/{}/{}",
+        m.dev(),
+        m.ino(),
+        m.ctime(),
+        m.ctime_nsec()
+    ));
     #[cfg(windows)]
     let identity = _file.and_then(|file| {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 { return None; }
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return None;
+        }
         let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
-        let created = ((info.ftCreationTime.dwHighDateTime as u64) << 32) | info.ftCreationTime.dwLowDateTime as u64;
-        Some(format!("{}/{}/{}", info.dwVolumeSerialNumber, index, created))
+        let created = ((info.ftCreationTime.dwHighDateTime as u64) << 32)
+            | info.ftCreationTime.dwLowDateTime as u64;
+        Some(format!(
+            "{}/{}/{}",
+            info.dwVolumeSerialNumber, index, created
+        ))
     });
     #[cfg(not(any(unix, windows)))]
     let identity = None;
     Some(FileStamp {
-        len: m.len(), modified: m.modified().ok()?,
+        len: m.len(),
+        modified: m.modified().ok()?,
         identity,
     })
 }
@@ -89,7 +112,8 @@ pub struct ReadSnapshot {
 
 impl ReadSnapshot {
     fn stable(&self, path: &Path, expected: &FileStamp) -> bool {
-        self.stamp.identity.is_some() && self.stamp == *expected
+        self.stamp.identity.is_some()
+            && self.stamp == *expected
             && handle_stamp(&self.file).as_ref() == Some(expected)
             && file_stamp(path).as_ref() == Some(expected)
     }
@@ -157,7 +181,8 @@ impl DedupTracker {
                 !(m == model && (ts.abs_diff(ts_ms) <= KEY_CLASH_TS_WINDOW_MS || *sig == value_sig))
             }
             None => {
-                self.seen.insert(key.to_string(), (ts_ms, model.to_string(), value_sig));
+                self.seen
+                    .insert(key.to_string(), (ts_ms, model.to_string(), value_sig));
                 false
             }
         }
@@ -180,7 +205,9 @@ impl UsageLines {
         stats.lines_bad_json += self.bad;
         stats.notes.extend(self.notes.iter().cloned());
         match outcome {
-            CacheOutcome::Reused => { stats.files_reused += 1; }
+            CacheOutcome::Reused => {
+                stats.files_reused += 1;
+            }
             CacheOutcome::FreshLoad => {
                 stats.files_read += 1;
                 stats.bytes_read += self.bytes;
@@ -201,20 +228,34 @@ impl UsageLines {
 
     pub fn push(&mut self, line: &str, project: fn(&Value) -> Option<Value>) {
         let line = line.trim();
-        if line.is_empty() { return; }
+        if line.is_empty() {
+            return;
+        }
         self.total += 1;
         match serde_json::from_str::<Value>(line) {
             Ok(value) => {
-                if let Some(value) = project(&value) { self.events.push((self.total, value)); }
+                if let Some(value) = project(&value) {
+                    self.events.push((self.total, value));
+                }
             }
             Err(_) => self.bad += 1,
         }
     }
 }
 
-struct UsageEntry { stamp: FileStamp, payload: Arc<[u8]>, decoded_len: usize, weight: usize, touched: u64 }
+struct UsageEntry {
+    stamp: FileStamp,
+    payload: Arc<[u8]>,
+    decoded_len: usize,
+    weight: usize,
+    touched: u64,
+}
 #[derive(Default)]
-struct UsageCache { entries: HashMap<(&'static str, PathBuf), UsageEntry>, weight: usize, clock: u64 }
+struct UsageCache {
+    entries: HashMap<(&'static str, PathBuf), UsageEntry>,
+    weight: usize,
+    clock: u64,
+}
 static USAGE_CACHE: OnceLock<Mutex<UsageCache>> = OnceLock::new();
 // Only compressed allowlisted metadata is retained. JSON trees are short-lived,
 // avoiding cache thrash from allocator/node overhead on large session histories.
@@ -222,10 +263,17 @@ const USAGE_CACHE_BUDGET: usize = 96 * 1024 * 1024;
 const MAX_CACHED_USAGE_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn prune_usage_cache(source: &'static str, files: &[PathBuf]) {
-    if !INCREMENTAL.with(|v| v.get()) { return; }
+    if !INCREMENTAL.with(|v| v.get()) {
+        return;
+    }
     let live: std::collections::HashSet<&PathBuf> = files.iter().collect();
-    let mut cache = USAGE_CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    cache.entries.retain(|(s,p),_| *s != source || live.contains(p));
+    let mut cache = USAGE_CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .entries
+        .retain(|(s, p), _| *s != source || live.contains(p));
     cache.weight = cache.entries.values().map(|v| v.weight).sum();
     // L2 死行 GC v3.1-C N8:实现在本函数内部,8 个调用点自然全覆盖)。
     // 仅在本轮文件清单非空(发现后)时执行;扫描前的 &[] 清 L1a 调用不触 L2。
@@ -243,42 +291,83 @@ fn backfill_l1a(
     path: &Path,
 ) {
     let weight = payload.len() + path.as_os_str().len() * 2 + 256;
-    if weight > USAGE_CACHE_BUDGET { return; }
-    let mut cache = USAGE_CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(old) = cache.entries.remove(&key) { cache.weight -= old.weight; }
+    if weight > USAGE_CACHE_BUDGET {
+        return;
+    }
+    let mut cache = USAGE_CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = cache.entries.remove(&key) {
+        cache.weight -= old.weight;
+    }
     while cache.weight + weight > USAGE_CACHE_BUDGET {
-        let victim = cache.entries.iter().min_by_key(|(_,v)| v.touched).map(|(k,_)| k.clone());
+        let victim = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, v)| v.touched)
+            .map(|(k, _)| k.clone());
         let Some(victim) = victim else { break };
-        if let Some(old) = cache.entries.remove(&victim) { cache.weight -= old.weight; }
+        if let Some(old) = cache.entries.remove(&victim) {
+            cache.weight -= old.weight;
+        }
     }
     cache.clock += 1;
     let touched = cache.clock;
-    cache.entries.insert(key, UsageEntry { stamp, payload, decoded_len, weight, touched });
+    cache.entries.insert(
+        key,
+        UsageEntry {
+            stamp,
+            payload,
+            decoded_len,
+            weight,
+            touched,
+        },
+    );
     cache.weight += weight;
 }
 
 fn l1a_lookup(key: &(&'static str, PathBuf), stamp: &FileStamp) -> Option<(Arc<[u8]>, usize)> {
-    let mut cache = USAGE_CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = USAGE_CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.clock += 1;
     let tick = cache.clock;
-    let hit = cache.entries.get_mut(key).filter(|entry| &entry.stamp == stamp).map(|entry| {
-        entry.touched = tick;
-        (entry.payload.clone(), entry.decoded_len)
-    });
+    let hit = cache
+        .entries
+        .get_mut(key)
+        .filter(|entry| &entry.stamp == stamp)
+        .map(|entry| {
+            entry.touched = tick;
+            (entry.payload.clone(), entry.decoded_len)
+        });
     if hit.is_none() {
-        if let Some(old) = cache.entries.remove(key) { cache.weight -= old.weight; }
+        if let Some(old) = cache.entries.remove(key) {
+            cache.weight -= old.weight;
+        }
     }
     hit
 }
 
 fn l1a_evict(key: &(&'static str, PathBuf)) {
-    let mut cache = USAGE_CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(old) = cache.entries.remove(key) { cache.weight -= old.weight; }
+    let mut cache = USAGE_CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = cache.entries.remove(key) {
+        cache.weight -= old.weight;
+    }
 }
 
 fn compress_l1a(lines: &UsageLines, _path: &Path) -> Option<(Arc<[u8]>, usize)> {
-    let bytes = serde_json::to_vec(lines).ok().filter(|b| b.len() <= MAX_CACHED_USAGE_BYTES)?;
-    let payload: Arc<[u8]> = zstd::bulk::compress(&bytes, 1).ok()?.into_boxed_slice().into();
+    let bytes = serde_json::to_vec(lines)
+        .ok()
+        .filter(|b| b.len() <= MAX_CACHED_USAGE_BYTES)?;
+    let payload: Arc<[u8]> = zstd::bulk::compress(&bytes, 1)
+        .ok()?
+        .into_boxed_slice()
+        .into();
     Some((payload, bytes.len()))
 }
 
@@ -297,7 +386,8 @@ fn committed_prefix_payload(head: &UsageLines, tail: &TailRead) -> UsageLines {
         committed_bad: head.bad + tail.committed_bad,
         read_snapshot: tail.lines.read_snapshot.clone(),
     };
-    out.events.extend_from_slice(&tail.lines.events[..committed_events]);
+    out.events
+        .extend_from_slice(&tail.lines.events[..committed_events]);
     out
 }
 
@@ -321,7 +411,9 @@ pub fn cached_usage_file(
     let key = (source, path.to_path_buf());
     let cached = if let Some(stamp) = &before {
         l1a_lookup(&key, stamp)
-    } else { None };
+    } else {
+        None
+    };
     // Decode outside the lock: independent sources remain parallel.
     if let Some((payload, decoded_len)) = cached {
         if let Ok(bytes) = zstd::bulk::decompress(&payload, decoded_len) {
@@ -343,7 +435,9 @@ pub fn cached_usage_file(
     // 直读(无元数据/store 故障/off):现状路径。
     let data = Arc::new(load.take().unwrap()());
     // Never freeze a failed read or a file that changed while being read.
-    if let Some(stamp) = before.filter(|stamp| data.readable && Some(stamp) == file_stamp(path).as_ref()) {
+    if let Some(stamp) =
+        before.filter(|stamp| data.readable && Some(stamp) == file_stamp(path).as_ref())
+    {
         if let Some((payload, decoded_len)) = compress_l1a(&data, path) {
             backfill_l1a(key, stamp, payload, decoded_len, path);
         }
@@ -366,30 +460,59 @@ fn l2_attempt(
     // When judge needs a seal, retain this exact handle and the verified window.
     let mut append_input = None;
     let mut verdict = if parser.is_some() {
-        crate::store::judge(stamp.mtime_ns(), stamp.size(), Some(&stamp.identity_key()), cursor, |offset| {
-            let mut file = std::fs::File::open(path)?;
-            if handle_stamp(&file).as_ref() != Some(stamp) {
-                return Err(std::io::Error::other("file changed before tail verification"));
-            }
-            let window = read_boundary_window(&mut file, offset)?;
-            let seal = crate::store::tail_seal(&window);
-            append_input = Some((file, window));
-            Ok(seal)
-        })
+        crate::store::judge(
+            stamp.mtime_ns(),
+            stamp.size(),
+            Some(&stamp.identity_key()),
+            cursor,
+            |offset| {
+                let mut file = std::fs::File::open(path)?;
+                if handle_stamp(&file).as_ref() != Some(stamp) {
+                    return Err(std::io::Error::other(
+                        "file changed before tail verification",
+                    ));
+                }
+                let window = read_boundary_window(&mut file, offset)?;
+                let seal = crate::store::tail_seal(&window);
+                append_input = Some((file, window));
+                Ok(seal)
+            },
+        )
     } else {
-        crate::store::judge_reload(stamp.mtime_ns(), stamp.size(), Some(&stamp.identity_key()), cursor)
+        crate::store::judge_reload(
+            stamp.mtime_ns(),
+            stamp.size(),
+            Some(&stamp.identity_key()),
+            cursor,
+        )
     };
-    let head = if matches!(verdict, crate::store::Verdict::Unchanged | crate::store::Verdict::AppendFrom { .. }) {
+    let head = if matches!(
+        verdict,
+        crate::store::Verdict::Unchanged | crate::store::Verdict::AppendFrom { .. }
+    ) {
         row.and_then(|r| crate::store::decode_lines(&r.events, r.events_len))
-    } else { None };
-    if head.is_none() && matches!(verdict, crate::store::Verdict::Unchanged | crate::store::Verdict::AppendFrom { .. }) {
+    } else {
+        None
+    };
+    if head.is_none()
+        && matches!(
+            verdict,
+            crate::store::Verdict::Unchanged | crate::store::Verdict::AppendFrom { .. }
+        )
+    {
         verdict = crate::store::Verdict::Fresh;
     }
     match verdict {
         crate::store::Verdict::Unchanged => {
             let row = row?;
             if Some(stamp) == file_stamp(path).as_ref() {
-                backfill_l1a(key.clone(), stamp.clone(), row.events.clone(), row.events_len, path);
+                backfill_l1a(
+                    key.clone(),
+                    stamp.clone(),
+                    row.events.clone(),
+                    row.events_len,
+                    path,
+                );
             }
             Some((Arc::new(head?), CacheOutcome::Reused))
         }
@@ -397,8 +520,16 @@ fn l2_attempt(
             let parser = parser?;
             let head = head?;
             let (file, window) = append_input?;
-            let tail = read_tail_from_handle(path, file, stamp.clone(), offset,
-                row?.lines_total as u64, window, parser.project, parser.keep);
+            let tail = read_tail_from_handle(
+                path,
+                file,
+                stamp.clone(),
+                offset,
+                row?.lines_total as u64,
+                window,
+                parser.project,
+                parser.keep,
+            );
             match tail {
                 Ok(tail) => {
                     let mut merged = head.clone();
@@ -412,19 +543,29 @@ fn l2_attempt(
                     merged.committed_lines = tail.committed_lines;
                     merged.read_snapshot = tail.lines.read_snapshot.clone();
                     let prefix = committed_prefix_payload(&head, &tail);
-                    let result = persist_payload(source, path, stamp, &prefix, &observed.revision, true, true);
+                    let result = persist_payload(
+                        source,
+                        path,
+                        stamp,
+                        &prefix,
+                        &observed.revision,
+                        true,
+                        true,
+                    );
                     if result == crate::store::FileCommit::Conflict {
                         // Do not retry a stale head. A bounded full reread supplies this scan;
                         // the next scan observes the winning cache revision afresh.
                         l1a_evict(key);
-                        let mut fresh = read_usage_jsonl_committed(path, parser.project, parser.keep);
+                        let mut fresh =
+                            read_usage_jsonl_committed(path, parser.project, parser.keep);
                         fresh.bytes += merged.bytes;
                         fresh.notes.push("缓存版本已变化,本轮重新全读".into());
                         return Some((Arc::new(fresh), CacheOutcome::FreshLoad));
                     }
                     if merged.readable && snapshot_stable(&merged, path, stamp, true) {
                         if let Some((payload, len)) = compress_l1a(&merged, path)
-                            .filter(|_| snapshot_stable(&merged, path, stamp, true)) {
+                            .filter(|_| snapshot_stable(&merged, path, stamp, true))
+                        {
                             backfill_l1a(key.clone(), stamp.clone(), payload, len, path);
                         }
                     }
@@ -441,7 +582,14 @@ fn l2_attempt(
         }
         crate::store::Verdict::Fresh | crate::store::Verdict::Rewound(_) => {
             let mut data = load.take()?();
-            let result = persist_full(source, path, stamp, &data, &observed.revision, parser.is_some());
+            let result = persist_full(
+                source,
+                path,
+                stamp,
+                &data,
+                &observed.revision,
+                parser.is_some(),
+            );
             l1a_evict(key);
             if result == crate::store::FileCommit::Conflict {
                 if let Some(parser) = parser {
@@ -452,7 +600,8 @@ fn l2_attempt(
                 data.notes.push("缓存版本已变化,下轮重新判定".into());
             } else if data.readable && snapshot_stable(&data, path, stamp, parser.is_some()) {
                 if let Some((payload, len)) = compress_l1a(&data, path)
-                    .filter(|_| snapshot_stable(&data, path, stamp, parser.is_some())) {
+                    .filter(|_| snapshot_stable(&data, path, stamp, parser.is_some()))
+                {
                     backfill_l1a(key.clone(), stamp.clone(), payload, len, path);
                 }
             }
@@ -483,12 +632,25 @@ pub fn __set_persist_hook_for_tests(hook: impl FnOnce() + 'static) {
     PERSIST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-fn persist_payload(source: &'static str, path: &Path, stamp: &FileStamp, data: &UsageLines,
-    revision: &str, required: bool, append: bool) -> crate::store::FileCommit {
+fn persist_payload(
+    source: &'static str,
+    path: &Path,
+    stamp: &FileStamp,
+    data: &UsageLines,
+    revision: &str,
+    required: bool,
+    append: bool,
+) -> crate::store::FileCommit {
     use crate::store::FileCommit;
-    if !data.readable { return FileCommit::Unavailable; }
-    if !snapshot_stable(data, path, stamp, required) { return FileCommit::Conflict; }
-    let Some((blob, len)) = crate::store::encode_lines(data) else { return FileCommit::Unavailable };
+    if !data.readable {
+        return FileCommit::Unavailable;
+    }
+    if !snapshot_stable(data, path, stamp, required) {
+        return FileCommit::Conflict;
+    }
+    let Some((blob, len)) = crate::store::encode_lines(data) else {
+        return FileCommit::Unavailable;
+    };
     if len > MAX_CACHED_USAGE_BYTES {
         crate::store::note_capped_file();
         return FileCommit::Unavailable;
@@ -496,26 +658,50 @@ fn persist_payload(source: &'static str, path: &Path, stamp: &FileStamp, data: &
     #[cfg(feature = "regression-hooks")]
     {
         let hook = PERSIST_HOOK.with(|slot| slot.borrow_mut().take());
-        if let Some(hook) = hook { hook(); }
+        if let Some(hook) = hook {
+            hook();
+        }
     }
     // The seal was computed from consumed bytes, never by reopening the path here.
-    if !snapshot_stable(data, path, stamp, required) { return FileCommit::Conflict; }
+    if !snapshot_stable(data, path, stamp, required) {
+        return FileCommit::Conflict;
+    }
     let cursor = crate::store::FileCursor {
-        mtime_ns: stamp.mtime_ns(), size: stamp.size(), byte_offset: data.committed_bytes,
+        mtime_ns: stamp.mtime_ns(),
+        size: stamp.size(),
+        byte_offset: data.committed_bytes,
         tail_seal: data.read_snapshot.as_ref().map_or(0, |s| s.committed_seal),
         identity: Some(stamp.identity_key()),
     };
-    let write = crate::store::FileWrite { cursor: &cursor, events: &blob, events_len: len,
-        lines_total: data.committed_lines as i64 };
-    if append { crate::store::append_file(source, path, revision, write) }
-    else { crate::store::replace_file(source, path, revision, write) }
+    let write = crate::store::FileWrite {
+        cursor: &cursor,
+        events: &blob,
+        events_len: len,
+        lines_total: data.committed_lines as i64,
+    };
+    if append {
+        crate::store::append_file(source, path, revision, write)
+    } else {
+        crate::store::replace_file(source, path, revision, write)
+    }
 }
 
-fn persist_full(source: &'static str, path: &Path, stamp: &FileStamp, data: &UsageLines,
-    revision: &str, required: bool) -> crate::store::FileCommit {
+fn persist_full(
+    source: &'static str,
+    path: &Path,
+    stamp: &FileStamp,
+    data: &UsageLines,
+    revision: &str,
+    required: bool,
+) -> crate::store::FileCommit {
     let mut payload = data.clone();
-    if data.committed_bytes < data.bytes && data.total > data.committed_lines
-        && payload.events.last().is_some_and(|(ord, _)| *ord == data.total) {
+    if data.committed_bytes < data.bytes
+        && data.total > data.committed_lines
+        && payload
+            .events
+            .last()
+            .is_some_and(|(ord, _)| *ord == data.total)
+    {
         payload.events.pop();
     }
     payload.total = data.committed_lines;
@@ -524,11 +710,19 @@ fn persist_full(source: &'static str, path: &Path, stamp: &FileStamp, data: &Usa
     persist_payload(source, path, stamp, &payload, revision, required, false)
 }
 
-pub fn read_usage_jsonl(path: &Path, project: fn(&Value) -> Option<Value>, keep: fn(&str) -> bool) -> UsageLines {
+pub fn read_usage_jsonl(
+    path: &Path,
+    project: fn(&Value) -> Option<Value>,
+    keep: fn(&str) -> bool,
+) -> UsageLines {
     read_usage_jsonl_inner(path, project, keep, false)
 }
 
-pub fn read_usage_jsonl_committed(path: &Path, project: fn(&Value) -> Option<Value>, keep: fn(&str) -> bool) -> UsageLines {
+pub fn read_usage_jsonl_committed(
+    path: &Path,
+    project: fn(&Value) -> Option<Value>,
+    keep: fn(&str) -> bool,
+) -> UsageLines {
     read_usage_jsonl_inner(path, project, keep, true)
 }
 
@@ -542,7 +736,10 @@ pub struct TailRead {
     pub pending_tail: bool,
 }
 
-pub struct TailError { pub error: std::io::Error, pub bytes: u64 }
+pub struct TailError {
+    pub error: std::io::Error,
+    pub bytes: u64,
+}
 
 fn read_boundary_window(file: &mut std::fs::File, end: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
@@ -556,7 +753,8 @@ fn read_boundary_window(file: &mut std::fs::File, end: u64) -> std::io::Result<V
 fn extend_window(window: &mut Vec<u8>, bytes: &[u8]) {
     let limit = crate::store::TAIL_SEAL_BYTES as usize;
     if bytes.len() >= limit {
-        window.clear(); window.extend_from_slice(&bytes[bytes.len() - limit..]);
+        window.clear();
+        window.extend_from_slice(&bytes[bytes.len() - limit..]);
     } else {
         let excess = (window.len() + bytes.len()).saturating_sub(limit);
         window.drain(..excess);
@@ -564,12 +762,28 @@ fn extend_window(window: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-struct StreamRead { lines: UsageLines, seal: i64, committed_events: usize }
+struct StreamRead {
+    lines: UsageLines,
+    seal: i64,
+    committed_events: usize,
+}
 
-fn read_stream(reader: &mut impl std::io::BufRead, project: fn(&Value) -> Option<Value>,
-    keep: fn(&str) -> bool, offset: u64, resume_lines: u64, mut window: Vec<u8>, track: bool) -> StreamRead {
-    let mut out = UsageLines { readable: true, total: resume_lines,
-        committed_bytes: offset, committed_lines: resume_lines, ..Default::default() };
+fn read_stream(
+    reader: &mut impl std::io::BufRead,
+    project: fn(&Value) -> Option<Value>,
+    keep: fn(&str) -> bool,
+    offset: u64,
+    resume_lines: u64,
+    mut window: Vec<u8>,
+    track: bool,
+) -> StreamRead {
+    let mut out = UsageLines {
+        readable: true,
+        total: resume_lines,
+        committed_bytes: offset,
+        committed_lines: resume_lines,
+        ..Default::default()
+    };
     let mut committed_events = 0;
     let mut committed_window = window.clone();
     let mut buf = Vec::new();
@@ -581,8 +795,11 @@ fn read_stream(reader: &mut impl std::io::BufRead, project: fn(&Value) -> Option
                 out.bytes += n as u64;
                 let line = String::from_utf8_lossy(&buf);
                 let line = line.trim_end_matches(['\n', '\r']);
-                if keep(line) { out.push(line, project); }
-                else if !line.trim().is_empty() { out.total += 1; }
+                if keep(line) {
+                    out.push(line, project);
+                } else if !line.trim().is_empty() {
+                    out.total += 1;
+                }
                 extend_window(&mut window, &buf);
                 if buf.ends_with(b"\n") {
                     out.committed_bytes = offset + out.bytes;
@@ -610,71 +827,162 @@ fn read_stream(reader: &mut impl std::io::BufRead, project: fn(&Value) -> Option
         committed_events = out.events.len();
         committed_window = window;
     }
-    StreamRead { lines: out, seal: crate::store::tail_seal(&committed_window), committed_events }
+    StreamRead {
+        lines: out,
+        seal: crate::store::tail_seal(&committed_window),
+        committed_events,
+    }
 }
 
 /// Streaming entry point for embedders and deterministic I/O fault injection.
 #[doc(hidden)]
-pub fn read_usage_jsonl_reader(reader: &mut impl std::io::BufRead,
-    project: fn(&Value) -> Option<Value>, keep: fn(&str) -> bool) -> UsageLines {
+pub fn read_usage_jsonl_reader(
+    reader: &mut impl std::io::BufRead,
+    project: fn(&Value) -> Option<Value>,
+    keep: fn(&str) -> bool,
+) -> UsageLines {
     read_stream(reader, project, keep, 0, 0, Vec::new(), true).lines
 }
 
-fn read_usage_jsonl_inner(path: &Path, project: fn(&Value) -> Option<Value>, keep: fn(&str) -> bool,
-    track: bool) -> UsageLines {
+fn read_usage_jsonl_inner(
+    path: &Path,
+    project: fn(&Value) -> Option<Value>,
+    keep: fn(&str) -> bool,
+    track: bool,
+) -> UsageLines {
     use std::io::{BufReader, Read};
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(e) => return UsageLines { bad: 1, notes: vec![format!("用量文件不可读: {}", e.kind())], ..Default::default() },
+        Err(e) => {
+            return UsageLines {
+                bad: 1,
+                notes: vec![format!("用量文件不可读: {}", e.kind())],
+                ..Default::default()
+            }
+        }
     };
     let Some(stamp) = handle_stamp(&file) else {
-        return UsageLines { bad: 1, notes: vec!["无法读取文件元数据".into()], ..Default::default() };
+        return UsageLines {
+            bad: 1,
+            notes: vec!["无法读取文件元数据".into()],
+            ..Default::default()
+        };
     };
-    let mut result = read_stream(&mut BufReader::new((&file).take(stamp.len)), project, keep, 0, 0, Vec::new(), track);
-    let snapshot = Arc::new(ReadSnapshot { file, stamp: stamp.clone(), committed_seal: result.seal });
+    let mut result = read_stream(
+        &mut BufReader::new((&file).take(stamp.len)),
+        project,
+        keep,
+        0,
+        0,
+        Vec::new(),
+        track,
+    );
+    let snapshot = Arc::new(ReadSnapshot {
+        file,
+        stamp: stamp.clone(),
+        committed_seal: result.seal,
+    });
     if !snapshot.stable(path, &stamp) {
         result.lines.readable = false;
-        result.lines.notes.push("读取期间文件发生变化,本轮结果不缓存".into());
+        result
+            .lines
+            .notes
+            .push("读取期间文件发生变化,本轮结果不缓存".into());
     }
     result.lines.read_snapshot = Some(snapshot);
     result.lines
 }
 
-pub fn read_usage_jsonl_tail(path: &Path, from_offset: u64, resume_lines: u64,
-    project: fn(&Value) -> Option<Value>, keep: fn(&str) -> bool) -> Result<TailRead, TailError> {
+pub fn read_usage_jsonl_tail(
+    path: &Path,
+    from_offset: u64,
+    resume_lines: u64,
+    project: fn(&Value) -> Option<Value>,
+    keep: fn(&str) -> bool,
+) -> Result<TailRead, TailError> {
     let err = |error| TailError { error, bytes: 0 };
     let mut file = std::fs::File::open(path).map_err(err)?;
-    let stamp = handle_stamp(&file).ok_or_else(|| err(std::io::Error::other("missing file metadata")))?;
+    let stamp =
+        handle_stamp(&file).ok_or_else(|| err(std::io::Error::other("missing file metadata")))?;
     let window = read_boundary_window(&mut file, from_offset).map_err(err)?;
-    read_tail_from_handle(path, file, stamp, from_offset, resume_lines, window, project, keep)
+    read_tail_from_handle(
+        path,
+        file,
+        stamp,
+        from_offset,
+        resume_lines,
+        window,
+        project,
+        keep,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn read_tail_from_handle(path: &Path, file: std::fs::File, stamp: FileStamp, from_offset: u64,
-    resume_lines: u64, window: Vec<u8>, project: fn(&Value) -> Option<Value>, keep: fn(&str) -> bool) -> Result<TailRead, TailError> {
+fn read_tail_from_handle(
+    path: &Path,
+    file: std::fs::File,
+    stamp: FileStamp,
+    from_offset: u64,
+    resume_lines: u64,
+    window: Vec<u8>,
+    project: fn(&Value) -> Option<Value>,
+    keep: fn(&str) -> bool,
+) -> Result<TailRead, TailError> {
     use std::io::{BufReader, Read};
     if from_offset > stamp.len {
-        return Err(TailError { error: std::io::Error::other("file truncated"), bytes: 0 });
+        return Err(TailError {
+            error: std::io::Error::other("file truncated"),
+            bytes: 0,
+        });
     }
-    let mut result = read_stream(&mut BufReader::new((&file).take(stamp.len - from_offset)),
-        project, keep, from_offset, resume_lines, window, true);
-    let snapshot = Arc::new(ReadSnapshot { file, stamp: stamp.clone(), committed_seal: result.seal });
+    let mut result = read_stream(
+        &mut BufReader::new((&file).take(stamp.len - from_offset)),
+        project,
+        keep,
+        from_offset,
+        resume_lines,
+        window,
+        true,
+    );
+    let snapshot = Arc::new(ReadSnapshot {
+        file,
+        stamp: stamp.clone(),
+        committed_seal: result.seal,
+    });
     if !result.lines.readable || !snapshot.stable(path, &stamp) {
-        return Err(TailError { error: std::io::Error::other("incomplete or unstable tail read"), bytes: result.lines.bytes });
+        return Err(TailError {
+            error: std::io::Error::other("incomplete or unstable tail read"),
+            bytes: result.lines.bytes,
+        });
     }
     result.lines.read_snapshot = Some(snapshot);
     let lines = result.lines;
-    Ok(TailRead { committed_bytes: lines.committed_bytes, committed_lines: lines.committed_lines,
-        committed_bad: lines.committed_bad, committed_events: result.committed_events,
-        pending_tail: lines.committed_bytes < from_offset + lines.bytes, lines, from_offset })
+    Ok(TailRead {
+        committed_bytes: lines.committed_bytes,
+        committed_lines: lines.committed_lines,
+        committed_bad: lines.committed_bad,
+        committed_events: result.committed_events,
+        pending_tail: lines.committed_bytes < from_offset + lines.bytes,
+        lines,
+        from_offset,
+    })
 }
 
 /// Copy selected JSON-pointer paths. Paths name scalar/token metadata only.
 pub fn usage_projection(value: &Value, paths: &[&str]) -> Value {
     fn put(out: &mut Value, parts: &[&str], value: Value) {
-        if parts.is_empty() { *out = value; return; }
-        if !out.is_object() { *out = Value::Object(Default::default()); }
-        let slot = out.as_object_mut().unwrap().entry(parts[0]).or_insert(Value::Null);
+        if parts.is_empty() {
+            *out = value;
+            return;
+        }
+        if !out.is_object() {
+            *out = Value::Object(Default::default());
+        }
+        let slot = out
+            .as_object_mut()
+            .unwrap()
+            .entry(parts[0])
+            .or_insert(Value::Null);
         put(slot, &parts[1..], value);
     }
     let mut out = Value::Object(Default::default());
@@ -682,8 +990,14 @@ pub fn usage_projection(value: &Value, paths: &[&str]) -> Value {
         if let Some(v) = value.pointer(path) {
             // Even a malformed "model"/"id" field must not retain nested messages.
             // Legitimate token metadata is scalar and identifiers are short.
-            if v.is_object() || v.is_array() || v.as_str().is_some_and(|s| s.len() > 4096) { continue; }
-            put(&mut out, &path[1..].split('/').collect::<Vec<_>>(), v.clone());
+            if v.is_object() || v.is_array() || v.as_str().is_some_and(|s| s.len() > 4096) {
+                continue;
+            }
+            put(
+                &mut out,
+                &path[1..].split('/').collect::<Vec<_>>(),
+                v.clone(),
+            );
         }
     }
     out
@@ -706,9 +1020,14 @@ fn source_fingerprint(roots: &[PathBuf]) -> Option<SourceFingerprint> {
         let md = std::fs::symlink_metadata(p).ok()?;
         out.push((p.to_path_buf(), file_stamp(p)?));
         if md.is_dir() || (descend && p.is_dir()) {
-            let mut children = std::fs::read_dir(p).ok()?.collect::<Result<Vec<_>, _>>().ok()?;
+            let mut children = std::fs::read_dir(p)
+                .ok()?
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
             children.sort_by_key(|e| e.path());
-            for e in children { visit(&e.path(), out, false)?; }
+            for e in children {
+                visit(&e.path(), out, false)?;
+            }
         }
         Some(())
     }
@@ -724,7 +1043,7 @@ fn source_fingerprint(roots: &[PathBuf]) -> Option<SourceFingerprint> {
                 let sidecar = PathBuf::from(name);
                 match std::fs::symlink_metadata(&sidecar) {
                     Ok(_) => visit(&sidecar, &mut out, false)?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(_) => return None,
                 }
             }
@@ -740,26 +1059,42 @@ fn source_cache_weight(
     fingerprint: &Option<SourceFingerprint>,
 ) -> usize {
     std::mem::size_of_val(records)
-        + records.iter().map(|r| r.session_id.capacity() + r.model.capacity() + r.dedup_key.capacity()
-            + r.agent.as_ref().map_or(0, String::capacity)).sum::<usize>()
+        + records
+            .iter()
+            .map(|r| {
+                r.session_id.capacity()
+                    + r.model.capacity()
+                    + r.dedup_key.capacity()
+                    + r.agent.as_ref().map_or(0, String::capacity)
+            })
+            .sum::<usize>()
         + stats.notes.capacity() * std::mem::size_of::<String>()
         + stats.notes.iter().map(String::capacity).sum::<usize>()
-        + fingerprint.as_ref().map_or(0, |f| f.capacity() * std::mem::size_of::<(PathBuf, FileStamp)>()
-            + f.iter().map(|(p,_)| p.as_os_str().len() * 2).sum::<usize>()) + 256
+        + fingerprint.as_ref().map_or(0, |f| {
+            f.capacity() * std::mem::size_of::<(PathBuf, FileStamp)>()
+                + f.iter()
+                    .map(|(p, _)| p.as_os_str().len() * 2)
+                    .sum::<usize>()
+        })
+        + 256
 }
 
 /// Snapshot-only entry point; adapters' scan()/scan_roots() retain one-shot behavior.
 /// 非 JSONL 大源多一层 L2(source_state 指纹门;:L1b → L2 → 全量扫描,
 /// 成功且非空的结果整行持久化(空记录成功轮删除旧行,镜像 L1b 不冻结语义)。
 pub fn scan_source_cached(
-    source: &dyn crate::model::UsageSource, roots: &[PathBuf],
+    source: &dyn crate::model::UsageSource,
+    roots: &[PathBuf],
 ) -> (Vec<crate::model::UsageRecord>, crate::model::ScanStats) {
     if matches!(source.id(), "claude" | "codex" | "kimi" | "dsh") {
         return with_incremental_cache(|| source.scan_roots(roots, None));
     }
     let before = source_fingerprint(roots);
     if let Some(fingerprint) = &before {
-        let cache = SOURCE_CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        let cache = SOURCE_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = cache.get(source.id()) {
             if &entry.fingerprint == fingerprint {
                 let mut stats = entry.stats.clone();
@@ -787,16 +1122,21 @@ pub fn scan_source_cached(
                         // 回填 L1b L1b"):进程内下轮免 SQLite 读行+解压。
                         let weight = source_cache_weight(&records, &stats, &before);
                         if weight <= SOURCE_CACHE_BUDGET {
-                            let mut cache = SOURCE_CACHE.get_or_init(Default::default)
-                                .lock().unwrap_or_else(|e| e.into_inner());
+                            let mut cache = SOURCE_CACHE
+                                .get_or_init(Default::default)
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             let occupied: usize = cache.values().map(|e| e.weight).sum();
                             if occupied + weight <= SOURCE_CACHE_BUDGET {
-                                cache.insert(source.id(), SourceEntry {
-                                    fingerprint: fingerprint.clone(),
-                                    records: records.clone(),
-                                    stats: stats.clone(),
-                                    weight,
-                                });
+                                cache.insert(
+                                    source.id(),
+                                    SourceEntry {
+                                        fingerprint: fingerprint.clone(),
+                                        records: records.clone(),
+                                        stats: stats.clone(),
+                                        weight,
+                                    },
+                                );
                             }
                         }
                         return (records, stats);
@@ -806,20 +1146,36 @@ pub fn scan_source_cached(
         }
     }
     // Remove stale state even if re-reading subsequently fails.
-    SOURCE_CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).remove(source.id());
+    SOURCE_CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(source.id());
     let (records, mut stats) = source.scan_roots(roots, None);
     stats.files_read = stats.files_parsed;
     let weight = source_cache_weight(&records, &stats, &before);
     // 冻结契约:只认显式标志;notes 文本不参与机器判定(措辞润色不得改变缓存语义)。
     let failed = stats.failed || stats.lines_bad_json > 0;
-    let stable = before.as_ref().is_some_and(|fingerprint|
-        !records.is_empty() && !failed && Some(fingerprint) == source_fingerprint(roots).as_ref());
+    let stable = before.as_ref().is_some_and(|fingerprint| {
+        !records.is_empty() && !failed && Some(fingerprint) == source_fingerprint(roots).as_ref()
+    });
     if let Some(fingerprint) = before.filter(|_| stable) {
-        let mut cache = SOURCE_CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = SOURCE_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let occupied: usize = cache.values().map(|e| e.weight).sum();
         // Prefer a bounded cache to retaining an unbounded copy of every source's history.
         if occupied + weight <= SOURCE_CACHE_BUDGET {
-            cache.insert(source.id(), SourceEntry { fingerprint: fingerprint.clone(), records: records.clone(), stats: stats.clone(), weight });
+            cache.insert(
+                source.id(),
+                SourceEntry {
+                    fingerprint: fingerprint.clone(),
+                    records: records.clone(),
+                    stats: stats.clone(),
+                    weight,
+                },
+            );
         }
         // L2 持久化:成功且非空(空记录成功轮删除旧行,。
         if crate::store::store_ready() {
@@ -867,25 +1223,38 @@ pub fn home() -> PathBuf {
 
 /// 递归收集 *.jsonl(排序保证确定性;不假设目录深度)。
 pub fn walk_jsonl(root: &Path, max_files: Option<usize>) -> Vec<PathBuf> {
-    walk_with(root, max_files, &|p| p.extension().is_some_and(|x| x == "jsonl"))
+    walk_with(root, max_files, &|p| {
+        p.extension().is_some_and(|x| x == "jsonl")
+    })
 }
 
 /// 递归收集满足谓词的文件(排序保证确定性;不假设目录深度)。
 /// community 源发现规则形态各异(.json/.jsonl 双扩展、固定文件名),统一走此入口。
-pub fn walk_with(root: &Path, max_files: Option<usize>, keep: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+pub fn walk_with(
+    root: &Path,
+    max_files: Option<usize>,
+    keep: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk_inner(root, max_files, keep, &mut out);
     out.sort();
     out
 }
 
-fn walk_inner(root: &Path, max_files: Option<usize>, keep: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) {
+fn walk_inner(
+    root: &Path,
+    max_files: Option<usize>,
+    keep: &dyn Fn(&Path) -> bool,
+    out: &mut Vec<PathBuf>,
+) {
     if let Some(m) = max_files {
         if out.len() >= m {
             return;
         }
     }
-    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let Ok(ft) = e.file_type() else { continue };
@@ -906,7 +1275,9 @@ fn walk_inner(root: &Path, max_files: Option<usize>, keep: &dyn Fn(&Path) -> boo
 /// 新式格式(OTel/网关)数值常在数字与字符串双形态间漂移,统一在此容错。
 pub fn json_u64(v: Option<&Value>) -> u64 {
     match v {
-        Some(Value::Number(n)) => n.as_u64().unwrap_or_else(|| n.as_f64().map(|f| f.max(0.0) as u64).unwrap_or(0)),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .unwrap_or_else(|| n.as_f64().map(|f| f.max(0.0) as u64).unwrap_or(0)),
         Some(Value::String(s)) => s.trim().parse().unwrap_or(0),
         _ => 0,
     }
@@ -922,10 +1293,8 @@ pub const TS_MS_FLOOR: i64 = 100_000_000_000;
 /// 打开或 busy_timeout 失败均返回 Err,由调用方按各自渠道语义处置;
 /// query_only 失败静默降级(个别平台不支持,只读 flags 已是主防线)。
 pub fn open_sqlite_readonly(db: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let _ = conn.pragma_update(None, "query_only", true);
     Ok(conn)
@@ -991,22 +1360,19 @@ impl SnapshotDiff {
     /// 降则该桶增量被饱和截断丢失——任一桶下降即视为计数器重置,走全量语义。
     pub fn push(&mut self, cur: [u64; 5]) -> [u64; 5] {
         let out = match self.prev {
-            Some(p) if cur.iter().zip(p.iter()).all(|(c, p)| c >= p) => {
-                [
-                    cur[0].saturating_sub(p[0]),
-                    cur[1].saturating_sub(p[1]),
-                    cur[2].saturating_sub(p[2]),
-                    cur[3].saturating_sub(p[3]),
-                    cur[4].saturating_sub(p[4]),
-                ]
-            }
+            Some(p) if cur.iter().zip(p.iter()).all(|(c, p)| c >= p) => [
+                cur[0].saturating_sub(p[0]),
+                cur[1].saturating_sub(p[1]),
+                cur[2].saturating_sub(p[2]),
+                cur[3].saturating_sub(p[3]),
+                cur[4].saturating_sub(p[4]),
+            ],
             _ => cur,
         };
         self.prev = Some(cur);
         out
     }
 }
-
 
 /// ISO 8601(Claude/Codex 转录时间戳)→ epoch 毫秒;失败返回 None(该行跳过计数)。
 pub fn iso_to_ms(s: &str) -> Option<i64> {
@@ -1052,7 +1418,10 @@ pub fn for_each_line<P: AsRef<Path>, F: FnMut(&str)>(path: P, f: F) -> (u64, u64
 /// Byte-level reading distinguishes consumed invalid UTF-8 from a permanent
 /// I/O error with no progress. The tuple contract for legacy adapters is unchanged.
 #[doc(hidden)]
-pub fn for_each_line_reader(reader: &mut impl std::io::BufRead, mut f: impl FnMut(&str)) -> (u64, u64) {
+pub fn for_each_line_reader(
+    reader: &mut impl std::io::BufRead,
+    mut f: impl FnMut(&str),
+) -> (u64, u64) {
     let (mut total, mut bad) = (0, 0);
     let mut buf = Vec::new();
     loop {
@@ -1062,12 +1431,18 @@ pub fn for_each_line_reader(reader: &mut impl std::io::BufRead, mut f: impl FnMu
             Ok(_) => match std::str::from_utf8(&buf) {
                 Ok(line) => {
                     let line = line.trim();
-                    if !line.is_empty() { total += 1; f(line); }
+                    if !line.is_empty() {
+                        total += 1;
+                        f(line);
+                    }
                 }
                 Err(_) => bad += 1,
             },
             // A partial line consumed before Err is not a complete record.
-            Err(_) => { bad += 1; break; }
+            Err(_) => {
+                bad += 1;
+                break;
+            }
         }
     }
     (total, bad)
@@ -1087,7 +1462,6 @@ pub fn __reset_caches_for_tests() {
     }
 }
 
-
 #[cfg(test)]
 mod dedup_tests {
     use super::*;
@@ -1098,16 +1472,31 @@ mod dedup_tests {
         assert!(!t.track("k", 1_000, "m", [10, 0, 0, 0, 0]));
         // 同 model + 窗内 ts 差:流式逐块/成对双发 → 补全,非碰撞(值变化也视为补全)。
         assert!(!t.track("k", 1_000, "m", [20, 0, 0, 0, 0]));
-        assert!(!t.track("k", 1_000 + KEY_CLASH_TS_WINDOW_MS as i64, "m", [30, 0, 0, 0, 0]));
+        assert!(!t.track(
+            "k",
+            1_000 + KEY_CLASH_TS_WINDOW_MS as i64,
+            "m",
+            [30, 0, 0, 0, 0]
+        ));
     }
 
     #[test]
     fn different_model_or_far_ts_with_value_change_is_clash() {
         let mut t = DedupTracker::default();
         assert!(!t.track("k", 1_000, "m1", [100, 0, 0, 0, 0]));
-        assert!(t.track("k", 1_000, "m2", [100, 0, 0, 0, 0]), "同键不同 model = 键碰撞");
-        assert!(t.track("k", 1_000 + KEY_CLASH_TS_WINDOW_MS as i64 + 1, "m1", [200, 0, 0, 0, 0]),
-            "同键超窗且值不同 = 键碰撞");
+        assert!(
+            t.track("k", 1_000, "m2", [100, 0, 0, 0, 0]),
+            "同键不同 model = 键碰撞"
+        );
+        assert!(
+            t.track(
+                "k",
+                1_000 + KEY_CLASH_TS_WINDOW_MS as i64 + 1,
+                "m1",
+                [200, 0, 0, 0, 0]
+            ),
+            "同键超窗且值不同 = 键碰撞"
+        );
     }
 
     #[test]
@@ -1115,7 +1504,10 @@ mod dedup_tests {
         // codex 成对双发/恢复重投:键内嵌值,同键 ⟹ 同值,远距重投是去重正确命中。
         let mut t = DedupTracker::default();
         assert!(!t.track("k", 1_000, "m", [777, 0, 0, 0, 0]));
-        assert!(!t.track("k", 600_000, "m", [777, 0, 0, 0, 0]), "值全同的远距重投 ≠ 碰撞");
+        assert!(
+            !t.track("k", 600_000, "m", [777, 0, 0, 0, 0]),
+            "值全同的远距重投 ≠ 碰撞"
+        );
     }
 
     #[test]
@@ -1125,5 +1517,3 @@ mod dedup_tests {
         assert!(!t.track("b", 1, "m", [1, 0, 0, 0, 0]));
     }
 }
-
-

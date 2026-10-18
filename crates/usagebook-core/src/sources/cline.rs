@@ -17,7 +17,7 @@
 //! db 不读:sessions 表无 token 列,文件即账本(§2)
 
 use crate::common::{env_roots, home};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,8 +54,7 @@ fn read_manifest(dir: &Path) -> ManifestInfo {
         .pointer("/metadata/sessionHistoryOrigin/mode")
         .and_then(|x| x.as_str())
         == Some("import")
-        || v
-            .get("metadata")
+        || v.get("metadata")
             .is_some_and(|m| m.get("importedFrom").is_some_and(|x| !x.is_null()));
     ManifestInfo {
         is_import,
@@ -101,7 +100,11 @@ impl UsageSource for ClineSource {
         Vec::new()
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             stats.notes.push(
@@ -125,8 +128,7 @@ impl UsageSource for ClineSource {
                     if let Ok(md) = std::fs::read_dir(&d) {
                         for f in md.flatten() {
                             let p = f.path();
-                            if p
-                                .file_name()
+                            if p.file_name()
                                 .and_then(|n| n.to_str())
                                 .is_some_and(|n| n.ends_with(".messages.json"))
                             {
@@ -240,13 +242,18 @@ impl UsageSource for ClineSource {
                     g("inputTokens"), // inclusive:含 cacheRead+cacheWrite(§4)
                     g("cacheReadTokens"),
                     g("cacheWriteTokens"),
-                    g("outputTokens"), // 含 reasoning(§4)
+                    g("outputTokens"),        // 含 reasoning(§4)
                     g("reasoningTokenCount"), // 本机无键,防御读取(§3)
                 );
                 // 服务端上报 USD 直入,缺 → None 不估算(cline-free 恒 0 属正常,§4)
                 let cost = mt.get("cost").and_then(|x| x.as_f64());
                 // 全零条目跳过 + 计数(§5-8/00-总览 §5-5;成本非 0 仍入账)
-                if i_tok.saturating_add(cr).saturating_add(cw).saturating_add(o_tok).saturating_add(rs) == 0
+                if i_tok
+                    .saturating_add(cr)
+                    .saturating_add(cw)
+                    .saturating_add(o_tok)
+                    .saturating_add(rs)
+                    == 0
                     && cost.is_none_or(|c| c == 0.0)
                 {
                     all_zero += 1;
@@ -260,7 +267,7 @@ impl UsageSource for ClineSource {
                     i_tok.saturating_sub(cr).saturating_sub(cw)
                 };
                 let output = o_tok.saturating_sub(rs); // reasoning 为 output 子集(§4)
-                // 模型回退链(§5-2):per-message modelInfo.id → manifest.model → provider:xxx
+                                                       // 模型回退链(§5-2):per-message modelInfo.id → manifest.model → provider:xxx
                 let model = m
                     .pointer("/modelInfo/id")
                     .and_then(|x| x.as_str())
@@ -309,7 +316,9 @@ impl UsageSource for ClineSource {
         }
 
         for (root, n) in per_root {
-            stats.notes.push(format!("根 {}:{n} 个 *.messages.json", root));
+            stats
+                .notes
+                .push(format!("根 {}:{n} 个 *.messages.json", root));
         }
         if import_files > 0 {
             stats.notes.push(format!(
@@ -317,9 +326,9 @@ impl UsageSource for ClineSource {
             ));
         }
         if version_skipped > 0 {
-            stats
-                .notes
-                .push(format!("version!=1 整文件跳过 {version_skipped} 个(未知布局)"));
+            stats.notes.push(format!(
+                "version!=1 整文件跳过 {version_skipped} 个(未知布局)"
+            ));
         }
         if all_zero > 0 {
             stats

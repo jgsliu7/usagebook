@@ -19,34 +19,58 @@ pub struct KimiSource;
 
 fn project_usage(v: &Value) -> Option<Value> {
     match v.get("type").and_then(Value::as_str) {
-        Some("usage.record") => Some(usage_projection(v, &[
-            "/type", "/usageScope", "/time", "/model", "/usage/inputOther", "/usage/inputCacheRead",
-            "/usage/inputCacheCreation", "/usage/output",
-        ])),
+        Some("usage.record") => Some(usage_projection(
+            v,
+            &[
+                "/type",
+                "/usageScope",
+                "/time",
+                "/model",
+                "/usage/inputOther",
+                "/usage/inputCacheRead",
+                "/usage/inputCacheCreation",
+                "/usage/output",
+            ],
+        )),
         Some("llm.request") => Some(usage_projection(v, &["/type", "/model"])),
         Some(t) if is_known_type(t) => None,
         Some(_) => Some(usage_projection(v, &["/type"])),
         None => {
             if let Some(t) = v.pointer("/message/type").and_then(Value::as_str) {
-                if KNOWN_OLD_MSG_TYPES.contains(&t) { return None; }
+                if KNOWN_OLD_MSG_TYPES.contains(&t) {
+                    return None;
+                }
             }
-            let mut out = usage_projection(v, &[
-                "/timestamp", "/message/type", "/message/payload/token_usage/input_other",
-                "/message/payload/token_usage/input_cache_read", "/message/payload/token_usage/input_cache_creation",
-                "/message/payload/token_usage/output",
-            ]);
+            let mut out = usage_projection(
+                v,
+                &[
+                    "/timestamp",
+                    "/message/type",
+                    "/message/payload/token_usage/input_other",
+                    "/message/payload/token_usage/input_cache_read",
+                    "/message/payload/token_usage/input_cache_creation",
+                    "/message/payload/token_usage/output",
+                ],
+            );
             if let Some(original) = v.pointer("/message/payload/token_usage") {
                 if out.pointer("/message/payload/token_usage").is_none() {
-                    if out.get("message").is_none() { out["message"] = serde_json::json!({}); }
-                    if out["message"].get("payload").is_none() { out["message"]["payload"] = serde_json::json!({}); }
-                    out["message"]["payload"]["token_usage"] = if original.is_null() { Value::Null } else { serde_json::json!({}) };
+                    if out.get("message").is_none() {
+                        out["message"] = serde_json::json!({});
+                    }
+                    if out["message"].get("payload").is_none() {
+                        out["message"]["payload"] = serde_json::json!({});
+                    }
+                    out["message"]["payload"]["token_usage"] = if original.is_null() {
+                        Value::Null
+                    } else {
+                        serde_json::json!({})
+                    };
                 }
             }
             Some(out)
         }
     }
 }
-
 
 /// 从 wire.jsonl 路径提取 (session_id, agent)。
 /// 新:.../{session_|ses_}<uuid>/agents/<agent>/wire.jsonl(两代目录命名并存,§2)
@@ -186,7 +210,11 @@ impl UsageSource for KimiSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             prune_usage_cache("kimi", &[]);
@@ -201,12 +229,17 @@ impl UsageSource for KimiSource {
         for r in roots {
             let scope = {
                 let s = r.join("sessions");
-                if s.is_dir() { s } else { r.clone() }
+                if s.is_dir() {
+                    s
+                } else {
+                    r.clone()
+                }
             };
-            let got: Vec<PathBuf> = walk_jsonl(&scope, max_files.map(|m| m.saturating_sub(files.len())))
-                .into_iter()
-                .filter(|p| p.file_name().is_some_and(|n| n == "wire.jsonl"))
-                .collect();
+            let got: Vec<PathBuf> =
+                walk_jsonl(&scope, max_files.map(|m| m.saturating_sub(files.len())))
+                    .into_iter()
+                    .filter(|p| p.file_name().is_some_and(|n| n == "wire.jsonl"))
+                    .collect();
             per_root.push((r.display().to_string(), got.len()));
             files.extend(got);
         }
@@ -230,9 +263,15 @@ impl UsageSource for KimiSource {
                 line_no: 0,
             };
             let mut parsed_any = false;
-            let (lines, outcome) = cached_usage_file("kimi", path,
-                Some(FileParser { project: project_usage, keep: |_| true }),
-                || read_usage_jsonl_committed(path, project_usage, |_| true));
+            let (lines, outcome) = cached_usage_file(
+                "kimi",
+                path,
+                Some(FileParser {
+                    project: project_usage,
+                    keep: |_| true,
+                }),
+                || read_usage_jsonl_committed(path, project_usage, |_| true),
+            );
             lines.account(&mut stats, outcome);
             let mut consume = |line_no: u64, v: &Value| {
                 ctx.line_no = line_no;
@@ -258,13 +297,17 @@ impl UsageSource for KimiSource {
                             if i + cr + cw + o == 0 {
                                 return;
                             }
-                            let Some(ts) = v.get("time").and_then(|x| x.as_f64()).map(norm_ms) else {
+                            let Some(ts) = v.get("time").and_then(|x| x.as_f64()).map(norm_ms)
+                            else {
                                 no_time_skipped += 1;
                                 return;
                             };
                             // 真实模型:最近一次 llm.request.model 优先,退化为配置别名(§4)
                             let model = ctx.last_llm_model.clone().unwrap_or_else(|| {
-                                v.get("model").and_then(|x| x.as_str()).unwrap_or("unknown").to_string()
+                                v.get("model")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string()
                             });
                             models.insert(model.clone());
                             sessions.insert(ctx.session_id.clone());
@@ -337,8 +380,7 @@ impl UsageSource for KimiSource {
                             if i + cr + cw + o == 0 {
                                 return;
                             }
-                            let Some(ts) =
-                                v.get("timestamp").and_then(|x| x.as_f64()).map(norm_ms)
+                            let Some(ts) = v.get("timestamp").and_then(|x| x.as_f64()).map(norm_ms)
                             else {
                                 no_time_skipped += 1;
                                 return;
@@ -383,7 +425,9 @@ impl UsageSource for KimiSource {
                 }
                 stats.lines_unknown_type += 1;
             };
-            for (line_no, value) in &lines.events { consume(*line_no, value); }
+            for (line_no, value) in &lines.events {
+                consume(*line_no, value);
+            }
             if parsed_any || lines.total > 0 {
                 stats.files_parsed += 1;
             }
@@ -393,9 +437,10 @@ impl UsageSource for KimiSource {
             stats.notes.push(format!("根 {}:{} 个 wire.jsonl", root, n));
         }
         if scope_skipped > 0 {
-            stats
-                .notes
-                .push(format!("usageScope 非 turn 跳过 {} 条(累计口径,§5.1)", scope_skipped));
+            stats.notes.push(format!(
+                "usageScope 非 turn 跳过 {} 条(累计口径,§5.1)",
+                scope_skipped
+            ));
         }
         if old_null_usage > 0 {
             stats.notes.push(format!(

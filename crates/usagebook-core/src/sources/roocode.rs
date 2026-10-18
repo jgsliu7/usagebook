@@ -8,7 +8,7 @@
 //! 去重键:roocode:{taskUuid}:{ts}(§4)
 
 use crate::common::{env_roots, json_u64};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,9 @@ pub struct RoocodeSource;
 
 /// <model>X</model> 最后一处匹配(§4;>1MB 只读末尾,前缀残缺匹配忽略)。
 fn last_model_tag(path: &Path) -> Option<String> {
-    let Ok(meta) = std::fs::metadata(path) else { return None };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return None;
+    };
     let buf = if meta.len() > 1_048_576 {
         // 只读末尾 1MB(§4)
         let mut f = std::fs::File::open(path).ok()?;
@@ -86,7 +88,11 @@ impl UsageSource for RoocodeSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             stats
@@ -149,7 +155,11 @@ impl UsageSource for RoocodeSource {
                 if say != "api_req_started" && say != "api_req_deleted" {
                     continue;
                 }
-                let Some(text) = el.get("text").and_then(|x| x.as_str()).filter(|t| t.starts_with('{')) else {
+                let Some(text) = el
+                    .get("text")
+                    .and_then(|x| x.as_str())
+                    .filter(|t| t.starts_with('{'))
+                else {
                     continue;
                 };
                 let Ok(u) = serde_json::from_str::<Value>(text) else {
@@ -157,7 +167,12 @@ impl UsageSource for RoocodeSource {
                     continue;
                 };
                 let g = |k: &str| json_u64(u.get(k));
-                let (raw_i, o, cr, cw) = (g("tokensIn"), g("tokensOut"), g("cacheReads"), g("cacheWrites"));
+                let (raw_i, o, cr, cw) = (
+                    g("tokensIn"),
+                    g("tokensOut"),
+                    g("cacheReads"),
+                    g("cacheWrites"),
+                );
                 // tokensIn 是 inclusive(档案 §6.2 定稿,源码铁证):须减 cacheReads+cacheWrites
                 // 得 exclusive 新输入,否则含缓存请求 input 侧系统性虚增(2026-10-17 修)
                 let i = raw_i.saturating_sub(cr).saturating_sub(cw);
@@ -166,7 +181,10 @@ impl UsageSource for RoocodeSource {
                 }
                 let ts_ms = el.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
                 // 模型链(§4):history 正则 → protocol slug → unknown(经 memo,同文件只读一次)
-                let hist_path = path.parent().unwrap_or(Path::new("")).join("api_conversation_history.json");
+                let hist_path = path
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .join("api_conversation_history.json");
                 let model = model_tag_cache
                     .entry(hist_path.clone())
                     .or_insert_with(|| last_model_tag(&hist_path))
@@ -209,10 +227,14 @@ impl UsageSource for RoocodeSource {
         }
 
         for (root, n) in per_root {
-            stats.notes.push(format!("根 {}:{n} 个 ui_messages.json", root));
+            stats
+                .notes
+                .push(format!("根 {}:{n} 个 ui_messages.json", root));
         }
         if dup_dropped > 0 {
-            stats.notes.push(format!("去重键命中丢弃 {dup_dropped} 条(§4)"));
+            stats
+                .notes
+                .push(format!("去重键命中丢弃 {dup_dropped} 条(§4)"));
         }
         (records, stats)
     }

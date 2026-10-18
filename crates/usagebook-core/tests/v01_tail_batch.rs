@@ -1,11 +1,9 @@
 //! v0.1 尾批验收 fixture(F 编号=验收条款编号;单入口串行,避免进程级 env/store 竞态)。
 
-use usagebook_core::common::{with_incremental_cache, __reset_caches_for_tests};
+use std::path::PathBuf;
+use usagebook_core::common::{__reset_caches_for_tests, with_incremental_cache};
 use usagebook_core::store;
 use usagebook_core::UsageSource;
-use std::path::PathBuf;
-
-
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ub-tail-{}-{}", tag, std::process::id()));
@@ -40,7 +38,11 @@ fn freeze_gate_semantics_direct(notes: Vec<String>, failed: bool) -> bool {
 }
 
 fn crate_usage_stats(notes: Vec<String>, failed: bool) -> usagebook_core::model::ScanStats {
-    usagebook_core::model::ScanStats { failed, notes, ..Default::default() }
+    usagebook_core::model::ScanStats {
+        failed,
+        notes,
+        ..Default::default()
+    }
 }
 
 fn f1_1_gate_ignores_note_keywords() {
@@ -67,11 +69,16 @@ fn f1_1_gate_ignores_note_keywords() {
     // 模拟"良性 note 含旧关键词"(冻结门不得因此拒绝冻结)。
     __reset_caches_for_tests();
     let (r2, s2) = usagebook_core::common::scan_source_cached(&src, &roots);
-    assert_eq!(s2.files_reused, s2.files_parsed, "L1b 冻结不受 note 措辞影响");
+    assert_eq!(
+        s2.files_reused, s2.files_parsed,
+        "L1b 冻结不受 note 措辞影响"
+    );
     assert_eq!(r2.len(), r1.len());
     // 正向例:六个旧关键词全含 + failed=false → 判定"非失败"(冻结)。
     assert!(!freeze_gate_semantics_direct(
-        vec!["失败 不可读 错误 busy locked error".into()], false));
+        vec!["失败 不可读 错误 busy locked error".into()],
+        false
+    ));
     // 反例:notes 干净 + failed=true → 判定"失败"(不冻结)。
     assert!(freeze_gate_semantics_direct(vec!["一切正常".into()], true));
     let _ = s1;
@@ -90,7 +97,11 @@ fn f1_3_unreadable_db_marks_failed() {
             _ => {
                 let root = dir.join("zcode-home");
                 std::fs::create_dir_all(root.join("cli/db")).unwrap();
-                (kilo_db(&root.join("cli/db/db.sqlite")), vec![root], "ZCODE_HOME")
+                (
+                    kilo_db(&root.join("cli/db/db.sqlite")),
+                    vec![root],
+                    "ZCODE_HOME",
+                )
             }
         };
         std::env::set_var(env_key, roots[0].display().to_string());
@@ -102,10 +113,8 @@ fn f1_3_unreadable_db_marks_failed() {
         let db = db_of(&dir);
         fresh_env(&db);
         let (recs, stats) = with_incremental_cache(|| match src_id {
-            "kilo" => usagebook_core::sources::kilo::KiloSource
-                .scan_roots(&roots, None),
-            _ => usagebook_core::sources::zcode::ZcodeSource
-                .scan_roots(&roots, None),
+            "kilo" => usagebook_core::sources::kilo::KiloSource.scan_roots(&roots, None),
+            _ => usagebook_core::sources::zcode::ZcodeSource.scan_roots(&roots, None),
         });
         assert!(recs.is_empty(), "{src_id}: 不可读库不得产记录");
         assert!(stats.failed, "{src_id}: 打开失败分支必须置 stats.failed");
@@ -126,7 +135,8 @@ fn f1_3_unreadable_db_marks_failed() {
 /// 造一个表结构存在但无数据的库(只为让"打开失败"分支有真实目标)。
 fn kilo_db(path: &std::path::Path) -> PathBuf {
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1);").unwrap();
+    conn.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1);")
+        .unwrap();
     drop(conn);
     path.to_path_buf()
 }
@@ -159,9 +169,15 @@ fn f1_4_zcode_freeze_restored() {
     store::reset_for_tests();
     __reset_caches_for_tests();
     let (_, s2) = usagebook_core::common::scan_source_cached(&src, &roots);
-    assert_eq!(s2.files_reused, s2.files_parsed, "zcode 恢复冻结(旧子串门下永不)");
+    assert_eq!(
+        s2.files_reused, s2.files_parsed,
+        "zcode 恢复冻结(旧子串门下永不)"
+    );
     // 语义锁定:良性 note 含 'error' 子串不再阻止冻结(旧门会)。
-    assert!(!freeze_gate_semantics_direct(vec!["rollout/ 1 个转录文件仅探测不读(v1.1) error".into()], false));
+    assert!(!freeze_gate_semantics_direct(
+        vec!["rollout/ 1 个转录文件仅探测不读(v1.1) error".into()],
+        false
+    ));
     std::env::remove_var("ZCODE_HOME");
 }
 
@@ -175,19 +191,26 @@ fn f2_1_newer_schema_disables_without_touching() {
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.pragma_update(None, "user_version", 99).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
     let before = sha256(&db);
     let modified = std::fs::metadata(&db).unwrap().modified().unwrap();
     store::reset_for_tests();
     assert_eq!(store::doctor_snapshot().mode, "future-schema");
     assert_eq!(sha256(&db), before);
-    assert_eq!(std::fs::metadata(&db).unwrap().modified().unwrap(), modified);
+    assert_eq!(
+        std::fs::metadata(&db).unwrap().modified().unwrap(),
+        modified
+    );
 }
 
 fn sha256(p: &std::path::Path) -> String {
     use sha2::Digest;
-    sha2::Sha256::digest(std::fs::read(p).unwrap()).iter().map(|b| format!("{b:02x}")).collect()
+    sha2::Sha256::digest(std::fs::read(p).unwrap())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn f2_2_future_schema_doctor_mode() {
@@ -222,7 +245,9 @@ fn f2_3_older_schema_rotates_rebuilds() {
     assert_ne!(store::state_db_path(), old);
     assert_eq!(sha256(&old), before, "旧兼容目录保持原样");
     let conn = rusqlite::Connection::open(store::state_db_path()).unwrap();
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(version, 3);
     drop(conn);
     store::close_for_tests();
@@ -254,7 +279,11 @@ fn f6_2_parser_v4_upgrade_rebuilds() {
     assert_eq!(sha256(&base), before);
     assert_ne!(store::state_db_path(), base);
     let conn = rusqlite::Connection::open(store::state_db_path()).unwrap();
-    let version: String = conn.query_row("SELECT v FROM kv WHERE k='parser_version'", [], |r| r.get(0)).unwrap();
+    let version: String = conn
+        .query_row("SELECT v FROM kv WHERE k='parser_version'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
     assert_eq!(version, store::PARSER_VERSION);
 }
 

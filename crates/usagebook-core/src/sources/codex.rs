@@ -16,36 +16,68 @@ pub struct CodexSource;
 
 fn project_usage(v: &Value) -> Option<Value> {
     match v.get("type").and_then(Value::as_str) {
-        Some("session_meta") => Some(usage_projection(v, &["/type", "/payload/session_id", "/payload/id"])),
+        Some("session_meta") => Some(usage_projection(
+            v,
+            &["/type", "/payload/session_id", "/payload/id"],
+        )),
         Some("turn_context") => Some(usage_projection(v, &["/type", "/payload/model"])),
-        Some("event_msg") if v.pointer("/payload/type").and_then(Value::as_str) == Some("token_count") => {
-            let mut paths = vec!["/type".to_string(), "/timestamp".into(), "/payload/type".into()];
+        Some("event_msg")
+            if v.pointer("/payload/type").and_then(Value::as_str) == Some("token_count") =>
+        {
+            let mut paths = vec![
+                "/type".to_string(),
+                "/timestamp".into(),
+                "/payload/type".into(),
+            ];
             for side in ["last_token_usage", "total_token_usage"] {
-                for field in ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"] {
+                for field in [
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "cache_write_input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
+                    "total_tokens",
+                ] {
                     paths.push(format!("/payload/info/{side}/{field}"));
                 }
             }
-            let mut out = usage_projection(v, &paths.iter().map(String::as_str).collect::<Vec<_>>());
+            let mut out =
+                usage_projection(v, &paths.iter().map(String::as_str).collect::<Vec<_>>());
             // Preserve null/missing/empty-object semantics used by the delta state machine.
             if let Some(info) = v.pointer("/payload/info") {
-                if info.is_null() { out["payload"]["info"] = Value::Null; }
-                else {
-                    if out.pointer("/payload/info").is_none() { out["payload"]["info"] = serde_json::json!({}); }
+                if info.is_null() {
+                    out["payload"]["info"] = Value::Null;
+                } else {
+                    if out.pointer("/payload/info").is_none() {
+                        out["payload"]["info"] = serde_json::json!({});
+                    }
                     for side in ["last_token_usage", "total_token_usage"] {
                         if let Some(original) = info.get(side) {
-                            if original.is_null() { out["payload"]["info"][side] = Value::Null; }
-                            else if original.is_object() && out["payload"]["info"].get(side).is_none() { out["payload"]["info"][side] = serde_json::json!({}); }
+                            if original.is_null() {
+                                out["payload"]["info"][side] = Value::Null;
+                            } else if original.is_object()
+                                && out["payload"]["info"].get(side).is_none()
+                            {
+                                out["payload"]["info"][side] = serde_json::json!({});
+                            }
                         }
                     }
                 }
             }
             Some(out)
         }
-        Some("event_msg" | "response_item" | "compacted" | "ghost_snapshot" | "token_usage_record" | "inter_agent_communication_metadata" | "world_state") => None,
+        Some(
+            "event_msg"
+            | "response_item"
+            | "compacted"
+            | "ghost_snapshot"
+            | "token_usage_record"
+            | "inter_agent_communication_metadata"
+            | "world_state",
+        ) => None,
         _ => Some(usage_projection(v, &["/type"])),
     }
 }
-
 
 /// [input, cached, cache_write, output, reasoning]
 type Buckets = [u64; 5];
@@ -69,10 +101,16 @@ struct FileState {
 fn usage_tokens(u: &Value) -> Buckets {
     [
         u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-        u.get("cached_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-        u.get("cache_write_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        u.get("cached_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        u.get("cache_write_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
         u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-        u.get("reasoning_output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        u.get("reasoning_output_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
     ]
 }
 
@@ -96,7 +134,11 @@ impl UsageSource for CodexSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
             prune_usage_cache("codex", &[]);
@@ -108,7 +150,10 @@ impl UsageSource for CodexSource {
             for sub in ["sessions", "archived_sessions"] {
                 let d = r.join(sub);
                 if d.is_dir() {
-                    files.extend(walk_jsonl(&d, max_files.map(|m| m.saturating_sub(files.len()))));
+                    files.extend(walk_jsonl(
+                        &d,
+                        max_files.map(|m| m.saturating_sub(files.len())),
+                    ));
                 }
             }
         }
@@ -135,11 +180,25 @@ impl UsageSource for CodexSource {
                 model: "unknown".into(),
                 ..Default::default()
             };
-            let (lines, outcome) = cached_usage_file("codex", path,
-                Some(FileParser { project: project_usage,
-                    keep: |line| line.contains("token_count") || line.contains("session_meta") || line.contains("turn_context") }),
-                || read_usage_jsonl_committed(path, project_usage,
-                    |line| line.contains("token_count") || line.contains("session_meta") || line.contains("turn_context")));
+            let (lines, outcome) = cached_usage_file(
+                "codex",
+                path,
+                Some(FileParser {
+                    project: project_usage,
+                    keep: |line| {
+                        line.contains("token_count")
+                            || line.contains("session_meta")
+                            || line.contains("turn_context")
+                    },
+                }),
+                || {
+                    read_usage_jsonl_committed(path, project_usage, |line| {
+                        line.contains("token_count")
+                            || line.contains("session_meta")
+                            || line.contains("turn_context")
+                    })
+                },
+            );
             lines.account(&mut stats, outcome);
             let mut consume = |v: &Value| {
                 let ts_ms = v
@@ -149,8 +208,16 @@ impl UsageSource for CodexSource {
                     .unwrap_or(0);
                 match v.get("type").and_then(|x| x.as_str()) {
                     Some("session_meta") => {
-                        if let Some(id) = v.pointer("/payload/session_id").and_then(Value::as_str).filter(|s| !s.is_empty())
-                            .or_else(|| v.pointer("/payload/id").and_then(Value::as_str).filter(|s| !s.is_empty())) {
+                        if let Some(id) = v
+                            .pointer("/payload/session_id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                v.pointer("/payload/id")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                            })
+                        {
                             st.session_id = id.to_string();
                         }
                     }
@@ -161,7 +228,9 @@ impl UsageSource for CodexSource {
                         }
                     }
                     Some("event_msg") => {
-                        if v.pointer("/payload/type").and_then(|x| x.as_str()) != Some("token_count") {
+                        if v.pointer("/payload/type").and_then(|x| x.as_str())
+                            != Some("token_count")
+                        {
                             return;
                         }
                         // #9660:info 可为 null —— 跳过计数
@@ -175,8 +244,14 @@ impl UsageSource for CodexSource {
                                 .pointer("/last_token_usage/total_tokens")
                                 .and_then(|x| x.as_u64());
                         }
-                        let last_split = info.get("last_token_usage").filter(|v| v.is_object()).map(usage_tokens);
-                        let total_split = info.get("total_token_usage").filter(|v| v.is_object()).map(usage_tokens);
+                        let last_split = info
+                            .get("last_token_usage")
+                            .filter(|v| v.is_object())
+                            .map(usage_tokens);
+                        let total_split = info
+                            .get("total_token_usage")
+                            .filter(|v| v.is_object())
+                            .map(usage_tokens);
                         // total 语义 = total_tokens 字段(= input 含缓存 + output 含推理);
                         // 五桶直接相加会把 cached 双计(inclusive),缺字段时退化为 b0+b3
                         let total_now = info
@@ -225,7 +300,13 @@ impl UsageSource for CodexSource {
                         // ts 入键会双双入账;total_now 会话内单调,天然区分不同 turn(档案 §5.1b)
                         let key = format!(
                             "codex:{}:{}:{}:{}:{}:{}:{}:{}",
-                            st.session_id, st.model, b[0], b[1], b[2], b[3], b[4],
+                            st.session_id,
+                            st.model,
+                            b[0],
+                            b[1],
+                            b[2],
+                            b[3],
+                            b[4],
                             total_now.unwrap_or(0)
                         );
                         // 去重命中(成对双发/重放前缀)不累入校验和;
@@ -260,7 +341,9 @@ impl UsageSource for CodexSource {
                     //   本机 852 个含它的文件全部同时含 token_count,故跳过不双计;若未来
                     //   build 只写它,须切换主源并按 response_id 去重)、
                     // inter_agent_communication_metadata / world_state(编排元数据,非用量)
-                    Some("response_item") | Some("compacted") | Some("ghost_snapshot")
+                    Some("response_item")
+                    | Some("compacted")
+                    | Some("ghost_snapshot")
                     | Some("token_usage_record")
                     | Some("inter_agent_communication_metadata")
                     | Some("world_state") => {}
@@ -268,14 +351,18 @@ impl UsageSource for CodexSource {
                     None => stats.lines_unknown_type += 1,
                 }
             };
-            for (_, value) in &lines.events { consume(value); }
+            for (_, value) in &lines.events {
+                consume(value);
+            }
             stats.files_parsed += usize::from(lines.readable);
             // 双法互验(档案 §5.1/§5.3):
             // 继承基线 = first_total − first_last(新会话=0,fork 子会话=父前缀累计);
             // Σlast ≈ last_total − 继承基线
             if let (Some(t), true) = (st.last_total, st.sum_last > 0) {
-                let inherited =
-                    st.first_total.unwrap_or(0).saturating_sub(st.first_last.unwrap_or(0));
+                let inherited = st
+                    .first_total
+                    .unwrap_or(0)
+                    .saturating_sub(st.first_last.unwrap_or(0));
                 let expect = t.saturating_sub(inherited);
                 if expect.abs_diff(st.sum_last).saturating_mul(100) > st.sum_last {
                     caliber_suspect += 1;
@@ -283,9 +370,10 @@ impl UsageSource for CodexSource {
             }
         }
         if caliber_suspect > 0 {
-            stats
-                .notes
-                .push(format!("{} 个会话的会话合计与末条请求累计相差>1%,按末条累计计入(数值可能偏大)", caliber_suspect));
+            stats.notes.push(format!(
+                "{} 个会话的会话合计与末条请求累计相差>1%,按末条累计计入(数值可能偏大)",
+                caliber_suspect
+            ));
         }
         (records, stats)
     }

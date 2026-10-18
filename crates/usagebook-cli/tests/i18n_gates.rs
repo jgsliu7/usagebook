@@ -26,9 +26,9 @@ fn lex(src: &str) -> (Vec<StrLit>, String) {
         Code,
         Line,
         Block,
-        Quo(char, usize),   // (quote, 起始下标)
-        Tpl(usize),         // 起始下标
-        TplCode(usize),     // ${} 内花括号深度
+        Quo(char, usize), // (quote, 起始下标)
+        Tpl(usize),       // 起始下标
+        TplCode(usize),   // ${} 内花括号深度
         Re,
     }
     let chars: Vec<char> = src.chars().collect();
@@ -212,12 +212,17 @@ fn parse_dict(src: &str, expect_locale: &str) -> BTreeMap<String, String> {
             "字典重复 key({expect_locale}.js:{ln}): {line}"
         );
     }
-    assert!(locale.is_some(), "字典缺少 I18N['{expect_locale}'] 头部声明");
+    assert!(
+        locale.is_some(),
+        "字典缺少 I18N['{expect_locale}'] 头部声明"
+    );
     map
 }
 
 fn line_of(src: &str, byte: usize) -> usize {
-    src.get(..byte).map(|s| s.matches('\n').count() + 1).unwrap_or(0)
+    src.get(..byte)
+        .map(|s| s.matches('\n').count() + 1)
+        .unwrap_or(0)
 }
 
 /// 按字符序号计行(词法器的 code_view 用等字符数空格替换注释,字符序号与原文对齐、字节序号不对齐)
@@ -279,7 +284,10 @@ fn gate2_reference_integrity() {
         .captures_iter(&code_view)
         .map(|c| c[1].to_string())
         .collect();
-    assert!(!metric_keys.is_empty(), "未找到 METRICS labelKey 字面量声明");
+    assert!(
+        !metric_keys.is_empty(),
+        "未找到 METRICS labelKey 字面量声明"
+    );
 
     // t() 调用四类合法形态检查（在注释剔除后的 code 视图上扫描）
     let tcall = Regex::new(r"(?s)\bt\((.{0,120}?)\)").unwrap();
@@ -290,7 +298,10 @@ fn gate2_reference_integrity() {
         let byte_off = c.get(0).unwrap().start();
         let char_idx = code_view[..byte_off].chars().count();
         let ln = line_of_char(js, char_idx);
-        classified.push((char_idx, char_idx + c.get(0).unwrap().as_str().chars().count()));
+        classified.push((
+            char_idx,
+            char_idx + c.get(0).unwrap().as_str().chars().count(),
+        ));
         if let Some(k) = lit.captures(arg) {
             if &k[1] == "wd." {
                 continue; // 形态③：'wd.' + 表达式，key 空间由 wd.0~wd.6 强制覆盖
@@ -329,7 +340,10 @@ fn gate2_reference_integrity() {
         let inzh = zh.contains_key(k);
         let inen = en.contains_key(k);
         if !inzh || !inen {
-            let _ = writeln!(missing, "  key '{k}'(引用行 {ln}) 未入字典: zh={inzh} en={inen}");
+            let _ = writeln!(
+                missing,
+                "  key '{k}'(引用行 {ln}) 未入字典: zh={inzh} en={inen}"
+            );
         }
     }
     assert!(missing.is_empty(), "存在未入字典的引用:\n{missing}");
@@ -344,8 +358,14 @@ fn gate3_placeholder_parity() {
     let mut msg = String::new();
     for (k, v) in &zh {
         let Some(ev) = en.get(k) else { continue };
-        let mut zp: Vec<&str> = ph.captures_iter(v).map(|c| c.get(0).unwrap().as_str()).collect();
-        let mut ep: Vec<&str> = ph.captures_iter(ev).map(|c| c.get(0).unwrap().as_str()).collect();
+        let mut zp: Vec<&str> = ph
+            .captures_iter(v)
+            .map(|c| c.get(0).unwrap().as_str())
+            .collect();
+        let mut ep: Vec<&str> = ph
+            .captures_iter(ev)
+            .map(|c| c.get(0).unwrap().as_str())
+            .collect();
         zp.sort();
         ep.sort();
         if zp != ep {
@@ -433,7 +453,8 @@ fn gate6_static_text_mounted() {
         } else if let Some(txt) = c.get(2) {
             if cjk.is_match(txt.as_str()) {
                 let top = stack.last().cloned().unwrap_or_default();
-                let exempt = EXEMPT_TXT.iter().any(|e| txt.as_str().trim() == *e) && top.starts_with("<button");
+                let exempt = EXEMPT_TXT.iter().any(|e| txt.as_str().trim() == *e)
+                    && top.starts_with("<button");
                 if !exempt && !top.contains("data-i18n") {
                     panic!(
                         "HTML 元素直接文本含中文但未挂 data-i18n(标签: {top}, 文本: {})",

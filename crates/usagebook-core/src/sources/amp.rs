@@ -9,7 +9,7 @@
 //! credits 是 amp 积分非美元,不进 cost_usd(§6)
 
 use crate::common::{env_roots, home, iso_to_ms, json_u64, walk_with};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -43,10 +43,16 @@ impl UsageSource for AmpSource {
         roots
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
         if roots.is_empty() {
-            stats.notes.push("未发现 ~/.local/share/amp/threads 或 AMP_DATA_DIR".into());
+            stats
+                .notes
+                .push("未发现 ~/.local/share/amp/threads 或 AMP_DATA_DIR".into());
             return (vec![], stats);
         }
         let mut files: Vec<PathBuf> = Vec::new();
@@ -84,13 +90,19 @@ impl UsageSource for AmpSource {
                 continue;
             };
             stats.files_parsed += 1;
-            let thread_id = doc.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let thread_id = doc
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
 
             // messageId → assistant usage 的联表(ledger 路径补缓存桶用,§3)
             let mut by_msg_id: HashMap<String, &Value> = HashMap::new();
             for m in messages.iter() {
                 if m.get("role").and_then(|x| x.as_str()) == Some("assistant") {
-                    if let (Some(mid), Some(u)) = (m.get("messageId").and_then(|x| x.as_i64()), m.get("usage")) {
+                    if let (Some(mid), Some(u)) =
+                        (m.get("messageId").and_then(|x| x.as_i64()), m.get("usage"))
+                    {
                         by_msg_id.insert(mid.to_string(), u);
                     }
                 }
@@ -129,13 +141,20 @@ impl UsageSource for AmpSource {
                             })
                         });
                     let (cr, cw) = match join {
-                        Some(u) => (json_u64(u.get("cacheReadInputTokens")), json_u64(u.get("cacheCreationInputTokens"))),
+                        Some(u) => (
+                            json_u64(u.get("cacheReadInputTokens")),
+                            json_u64(u.get("cacheCreationInputTokens")),
+                        ),
                         None => {
                             join_miss += 1;
                             (0, 0)
                         }
                     };
-                    let model = e.get("model").and_then(|x| x.as_str()).unwrap_or("unknown").to_string();
+                    let model = e
+                        .get("model")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
                     let ts_ms = e
                         .get("timestamp")
                         .and_then(|x| x.as_str())
@@ -173,17 +192,29 @@ impl UsageSource for AmpSource {
                     let Some(u) = m.get("usage") else { continue };
                     stats.lines_total += 1;
                     let g = |k: &str| json_u64(u.get(k));
-                    let (i, o, cr, cw) =
-                        (g("inputTokens"), g("outputTokens"), g("cacheReadInputTokens"), g("cacheCreationInputTokens"));
+                    let (i, o, cr, cw) = (
+                        g("inputTokens"),
+                        g("outputTokens"),
+                        g("cacheReadInputTokens"),
+                        g("cacheCreationInputTokens"),
+                    );
                     if i == 0 && o == 0 && cr == 0 && cw == 0 {
                         continue;
                     }
-                    let model = u.get("model").and_then(|x| x.as_str()).unwrap_or("unknown").to_string();
+                    let model = u
+                        .get("model")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
                     let ts_ms = u
                         .get("timestamp")
                         .and_then(|x| x.as_str())
                         .and_then(iso_to_ms)
-                        .or_else(|| m.get("timestamp").and_then(|x| x.as_str()).and_then(iso_to_ms))
+                        .or_else(|| {
+                            m.get("timestamp")
+                                .and_then(|x| x.as_str())
+                                .and_then(iso_to_ms)
+                        })
                         .unwrap_or(0);
                     let key = format!("amp:{}:msg:{idx}", thread_id);
                     if !seen.insert(key.clone()) {
@@ -213,9 +244,13 @@ impl UsageSource for AmpSource {
         for (root, n) in per_root {
             stats.notes.push(format!("根 {}:{n} 个 json", root));
         }
-        stats.notes.push(format!("ledger 文件 {ledger_files} · messages 回落文件 {msg_files}"));
+        stats.notes.push(format!(
+            "ledger 文件 {ledger_files} · messages 回落文件 {msg_files}"
+        ));
         if join_miss > 0 {
-            stats.notes.push(format!("toMessageId 联表未命中 {join_miss} 条(缓存桶置 0)"));
+            stats
+                .notes
+                .push(format!("toMessageId 联表未命中 {join_miss} 条(缓存桶置 0)"));
         }
         if dup_dropped > 0 {
             stats.notes.push(format!("重复索引丢弃 {dup_dropped} 条"));

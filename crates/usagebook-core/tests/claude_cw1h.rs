@@ -33,10 +33,19 @@ fn claude_cache_write_1h_subset_and_parity() {
 
     // 直读:字段提取与口径
     let (records, _) = src.scan_roots(&roots, None);
-    let a = records.iter().find(|r| r.dedup_key.contains("msg_a")).expect("msg_a");
-    let b = records.iter().find(|r| r.dedup_key.contains("msg_b")).expect("msg_b");
+    let a = records
+        .iter()
+        .find(|r| r.dedup_key.contains("msg_a"))
+        .expect("msg_a");
+    let b = records
+        .iter()
+        .find(|r| r.dedup_key.contains("msg_b"))
+        .expect("msg_b");
     assert_eq!(a.cache_write, 1000);
-    assert_eq!(a.cache_write_1h, 600, "1h 子桶按 ephemeral_1h_input_tokens 提取");
+    assert_eq!(
+        a.cache_write_1h, 600,
+        "1h 子桶按 ephemeral_1h_input_tokens 提取"
+    );
     assert_eq!(b.cache_write, 50);
     assert_eq!(b.cache_write_1h, 0, "无 cache_creation 对象时为 0");
     // 五桶合计不因子桶双计:2+1000+1 = 1003(1h 不另加)。
@@ -49,7 +58,10 @@ fn claude_cache_write_1h_subset_and_parity() {
     usagebook_core::common::__reset_caches_for_tests();
     let (on1, _) = usagebook_core::common::with_incremental_cache(|| src.scan_roots(&roots, None));
     assert_eq!(
-        on1.iter().find(|r| r.dedup_key.contains("msg_a")).unwrap().cache_write_1h,
+        on1.iter()
+            .find(|r| r.dedup_key.contains("msg_a"))
+            .unwrap()
+            .cache_write_1h,
         600,
         "L1/L2 路径不得丢 1h 子桶"
     );

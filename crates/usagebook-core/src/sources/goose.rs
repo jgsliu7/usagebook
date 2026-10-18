@@ -10,7 +10,7 @@
 //! 去重键:goose:{db路径}:ledger:{id} / 会话兜底 goose:{db路径}:{id}(§6.3)
 
 use crate::common::{env_roots, home, iso_to_ms, secs_or_ms};
-use crate::model::{Caliber, ScanStats, UsageSource, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use chrono::NaiveDate;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
@@ -32,7 +32,9 @@ fn goose_time(v: &SqlValue) -> Option<i64> {
                 return Some(secs_or_ms(n));
             }
             if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                return d.and_hms_opt(0, 0, 0).map(|t| t.and_utc().timestamp_millis());
+                return d
+                    .and_hms_opt(0, 0, 0)
+                    .map(|t| t.and_utc().timestamp_millis());
             }
             NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
                 .ok()
@@ -98,8 +100,10 @@ impl UsageSource for GooseSource {
             ];
             if let Ok(appdata) = std::env::var("APPDATA") {
                 if !appdata.trim().is_empty() {
-                    cands.push(std::path::PathBuf::from(appdata.trim())
-                        .join("Block/goose/data/sessions/sessions.db"));
+                    cands.push(
+                        std::path::PathBuf::from(appdata.trim())
+                            .join("Block/goose/data/sessions/sessions.db"),
+                    );
                 }
             }
             for c in cands {
@@ -114,7 +118,11 @@ impl UsageSource for GooseSource {
         dbs
     }
 
-    fn scan_roots(&self, roots: &[std::path::PathBuf], _max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+    fn scan_roots(
+        &self,
+        roots: &[std::path::PathBuf],
+        _max_files: Option<usize>,
+    ) -> (Vec<UsageRecord>, ScanStats) {
         // max_files 对本源无意义:sqlite 单库全量读
         let mut stats = ScanStats::default();
         if roots.is_empty() {
@@ -133,7 +141,9 @@ impl UsageSource for GooseSource {
             let conn = match crate::common::open_sqlite_readonly(db) {
                 Ok(c) => c,
                 Err(e) => {
-                    stats.notes.push(format!("{} 打开失败: {}", db.display(), e));
+                    stats
+                        .notes
+                        .push(format!("{} 打开失败: {}", db.display(), e));
                     stats.failed = true;
                     continue;
                 }
@@ -153,7 +163,9 @@ impl UsageSource for GooseSource {
                 )
                 .unwrap_or(0);
             if has_sessions == 0 {
-                stats.notes.push(format!("{} 无 sessions 表,忽略", db.display()));
+                stats
+                    .notes
+                    .push(format!("{} 无 sessions 表,忽略", db.display()));
                 continue;
             }
 
@@ -171,9 +183,10 @@ impl UsageSource for GooseSource {
                 scan_ledger(db, &conn, &mut records, &mut seen, &mut stats);
                 continue;
             }
-            stats
-                .notes
-                .push(format!("{} 无 usage_ledger(老库),回退 sessions 会话级(§6.3)", db.display()));
+            stats.notes.push(format!(
+                "{} 无 usage_ledger(老库),回退 sessions 会话级(§6.3)",
+                db.display()
+            ));
 
             // ===== 兜底通道:sessions.accumulated_*(会话级;cache 列 v14+ 缺省防御)=====
             let has_cache_col = has_column(&conn, "sessions", "accumulated_cache_read_tokens");
@@ -189,7 +202,9 @@ impl UsageSource for GooseSource {
                        {cache_sel} FROM sessions"
             );
             let Ok(mut stmt) = conn.prepare(&sql) else {
-                stats.notes.push(format!("{} sessions 查询构建失败", db.display()));
+                stats
+                    .notes
+                    .push(format!("{} sessions 查询构建失败", db.display()));
                 stats.failed = true;
                 continue;
             };
@@ -198,14 +213,18 @@ impl UsageSource for GooseSource {
                 Ok(r) => r,
                 Err(e) => {
                     // 新旧列可能部分缺失(旧库),按 NULL 读仍失败才放弃(§2)
-                    stats.notes.push(format!("{} sessions 查询失败: {}", db.display(), e));
+                    stats
+                        .notes
+                        .push(format!("{} sessions 查询失败: {}", db.display(), e));
                     stats.failed = true;
                     continue;
                 }
             };
             stats.files_parsed += 1;
             while let Ok(Some(row)) = rows.next() {
-                let vals: Vec<SqlValue> = (0..11).filter_map(|i| row.get::<_, SqlValue>(i).ok()).collect();
+                let vals: Vec<SqlValue> = (0..11)
+                    .filter_map(|i| row.get::<_, SqlValue>(i).ok())
+                    .collect();
                 if vals.len() < 11 {
                     stats.lines_bad_json += 1;
                     continue;
@@ -293,25 +312,35 @@ fn scan_ledger(
     stats: &mut ScanStats,
 ) {
     let has_cost_col = has_column(conn, "usage_ledger", "cost_source");
-    let cost_sel = if has_cost_col { ", cost, cost_source" } else { ", NULL, NULL" };
+    let cost_sel = if has_cost_col {
+        ", cost, cost_source"
+    } else {
+        ", NULL, NULL"
+    };
     let sql = format!(
         "SELECT id, session_id, created_timestamp, model, \
                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens \
                 {cost_sel}, is_compaction FROM usage_ledger ORDER BY id"
     );
     let Ok(mut stmt) = conn.prepare(&sql) else {
-        stats.notes.push(format!("{} usage_ledger 查询构建失败", db.display()));
+        stats
+            .notes
+            .push(format!("{} usage_ledger 查询构建失败", db.display()));
         stats.failed = true;
         return;
     };
     let Ok(mut rows) = stmt.query([]) else {
-        stats.notes.push(format!("{} usage_ledger 查询执行失败", db.display()));
+        stats
+            .notes
+            .push(format!("{} usage_ledger 查询执行失败", db.display()));
         stats.failed = true;
         return;
     };
     let mut skipped_compaction = 0u64;
     while let Ok(Some(row)) = rows.next() {
-        let vals: Vec<SqlValue> = (0..11).filter_map(|i| row.get::<_, SqlValue>(i).ok()).collect();
+        let vals: Vec<SqlValue> = (0..11)
+            .filter_map(|i| row.get::<_, SqlValue>(i).ok())
+            .collect();
         if vals.len() < 11 {
             stats.lines_bad_json += 1;
             continue;
@@ -332,18 +361,22 @@ fn scan_ledger(
             continue;
         };
         let model = v_text(&vals[3]).unwrap_or_default();
-        let model = if model.trim().is_empty() { "unknown".into() } else { model };
+        let model = if model.trim().is_empty() {
+            "unknown".into()
+        } else {
+            model
+        };
         let input_incl = v_u64(&vals[4]); // 已含 cache(子集,§6.3)
         let output = v_u64(&vals[5]);
         let cr = v_u64(&vals[6]);
         let cw = v_u64(&vals[7]);
         let cost = match &vals[8] {
             SqlValue::Real(f) if *f > 0.0 => Some(*f),
-            SqlValue::Integer(n) if *n > 0 => Some(*n as f64),   // INTEGER 正值成本兼容(2026-10-17)
+            SqlValue::Integer(n) if *n > 0 => Some(*n as f64), // INTEGER 正值成本兼容(2026-10-17)
             _ => None,
         };
-        let cost_source = v_text(&vals.get(9).cloned().unwrap_or(SqlValue::Null))
-            .unwrap_or_default();
+        let cost_source =
+            v_text(&vals.get(9).cloned().unwrap_or(SqlValue::Null)).unwrap_or_default();
         if input_incl == 0 && output == 0 && cr == 0 && cw == 0 {
             continue; // 全零跳过(三跳过)
         }
@@ -363,7 +396,11 @@ fn scan_ledger(
                 output,
                 reasoning_output: 0, // ledger 无 reasoning 列(§6.3)
                 // 估算不落(model.rs 纪律):仅 provider_reported 视为官方实报
-                cost_usd: if cost_source == "provider_reported" { cost } else { None },
+                cost_usd: if cost_source == "provider_reported" {
+                    cost
+                } else {
+                    None
+                },
                 dedup_key: key,
             });
         }
@@ -399,11 +436,20 @@ mod tests {
 
     #[test]
     fn goose_time_formats() {
-        assert_eq!(goose_time(&SqlValue::Text("2026-01-02 03:04:05".into())), Some(1767323045000));
+        assert_eq!(
+            goose_time(&SqlValue::Text("2026-01-02 03:04:05".into())),
+            Some(1767323045000)
+        );
         assert!(goose_time(&SqlValue::Text("2026-01-02".into())).is_some());
         assert!(goose_time(&SqlValue::Text("2026-01-02T03:04:05Z".into())).is_some());
-        assert_eq!(goose_time(&SqlValue::Integer(1750000000)), Some(1750000000000));
-        assert_eq!(goose_time(&SqlValue::Integer(1750000000000)), Some(1750000000000));
+        assert_eq!(
+            goose_time(&SqlValue::Integer(1750000000)),
+            Some(1750000000000)
+        );
+        assert_eq!(
+            goose_time(&SqlValue::Integer(1750000000000)),
+            Some(1750000000000)
+        );
         assert_eq!(goose_time(&SqlValue::Null), None);
     }
 }

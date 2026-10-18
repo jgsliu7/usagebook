@@ -9,7 +9,12 @@ fn main() {
         if records.is_empty() && stats.key_clash == 0 {
             continue;
         }
-        println!("{:<10} 记录 {:>7} · 键碰撞 {}", a.id(), records.len(), stats.key_clash);
+        println!(
+            "{:<10} 记录 {:>7} · 键碰撞 {}",
+            a.id(),
+            records.len(),
+            stats.key_clash
+        );
         total_clash += stats.key_clash;
         total_records += records.len();
     }

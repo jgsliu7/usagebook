@@ -2,10 +2,10 @@
 //! 新增源的样板参考:grok.rs(纯 JSONL 累计快照+差分)、kimi.rs(复杂状态机)、hermes.rs(简单 SQLite 单库)。
 pub mod amp;
 pub mod claude;
-pub mod copilot;
 pub mod cline;
 pub mod codebuff;
 pub mod codex;
+pub mod copilot;
 pub mod droid;
 pub mod dsh;
 pub mod gemini;

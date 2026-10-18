@@ -11,20 +11,24 @@
 //! `--version`/`--help` 先退出,初始化抢跑会破坏 `--version` 全等输出契约)。
 
 use std::io::Write;
-use usagebook_core::logging::FileSink;
-use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::FormatTime;
-use tracing_subscriber::Layer;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 use tracing_subscriber::{filter::LevelFilter, fmt, registry::Registry, EnvFilter};
+use usagebook_core::logging::FileSink;
 
 /// RFC3339 + 本地时区偏移 + 毫秒(文件层与 console 层共用)。
 struct LocalTimer;
 
 impl FormatTime for LocalTimer {
     fn format_time(&self, w: &mut fmt::format::Writer<'_>) -> std::fmt::Result {
-        write!(w, "{}", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z"))
+        write!(
+            w,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+        )
     }
 }
 
@@ -36,7 +40,10 @@ struct SanitizedLineWriter<W: Write> {
 
 impl<W: Write> SanitizedLineWriter<W> {
     fn new(inner: W) -> Self {
-        SanitizedLineWriter { inner, buf: Vec::new() }
+        SanitizedLineWriter {
+            inner,
+            buf: Vec::new(),
+        }
     }
 
     fn flush_complete_lines(&mut self) -> std::io::Result<()> {
