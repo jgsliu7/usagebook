@@ -41,7 +41,7 @@ cd usagebook
 
 ### macOS：从本地解压包安装
 
-从 [本项目 Releases](https://github.com/jgsliu7/usagebook/releases) 下载 `universal-apple-darwin` 包及对应 `.sha256` 文件；通用包包含 Apple Silicon 和 Intel 两种架构。Linux 用户下载 `x86_64-unknown-linux-gnu` 包，步骤相同。先在下载目录用 `shasum -a 256 -c <校验和文件名>` 校验，再完整解压。
+当前版本尚未发布。发行包可用后，从 [本项目 Releases](https://github.com/jgsliu7/usagebook/releases) 下载 `universal-apple-darwin` 包及对应 `.sha256` 文件；通用包包含 Apple Silicon 和 Intel 两种架构。Linux 用户下载 `x86_64-unknown-linux-gnu` 包，步骤相同。先在下载目录用 `shasum -a 256 -c <校验和文件名>` 校验，再完整解压。
 
 进入解压目录运行：
 
@@ -123,7 +123,7 @@ USAGEBOOK_DATA_DIR=/absolute/path/usagebook-data "$HOME/.local/bin/usagebook" se
 "$HOME/.local/bin/usagebook" --source codex --days 7 --json > usage-last-7-days.json
 ```
 
-统计的是可读取日志中的记录；来源、时间、模型和金额覆盖都可能有限。看板金额来自源字段及适配器已有换算，不代表订阅账单或结算金额；金额列只覆盖带金额的逐请求记录。`—` 或隐藏金额列不代表免费，当前不能完整区分未知、真实零值和部分覆盖。CLI 的 JSON 示例导出 token 报表，不包含看板金额列。报告问题时优先提供版本与 `doctor --check` 诊断计数，先脱敏路径和模型别名，不要提交原始会话或密钥。
+统计的是可读取日志中的记录；来源、时间、模型覆盖都可能有限。费用金额不展示：各家工具计价差异很大且源数据覆盖不全，展示容易误导。CLI 的 JSON 示例导出 token 报表。报告问题时优先提供版本与 `doctor --check` 诊断计数，先脱敏路径和模型别名，不要提交原始会话或密钥。
 
 ## 5. 更新与卸载
 

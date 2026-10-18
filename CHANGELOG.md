@@ -2,6 +2,8 @@
 
 ## [未发布]
 
+- 看板与终端报表不再展示费用金额:移除来源表"成本$"列、会话基线列表的成本列及相关文案(各家工具计价差异很大,源内金额覆盖不全且不等于实际账单,展示易误导;金额字段保留在本地数据中,不展示、不上传)
+
 ## [0.1.0] - 2026-10-18
 
 首个公开版本。
@@ -40,7 +42,7 @@
 - `-v/-vv` 提升终端诊断级别;`RUST_LOG` 完全接管
 - 本地安装脚本支持源码与解压包、指定安装目录、重复安装更新及卸载
 - 新增英文版 README(`README.en.md`);README 含界面语言说明
-- 文档:README 全文改为面向读者的通用语态,开头为标准中英切换链接行;快速开始提供 GitHub Releases 预编译包入口;发行包口径与平台状态在 README/INSTALL 间保持一致(当前提供 macOS 与 Linux,Windows 暂无);状态库代次示例更正为 cache-p6;架构图补全 `store/` 与 `logging.rs`;来源状态图例与实际测试覆盖一致;README 增加 CI 与 License 徽章
+- 文档:README 全文改为面向读者的通用语态,开头为标准中英切换链接行;快速开始提供 GitHub Releases 预编译包入口;发行包口径与平台状态在 README/INSTALL 间保持一致(发行包尚未发布,将提供 macOS 与 Linux,Windows 暂无);状态库代次示例更正为 cache-p6;架构图补全 `store/` 与 `logging.rs`;来源状态图例与实际测试覆盖一致;README 增加 CI 与 License 徽章
 - 发布工程:CI 将 Windows 矩阵降为非阻塞(测试修绿前保持可见,其余平台继续作为合入闸门);CI 与发布前检查新增 rustfmt 闸门并完成一次全库格式化;Release 发布说明只取 CHANGELOG 对应版本小节(原先会附上整份文件);Cargo 包元数据补 repository
 - doctor:状态库"最近更新"由原始毫秒值改为本地时间显示;环境变量一览补 `GEMINI_CLI_HOME` 与 `XDG_DATA_HOME`
 - 发行包包含使用说明、Apache-2.0 许可证及第三方依赖许可全文

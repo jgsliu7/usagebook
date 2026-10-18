@@ -21,14 +21,14 @@ v0.1 统计 24 种 AI 编程工具的 token 消耗。**首发以 macOS 为主；
 
 | 数据源 | 状态 | 说明 |
 |---|---|---|
-| Claude Code | ✅ | 会话转录 + 源自带金额（不等于实际账单） |
+| Claude Code | ✅ | 会话转录 |
 | Codex CLI | ✅ | 会话事件流 |
 | Kimi Code | ✅ | 双根双格式会话流 |
 | ZCode | ✅ | SQLite 用量账本 |
 | WorkBuddy | ✅ | 会话转录 + 用量行 |
 | DeepSeek Harness | ✅ | 压缩会话流(zstd) |
 | MiniMax | ✅ | SQLite 用量投影 |
-| OMP / Pi | ✅ | 会话流(OMP 自带逐请求成本) |
+| OMP / Pi | ✅ | 会话流 |
 | Cline | ✅ | 仅原生会话(导入镜像不计) |
 | OpenCode | ✅ | SQLite 消息库 |
 | Qwen Code | ✅ | 逐响应用量 + 月度通道 |
@@ -54,7 +54,7 @@ git clone https://github.com/jgsliu7/usagebook && cd usagebook
 sh install.sh && "$HOME/.local/bin/usagebook" serve --open
 ```
 
-也可以从 [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) 下载预编译发行包（当前提供 macOS 通用包与 Linux x86_64 包；Windows 暂无）：完整解压后运行其中的 `sh install.sh`，不需要 Rust。
+预编译发行包尚未发布。发布后可从 [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) 下载（将提供 macOS 通用包与 Linux x86_64 包；Windows 暂无）：完整解压后运行其中的 `sh install.sh`，不需要 Rust。
 
 看板只在 `127.0.0.1:7878` 提供服务；按 **Ctrl-C** 停止。安装脚本不需要 sudo，不修改 shell 配置，不注册后台服务。已有源码并位于仓库根目录时，复制上面的第二行即可安装并打开看板。关闭浏览器标签页不会停止服务；下次使用仍运行 `"$HOME/.local/bin/usagebook" serve --open`。
 
@@ -102,7 +102,7 @@ usagebook serve --port 8080 --refresh-secs 30
 - **快照磁盘缓存**：服务重启先显示缓存结果，后台重扫更新
 - 图表库 Chart.js 随二进制分发，零外网依赖
 
-边界说明：图表的指标切换不改变"总量 Tokens"卡片及其环比的总量口径；今日同期不可计算或缓存仍属于前一天时，不显示该环比；整轮扫描或连接失败时，已有结果继续展示并标出数据截止时间；单个来源扫描失败会另行提示，本轮统计可能不完整；明细表跟随时间窗，来源表按带金额的逐请求记录汇总，金额覆盖可能不完整。
+边界说明：图表的指标切换不改变"总量 Tokens"卡片及其环比的总量口径；今日同期不可计算或缓存仍属于前一天时，不显示该环比；整轮扫描或连接失败时，已有结果继续展示并标出数据截止时间；单个来源扫描失败会另行提示，本轮统计可能不完整；明细表跟随时间窗。
 
 ### 环境变量
 
@@ -171,7 +171,7 @@ sh install.sh
 
 ## 口径纪律
 
-- **金额来自源记录及适配器已有换算，仅供参考，不等同于实际账单或订阅费用**。看板只汇总窗口内带金额的逐请求记录，可能仅覆盖一部分请求；Claude 会话级金额不计入该列。显示 `—` 或隐藏金额列不代表免费：当前聚合尚不能完整区分未提供金额、真实零值和部分覆盖，不可据此对账
+- **费用金额不展示**：各家工具计价差异很大，源数据中的金额覆盖不全且不等于实际账单，展示容易误导。看板与终端报表因此只统计 token 用量，不显示费用；相关字段保留在本地数据中，不上传
 - 源支持等级:标 ✅ 的为实机验证;未标记的源装了但无数据,通常是当前环境没有该工具的记录或其格式尚未支持,先运行 `usagebook doctor` 排查
 
 - 五桶模型:输入(新)/ 缓存读 / 缓存写 / 输出 / 推理输出

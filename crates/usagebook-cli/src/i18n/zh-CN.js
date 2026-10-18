@@ -130,8 +130,6 @@ I18N['zh-CN'] = {
   'tbl.sum': '合计',
   'tbl.share': '占比',
   'tbl.requests': '请求',
-  'tbl.cost': '成本$',
-  'tbl.costTitle': '窗口内逐请求成本(源自带计价)',
   'tbl.clickModel': '点击:切换该模型筛选',
   'tbl.clickSource': '点击:切换该来源筛选',
   'empty.noRange': '当前时间段无数据',

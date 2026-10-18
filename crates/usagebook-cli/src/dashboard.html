@@ -1148,8 +1148,8 @@ function renderDoughnut() {
 // 表格 HTML memo(perf 复检 修成真实现):稳态 tick 下两表 innerHTML 完全相同,
 // 键=数据代+本地日+窗口+筛选+指标+分组+单位+语言,按表分键存储;命中则跳过重建
 // (监听委托在常驻 <table> 元素上,子节点重建本就不丢,跳过只为省每 tick 的解析/布局)。
-// 注:缓存写列可见性(cwVisible)与成本列(costAny)未显式入键,由 generated_at_ms 隐式覆盖
-// (二者均随快照换代而变;若未来改为依赖非快照输入,须将其纳入键)
+// 注:缓存写列可见性(cwVisible)未显式入键,由 generated_at_ms 隐式覆盖
+// (其随快照换代而变;若未来改为依赖非快照输入,须将其纳入键)
 const _tblKeys = { 'tbl-model': null, 'tbl-source': null };
 function tblMemoKey() {
   return [DATA.generated_at_ms, localDayStr(), state.win, state.rs, state.re, _selKey(state.srcSel), _selKey(state.mdlSel), state.metric, state.group, state.unit, state.lang].join('|');
@@ -1192,28 +1192,24 @@ function renderModelTable() {
 }
 
 function renderSourceTable() {
-  // 时间窗聚合(与图表同口径);成本=窗口内逐请求成本合计(claude cost-state 为会话级快照,不在此列)
+  // 时间窗聚合(与图表同口径);费用不展示:各家计价差异大、源内金额覆盖不全,展示易误导
   const cw = cwVisible();
   const agg = Object.create(null);
-  let costAny = false;
   for (const r of viewRows()) {
-    const a = agg[r.s] = agg[r.s] || { i: 0, cr: 0, cw: 0, o: 0, r: 0, n: 0, c: 0 };
+    const a = agg[r.s] = agg[r.s] || { i: 0, cr: 0, cw: 0, o: 0, r: 0, n: 0 };
     a.i += r.b.i; a.cr += r.b.cr; a.cw += r.b.cw; a.o += r.b.o; a.r += r.b.r; a.n += r.b.n || 0;
-    a.c += r.b.c || 0;
-    if (r.b.c > 0) costAny = true;
   }
   const rows = Object.entries(agg).map(([s, b]) => ({ s, b }))
     .sort((a, b) => totalOf(b.b) - totalOf(a.b));
-  let html = `<tr><th>${t('tbl.source')}</th><th>${t('tbl.requests')}</th><th>${t('tbl.input')}</th><th>${t('tbl.cr')}</th>${cw ? `<th>${t('tbl.cw')}</th>` : ''}<th>${t('tbl.output')}</th><th>${t('tbl.sum')}</th>${costAny ? `<th title="${escapeHtml(t('tbl.costTitle'))}">${t('tbl.cost')}</th>` : ''}</tr>`;
+  let html = `<tr><th>${t('tbl.source')}</th><th>${t('tbl.requests')}</th><th>${t('tbl.input')}</th><th>${t('tbl.cr')}</th>${cw ? `<th>${t('tbl.cw')}</th>` : ''}<th>${t('tbl.output')}</th><th>${t('tbl.sum')}</th></tr>`;
   for (const r of rows) {
     html += `<tr class="srcrow" role="button" tabindex="0" data-s="${escapeHtml(r.s)}" title="${escapeHtml(t('tbl.clickSource'))}">
       <td class="mname"><span class="srcdot" style="background:${srcColor(r.s)}"></span>${escapeHtml(srcLabel(r.s))}</td>
       <td>${fmtInt(r.b.n)}</td>
       <td>${fmt(r.b.i)}</td><td>${fmt(r.b.cr)}</td>${cw ? `<td>${fmt(r.b.cw)}</td>` : ''}<td>${fmt(r.b.o + r.b.r)}</td>
-      <td><b>${fmt(totalOf(r.b))}</b></td>
-      ${costAny ? `<td>${r.b.c > 0 ? '$' + r.b.c.toFixed(2) : '—'}</td>` : ''}</tr>`;
+      <td><b>${fmt(totalOf(r.b))}</b></td></tr>`;
   }
-  if (!rows.length) html += `<tr><td colspan="${6 + (cw ? 1 : 0) + (costAny ? 1 : 0)}" class="empty-tip">${t('empty.noRange')}</td></tr>`;
+  if (!rows.length) html += `<tr><td colspan="${6 + (cw ? 1 : 0)}" class="empty-tip">${t('empty.noRange')}</td></tr>`;
   setTableHTML('tbl-source', html);
 }
 

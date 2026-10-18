@@ -175,14 +175,13 @@ pub fn print_report(records: &[UsageRecord], days: Option<usize>) {
         {
             let sid: String = b.session_id.chars().take(8).collect();
             println!(
-                "  {} {} {:<24} 输入{} 缓存读{} 输出{} 成本${:.2}",
+                "  {} {} {:<24} 输入{} 缓存读{} 输出{}",
                 b.source,
                 sid,
                 b.model,
                 fmt(b.input_uncached),
                 fmt(b.cache_read),
-                fmt(b.output),
-                b.cost_usd.unwrap_or(0.0)
+                fmt(b.output)
             );
         }
         if agg.baseline_count > 20 {

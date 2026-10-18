@@ -15,14 +15,14 @@ usagebook parses the on-disk data of 24 AI coding tools — read-only, zero conf
 
 | Source | Status | Notes |
 |---|---|---|
-| Claude Code | ✅ | session transcripts + source-side cost (not your actual bill) |
+| Claude Code | ✅ | session transcripts |
 | Codex CLI | ✅ | session event streams |
 | Kimi Code | ✅ | dual-root, dual-format session streams |
 | ZCode | ✅ | SQLite usage ledger |
 | WorkBuddy | ✅ | session transcripts + usage lines |
 | DeepSeek Harness | ✅ | zstd-compressed session streams |
 | MiniMax | ✅ | SQLite usage projection |
-| OMP / Pi | ✅ | session streams (OMP carries per-request cost) |
+| OMP / Pi | ✅ | session streams |
 | Cline | ✅ | native sessions only (imported mirrors excluded) |
 | OpenCode | ✅ | SQLite message store |
 | Qwen Code | ✅ | per-response usage + monthly channel |
@@ -52,7 +52,7 @@ If `~/.local/bin` is not on your PATH, run `export PATH="$HOME/.local/bin:$PATH"
 
 Uninstall: `sh install.sh --uninstall` (removes the binary; your data stays under `~/.usagebook`, delete it manually if you want a full wipe).
 
-Prebuilt archives for macOS (universal) and Linux x86_64 are available on [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) — no Windows archive yet. Unzip and run `sh install.sh` inside; no Rust toolchain needed.
+Prebuilt archives are not published yet. Once available, download them from [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) (macOS universal and Linux x86_64; no Windows archive for now) — unzip and run `sh install.sh` inside; no Rust toolchain needed.
 
 Quick start:
 

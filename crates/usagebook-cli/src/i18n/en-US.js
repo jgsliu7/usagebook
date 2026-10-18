@@ -130,8 +130,6 @@ I18N['en-US'] = {
   'tbl.sum': 'Total',
   'tbl.share': 'Share',
   'tbl.requests': 'Requests',
-  'tbl.cost': 'Cost ($)',
-  'tbl.costTitle': 'Sum of per-request costs in this window as recorded by sources; coverage may be partial',
   'tbl.clickModel': 'Click to toggle the filter for this model',
   'tbl.clickSource': 'Click to toggle the filter for this source',
   'empty.noRange': 'No data in this period',
