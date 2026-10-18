@@ -62,6 +62,21 @@ pub const SOURCE_CATALOG: &[SourceInfo] = &[
         label: "WorkBuddy",
         tier: SourceTier::Verified,
     },
+    // CodeBuddy CLI 与 WorkBuddy 同格式族(tencent_buddy)但数据根独立(~/.codebuddy);
+    // 2026-10-18 本机实装对账(1 会话 4 条五桶逐位全等,Σ=CLI 自报 tokenDelta 52376;档案 30 §1b)。
+    SourceInfo {
+        id: "codebuddy",
+        label: "CodeBuddy CLI",
+        tier: SourceTier::Verified,
+    },
+    // CodeBuddy CN 桌面 IDE("CodeBuddy Work")与 VS Code/Cursor 插件:会话/用量落
+    // CodeBuddyExtension/Data 的 history 树(extra.statsSnapshot whole-loop 口径)。
+    // 与 CLI 数据根及会话 id 空间互斥(档案 30 §5/§7);2026-10-18 本机实装对账。
+    SourceInfo {
+        id: "codebuddy-ide",
+        label: "CodeBuddy IDE",
+        tier: SourceTier::Verified,
+    },
     SourceInfo {
         id: "dsh",
         label: "DeepSeek Harness",
@@ -176,6 +191,8 @@ pub fn registered_sources() -> Vec<Box<dyn UsageSource>> {
         Box::new(sources::kimi_work::KimiWorkSource),
         Box::new(sources::zcode::ZcodeSource),
         Box::new(sources::workbuddy::WorkbuddySource),
+        Box::new(sources::codebuddy::CodebuddySource),
+        Box::new(sources::codebuddy_ide::CodebuddyIdeSource),
         Box::new(sources::dsh::DshSource),
         Box::new(sources::minimax::MinimaxSource),
         Box::new(sources::omp::OmpSource),

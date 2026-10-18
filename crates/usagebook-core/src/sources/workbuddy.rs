@@ -15,6 +15,9 @@
 //!   cache_creation_input_tokens];reasoning 取 [completion_tokens_details.reasoning_tokens,
 //!   completion_thinking_tokens] 首个正值;另有 credit 字段(单位不明,不入 cost_usd);
 //! - providerData.agent="cli" 为主代理,"general-purpose"+isSubAgent=true 为子代理。
+//!
+//! 2026-10-18:扫描核抽为 scan_buddy_wire(tencent_buddy 格式族共享,codebuddy 复用,档案 30;
+//! 范式同 kimi/kimi-work 的 scan_kimi_wire);workbuddy 侧行为零改动,workbuddy.db 注记留在此处。
 
 use crate::common::*;
 use crate::model::*;
@@ -64,8 +67,9 @@ fn det_num(o: &Value, path: &str, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// epoch 数字/ISO 字符串 → 毫秒(本机实证为毫秒数字;<1e12 视为秒 ×1000 防御)
-fn ts_to_ms(v: &Value) -> Option<i64> {
+/// epoch 数字/ISO 字符串 → 毫秒(本机实证为毫秒数字;<1e12 视为秒 ×1000 防御)。
+/// 家族共享(codebuddy_ide 的 createdAt 双形态兼容同用此策)。
+pub(crate) fn ts_to_ms(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => {
             let t = n.as_i64().or_else(|| n.as_f64().map(|f| f as i64))?;
@@ -167,6 +171,174 @@ fn from_message_usage(u: &Value) -> Buckets {
     }
 }
 
+/// tencent_buddy 格式族共享扫描核(workbuddy / codebuddy 共用;同族证据见档案 05 §3 与 30 §3,
+/// tokscale 同以 tencent_buddy 解析两源)。source_id 注入记录 source 与去重键前缀,token 天然分开统计。
+pub(crate) fn scan_buddy_wire(
+    source_id: &'static str,
+    empty_note: &str,
+    roots: &[PathBuf],
+    max_files: Option<usize>,
+) -> (Vec<UsageRecord>, ScanStats) {
+    let mut stats = ScanStats::default();
+    if roots.is_empty() {
+        stats.notes.push(empty_note.to_string());
+        return (vec![], stats);
+    }
+    let mut files = Vec::new();
+    for r in roots {
+        let d = r.join("projects");
+        if d.is_dir() {
+            files.extend(walk_jsonl(
+                &d,
+                max_files.map(|m| m.saturating_sub(files.len())),
+            ));
+        }
+    }
+    // 回滚日志非转录,防御排除(档案 §5.5;.ndjson 本就不入 walk_jsonl)
+    files.retain(|p| {
+        p.file_name()
+            .map(|n| !n.to_string_lossy().ends_with(".file-rollback.ndjson"))
+            .unwrap_or(true)
+    });
+    stats.files_seen = files.len();
+
+    let mut dedup: HashMap<String, UsageRecord> = HashMap::new();
+    let mut src_hits = [0u64; 3]; // rawUsage / providerData.usage / message.usage
+    let mut status_missing = 0u64;
+    let mut status_filtered = 0u64;
+    let mut ts_missing = 0u64;
+
+    for path in &files {
+        let fallback_session = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (total, bad) = for_each_line(path, |line| {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                stats.lines_bad_json += 1;
+                return;
+            };
+            let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            // 用量行:assistant 消息 + function_call(DeepSeek 特例,档案 §4 末)
+            let usage_row = match t {
+                "message" => v.get("role").and_then(|x| x.as_str()) == Some("assistant"),
+                "function_call" => true,
+                // 已知非用量行(本机全集实证):user 消息/工具结果/思考/快照/元数据/标题
+                "function_call_result"
+                | "reasoning"
+                | "file-history-snapshot"
+                | "session-meta"
+                | "ai-title" => return,
+                _ => {
+                    stats.lines_unknown_type += 1;
+                    return;
+                }
+            };
+            if !usage_row {
+                return; // role != assistant 的 message 行
+            }
+            // status 仅 message 行有;缺失视为 completed(档案 §8)
+            match v.get("status").and_then(|x| x.as_str()) {
+                Some("completed") | None => {
+                    if v.get("status").is_none() {
+                        status_missing += 1;
+                    }
+                }
+                Some(_) => {
+                    status_filtered += 1;
+                    return;
+                }
+            }
+            // usage 优先级(档案 §4 硬约束:rawUsage 最优先,防 Anthropic 名/OpenAI 义双计)
+            let pd = v.get("providerData");
+            let (buckets, which) =
+                if let Some(raw) = pd.and_then(|p| p.get("rawUsage")).filter(|u| u.is_object()) {
+                    (from_raw_usage(raw), 0)
+                } else if let Some(u) = pd.and_then(|p| p.get("usage")).filter(|u| u.is_object()) {
+                    (from_provider_usage(u), 1)
+                } else if let Some(u) = v.pointer("/message/usage").filter(|u| u.is_object()) {
+                    (from_message_usage(u), 2)
+                } else {
+                    return; // 无用量(多数 function_call/assistant 行是纯事件)
+                };
+            if buckets.is_zero() {
+                return;
+            }
+            src_hits[which] += 1;
+            let Some(ts_ms) = v.get("timestamp").and_then(ts_to_ms) else {
+                ts_missing += 1;
+                return;
+            };
+            let session_id = v
+                .get("sessionId")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&fallback_session)
+                .to_string();
+            let model = pd
+                .and_then(|p| p.get("model"))
+                .or_else(|| pd.and_then(|p| p.get("requestModelId")))
+                .or_else(|| v.pointer("/message/model"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            // 子代理:isSubAgent=true 时 agent 为子代理名,否则主代理(本机实证 cli/general-purpose)
+            let agent = pd
+                .and_then(|p| p.get("isSubAgent"))
+                .and_then(|x| x.as_bool())
+                .filter(|b| *b)
+                .and_then(|_| pd.and_then(|p| p.get("agent")).and_then(|x| x.as_str()))
+                .map(|s| s.to_string());
+            let msg_key = pd
+                .and_then(|p| p.get("messageId"))
+                .or_else(|| pd.and_then(|p| p.get("traceId")))
+                .or_else(|| v.get("id"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let key = format!("{}:{}:{}", source_id, session_id, msg_key);
+            let rec = UsageRecord {
+                source: source_id,
+                session_id: session_id.clone(),
+                agent,
+                model,
+                ts_ms,
+                caliber: Caliber::RequestDelta,
+                input_uncached: buckets.input_uncached,
+                cache_read: buckets.cache_read,
+                cache_write: buckets.cache_write,
+                cache_write_1h: 0,
+                output: buckets.output,
+                reasoning_output: buckets.reasoning,
+                cost_usd: None, // rawUsage.credit 单位不明,不冒认 USD
+                dedup_key: key.clone(),
+            };
+            // token 大者胜(claude.rs 同义;多 sink 镜像时五分量键天然塌缩)
+            match dedup.get(&key) {
+                Some(old) if old.token_total() >= rec.token_total() => {}
+                _ => {
+                    dedup.insert(key, rec);
+                }
+            }
+        });
+        stats.lines_total += total;
+        stats.lines_bad_json += bad;
+        if total > 0 {
+            stats.files_parsed += 1;
+        }
+    }
+    stats.notes.push(format!(
+        "usage 来源命中:rawUsage {} / providerData.usage {} / message.usage {}",
+        src_hits[0], src_hits[1], src_hits[2]
+    ));
+    stats.notes.push(format!(
+        "status 缺失 {} 行(视为 completed),非 completed 跳过 {} 行",
+        status_missing, status_filtered
+    ));
+    if ts_missing > 0 {
+        stats.notes.push(format!("{} 行缺时间戳跳过", ts_missing));
+    }
+    (dedup.into_values().collect(), stats)
+}
+
 impl WorkbuddySource {
     fn roots(&self) -> Vec<PathBuf> {
         let mut roots = env_roots("WORKBUDDY_HOME");
@@ -195,166 +367,12 @@ impl UsageSource for WorkbuddySource {
         roots: &[std::path::PathBuf],
         max_files: Option<usize>,
     ) -> (Vec<UsageRecord>, ScanStats) {
-        let mut stats = ScanStats::default();
-        if roots.is_empty() {
-            stats
-                .notes
-                .push("未发现 ~/.workbuddy 或 WORKBUDDY_HOME".into());
-            return (vec![], stats);
-        }
-        let mut files = Vec::new();
-        for r in roots {
-            let d = r.join("projects");
-            if d.is_dir() {
-                files.extend(walk_jsonl(
-                    &d,
-                    max_files.map(|m| m.saturating_sub(files.len())),
-                ));
-            }
-        }
-        // 回滚日志非转录,防御排除(档案 §5.5;.ndjson 本就不入 walk_jsonl)
-        files.retain(|p| {
-            p.file_name()
-                .map(|n| !n.to_string_lossy().ends_with(".file-rollback.ndjson"))
-                .unwrap_or(true)
-        });
-        stats.files_seen = files.len();
-
-        let mut dedup: HashMap<String, UsageRecord> = HashMap::new();
-        let mut src_hits = [0u64; 3]; // rawUsage / providerData.usage / message.usage
-        let mut status_missing = 0u64;
-        let mut status_filtered = 0u64;
-        let mut ts_missing = 0u64;
-
-        for path in &files {
-            let fallback_session = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let (total, bad) = for_each_line(path, |line| {
-                let Ok(v) = serde_json::from_str::<Value>(line) else {
-                    stats.lines_bad_json += 1;
-                    return;
-                };
-                let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                // 用量行:assistant 消息 + function_call(DeepSeek 特例,档案 §4 末)
-                let usage_row = match t {
-                    "message" => v.get("role").and_then(|x| x.as_str()) == Some("assistant"),
-                    "function_call" => true,
-                    // 已知非用量行(本机全集实证):user 消息/工具结果/思考/快照/元数据/标题
-                    "function_call_result"
-                    | "reasoning"
-                    | "file-history-snapshot"
-                    | "session-meta"
-                    | "ai-title" => return,
-                    _ => {
-                        stats.lines_unknown_type += 1;
-                        return;
-                    }
-                };
-                if !usage_row {
-                    return; // role != assistant 的 message 行
-                }
-                // status 仅 message 行有;缺失视为 completed(档案 §8)
-                match v.get("status").and_then(|x| x.as_str()) {
-                    Some("completed") | None => {
-                        if v.get("status").is_none() {
-                            status_missing += 1;
-                        }
-                    }
-                    Some(_) => {
-                        status_filtered += 1;
-                        return;
-                    }
-                }
-                // usage 优先级(档案 §4 硬约束:rawUsage 最优先,防 Anthropic 名/OpenAI 义双计)
-                let pd = v.get("providerData");
-                let (buckets, which) = if let Some(raw) =
-                    pd.and_then(|p| p.get("rawUsage")).filter(|u| u.is_object())
-                {
-                    (from_raw_usage(raw), 0)
-                } else if let Some(u) = pd.and_then(|p| p.get("usage")).filter(|u| u.is_object()) {
-                    (from_provider_usage(u), 1)
-                } else if let Some(u) = v.pointer("/message/usage").filter(|u| u.is_object()) {
-                    (from_message_usage(u), 2)
-                } else {
-                    return; // 无用量(多数 function_call/assistant 行是纯事件)
-                };
-                if buckets.is_zero() {
-                    return;
-                }
-                src_hits[which] += 1;
-                let Some(ts_ms) = v.get("timestamp").and_then(ts_to_ms) else {
-                    ts_missing += 1;
-                    return;
-                };
-                let session_id = v
-                    .get("sessionId")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or(&fallback_session)
-                    .to_string();
-                let model = pd
-                    .and_then(|p| p.get("model"))
-                    .or_else(|| pd.and_then(|p| p.get("requestModelId")))
-                    .or_else(|| v.pointer("/message/model"))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                // 子代理:isSubAgent=true 时 agent 为子代理名,否则主代理(本机实证 cli/general-purpose)
-                let agent = pd
-                    .and_then(|p| p.get("isSubAgent"))
-                    .and_then(|x| x.as_bool())
-                    .filter(|b| *b)
-                    .and_then(|_| pd.and_then(|p| p.get("agent")).and_then(|x| x.as_str()))
-                    .map(|s| s.to_string());
-                let msg_key = pd
-                    .and_then(|p| p.get("messageId"))
-                    .or_else(|| pd.and_then(|p| p.get("traceId")))
-                    .or_else(|| v.get("id"))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("");
-                let key = format!("workbuddy:{}:{}", session_id, msg_key);
-                let rec = UsageRecord {
-                    source: "workbuddy",
-                    session_id: session_id.clone(),
-                    agent,
-                    model,
-                    ts_ms,
-                    caliber: Caliber::RequestDelta,
-                    input_uncached: buckets.input_uncached,
-                    cache_read: buckets.cache_read,
-                    cache_write: buckets.cache_write,
-                    cache_write_1h: 0,
-                    output: buckets.output,
-                    reasoning_output: buckets.reasoning,
-                    cost_usd: None, // rawUsage.credit 单位不明,不冒认 USD
-                    dedup_key: key.clone(),
-                };
-                // token 大者胜(claude.rs 同义;多 sink 镜像时五分量键天然塌缩)
-                match dedup.get(&key) {
-                    Some(old) if old.token_total() >= rec.token_total() => {}
-                    _ => {
-                        dedup.insert(key, rec);
-                    }
-                }
-            });
-            stats.lines_total += total;
-            stats.lines_bad_json += bad;
-            if total > 0 {
-                stats.files_parsed += 1;
-            }
-        }
-        stats.notes.push(format!(
-            "usage 来源命中:rawUsage {} / providerData.usage {} / message.usage {}",
-            src_hits[0], src_hits[1], src_hits[2]
-        ));
-        stats.notes.push(format!(
-            "status 缺失 {} 行(视为 completed),非 completed 跳过 {} 行",
-            status_missing, status_filtered
-        ));
-        if ts_missing > 0 {
-            stats.notes.push(format!("{} 行缺时间戳跳过", ts_missing));
-        }
+        let (records, mut stats) = scan_buddy_wire(
+            "workbuddy",
+            "未发现 ~/.workbuddy 或 WORKBUDDY_HOME",
+            roots,
+            max_files,
+        );
         for r in roots {
             let db = r.join("workbuddy.db");
             if db.is_file() {
@@ -365,6 +383,6 @@ impl UsageSource for WorkbuddySource {
                 ));
             }
         }
-        (dedup.into_values().collect(), stats)
+        (records, stats)
     }
 }

@@ -9,7 +9,7 @@
 ## 1. 工具概况与本机安装情况
 
 - 腾讯 CodeBuddy 团队 AI 办公智能体(2026-03 上线,Win/macOS/鸿蒙);本机为 macOS 版 + Claw 工作区(`~/WorkBuddy/<时间戳>/`)。
-- 开源生态中 WorkBuddy 与 CodeBuddy/iFlow **共用一套 tencent_buddy 解析器**(tokscale `sessions/tencent_buddy.rs` + `workbuddy.rs`/`codebuddy.rs` 薄路由)。
+- 开源生态中 WorkBuddy 与 CodeBuddy/iFlow **共用一套 tencent_buddy 解析器**(tokscale `sessions/tencent_buddy.rs` + `workbuddy.rs`/`codebuddy.rs` 薄路由)。CodeBuddy CLI 是数据根独立的编程产品线(`~/.codebuddy/projects`,与本档案根互不重叠),已独立立源——见档案 30;本仓两源亦共用扫描核 `scan_buddy_wire`。
 
 ## 2. 目录与文件存储模式(本机实证)
 

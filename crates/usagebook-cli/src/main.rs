@@ -72,6 +72,8 @@ const ENV_OVERRIDES: &[&str] = &[
     "KIMI_WORK_HOME",
     "ZCODE_HOME",
     "WORKBUDDY_HOME",
+    "CODEBUDDY_HOME",
+    "CODEBUDDY_IDE_HOME",
     "DSH_HOME",
     "MINIMAX_CODE_HOME",
     "MINIMAX_DATA_DIR",
