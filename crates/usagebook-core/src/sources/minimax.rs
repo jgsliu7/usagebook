@@ -12,12 +12,15 @@
 //! 统一模型暂无项目字段,归属以扫描注记(分布)形式上报。
 //! 去重键:minimax-sqlite:{db路径}:{id} —— id AUTOINCREMENT 主键天然幂等(档案 §5.1);
 //! juejin 水位同样按 dbPath 分库记录,多 profile 根 id 序列独立,键带库路径防串。
+//! model 回填(2026-10-19):新版 runtime(M3.1-Flash 起)写用量不落 model 列,
+//! NULL 行从 v2/sessions/**/messages.jsonl 的 assistant 行按 turn_id/ts 双锚点回填,
+//! 兜底取会话内最高频模型;模型维度统一裸名(bare_model 去 provider 前缀,与其他源对齐)。
 
 use crate::common::*;
 use crate::model::*;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub struct MinimaxSource;
@@ -96,7 +99,7 @@ impl UsageSource for MinimaxSource {
             let obs_jsonl = walk_jsonl(&root.join("v2/observability"), None).len();
             if sessions_jsonl + obs_jsonl > 0 {
                 stats.notes.push(format!(
-                    "v2/sessions {} 个 + observability {} 个 jsonl 无用量,仅探测不读(档案 §2)",
+                    "v2/sessions {} 个 + observability {} 个 jsonl 无用量行不采账;messages.jsonl 仅在 model 回填时读(档案 §2/§5.4)",
                     sessions_jsonl, obs_jsonl
                 ));
             }
@@ -254,10 +257,11 @@ impl UsageSource for MinimaxSource {
                 ));
             }
 
-            // 用量主查询:固定列序直取(五列 exclusive,档案 §4);ORDER BY id 保证确定性
-            let sql = "SELECT id, session_id, agent_name, model, ts, input_tokens, output_tokens, \
-                       reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
-                       FROM local_runtime_token_usage ORDER BY id";
+            // 用量主查询:固定列序直取(五列 exclusive,档案 §4);ORDER BY id 保证确定性。
+            // turn_id 入列:model NULL 行回填的双锚点之一(2026-10-19 新版 runtime 不落 model)
+            let sql = "SELECT id, session_id, agent_name, model, turn_id, ts, input_tokens, \
+                       output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, \
+                       cost_usd FROM local_runtime_token_usage ORDER BY id";
             let Ok(mut stmt) = conn.prepare(sql) else {
                 stats
                     .notes
@@ -272,9 +276,27 @@ impl UsageSource for MinimaxSource {
                 stats.failed = true;
                 continue;
             };
+
+            // 阶段一:先收行(model NULL 不再当场记 unknown,留待阶段二回填)
+            struct RawRow {
+                id: i64,
+                session_id: String,
+                agent_name: String,
+                model: Option<String>,
+                turn_id: Option<String>,
+                ts_ms: i64,
+                input_uncached: u64,
+                output: u64,
+                reasoning_output: u64,
+                cache_read: u64,
+                cache_write: u64,
+                cost: Option<f64>,
+            }
+            let mut raw_rows: Vec<RawRow> = Vec::new();
+            let mut need_backfill: HashSet<String> = HashSet::new(); // 含 model NULL 行的会话
             while let Ok(Some(row)) = rows.next() {
-                // 0 id, 1 session_id, 2 agent_name, 3 model, 4 ts,
-                // 5 input, 6 output, 7 reasoning, 8 cache_read, 9 cache_write, 10 cost_usd
+                // 0 id, 1 session_id, 2 agent_name, 3 model, 4 turn_id, 5 ts,
+                // 6 input, 7 output, 8 reasoning, 9 cache_read, 10 cache_write, 11 cost_usd
                 let (Ok(id), Ok(session_id), Ok(agent_name)) = (
                     row.get::<_, i64>(0),
                     row.get::<_, String>(1),
@@ -285,7 +307,8 @@ impl UsageSource for MinimaxSource {
                 };
                 stats.lines_total += 1;
                 let model: Option<String> = row.get(3).ok().flatten();
-                let ts_raw: Option<i64> = row.get(4).ok().flatten();
+                let turn_id: Option<String> = row.get(4).ok().flatten();
+                let ts_raw: Option<i64> = row.get(5).ok().flatten();
                 let Some(ts_ms) = ts_raw.filter(|t| *t > 0).map(norm_ms) else {
                     skipped_no_time += 1;
                     continue;
@@ -298,59 +321,137 @@ impl UsageSource for MinimaxSource {
                     Ok(rusqlite::types::Value::Real(f)) if f > 0.0 => f as u64,
                     _ => 0,
                 };
-                let input_uncached = sql_u64(5);
-                let output = sql_u64(6);
-                let reasoning_output = sql_u64(7);
-                let cache_read = sql_u64(8);
-                let cache_write = sql_u64(9);
+                let input_uncached = sql_u64(6);
+                let output = sql_u64(7);
+                let reasoning_output = sql_u64(8);
+                let cache_read = sql_u64(9);
+                let cache_write = sql_u64(10);
                 if input_uncached + output + reasoning_output + cache_read + cache_write == 0 {
                     skipped_zero += 1; // 全零 usage 跳过(三跳过纪律)
                     continue;
                 }
                 // cost_usd 本机全 0 → None;非零才作源自带成本采入(档案 §4/§8)
                 let cost = row
-                    .get::<_, Option<f64>>(10)
+                    .get::<_, Option<f64>>(11)
                     .ok()
                     .flatten()
                     .filter(|c| *c != 0.0);
                 if cost.is_some() {
                     cost_nonzero += 1;
                 }
-
-                let key = format!("minimax-sqlite:{}:{}", db.display(), id);
-                if seen.insert(key.clone()) {
-                    let model = model.unwrap_or_else(|| {
-                        unknown_model += 1;
-                        "unknown".into() // model NULL 不猜(档案 §8)
-                    });
-                    sessions.insert(session_id.clone());
-                    models.insert(model.clone());
-                    *agent_dist.entry(agent_name.clone()).or_insert(0) += 1;
-                    match workspace.get(&session_id) {
-                        Some(w) => {
-                            *workspace_dist.entry(w.clone()).or_insert(0) += 1;
-                        }
-                        None => no_workspace += 1,
-                    }
-                    ts_min = ts_min.min(ts_ms);
-                    ts_max = ts_max.max(ts_ms);
-                    records.push(UsageRecord {
-                        source: "minimax",
-                        session_id,
-                        agent: Some(agent_name), // agent_name 白送子代理/任务维度(档案 §4)
-                        model,
-                        ts_ms,
-                        caliber: Caliber::RequestDelta,
-                        input_uncached,
-                        cache_read,
-                        cache_write,
-                        cache_write_1h: 0,
-                        output,
-                        reasoning_output,
-                        cost_usd: cost,
-                        dedup_key: key,
-                    });
+                if model.is_none() {
+                    need_backfill.insert(session_id.clone());
                 }
+                raw_rows.push(RawRow {
+                    id,
+                    session_id,
+                    agent_name,
+                    model,
+                    turn_id,
+                    ts_ms,
+                    input_uncached,
+                    output,
+                    reasoning_output,
+                    cache_read,
+                    cache_write,
+                    cost,
+                });
+            }
+
+            // 阶段二:model 回填(2026-10-19 起 MiniMax Code 新版不落 model 列;档案 §5.4
+            // 预留的 juejin 路径,现已有实测样本)。仅当存在 NULL 行才扫会话目录:
+            // v2/sessions/**/messages.jsonl 的 assistant 行带 {model,turn_id,timestamp},
+            // 以 turn_id / ts 双锚点对行,兜底取会话内最高频模型。
+            // 模型维度统一裸名(bare_model 去前缀),与看板其他源对齐(维护者 2026-10-19 裁决)。
+            let backfill =
+                load_model_backfill(&root.join("v2/sessions"), &need_backfill, &mut stats);
+            let mut bf_turn = 0u64;
+            let mut bf_ts = 0u64;
+            let mut bf_session = 0u64;
+
+            // 阶段三:出账(model 解析顺序:native → turn_id 锚 → ts 锚 → 会话频次 → unknown;
+            // 最终值统一经 bare_model 去前缀 —— native 历史值 "minimax/MiniMax-M3" 与
+            // 回填值同规,native 行的显示名也随之变化,属显示维度归一,不改用量归属)
+            for r in raw_rows {
+                let key = format!("minimax-sqlite:{}:{}", db.display(), r.id);
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                let resolved = match r.model {
+                    Some(m) => m,
+                    None => {
+                        let s = backfill.get(&r.session_id);
+                        let mut via = 0u8; // 1=turn锚 2=ts锚 3=会话频次
+                        let hit = r
+                            .turn_id
+                            .as_deref()
+                            .and_then(|t| s.and_then(|s| s.by_turn.get(t)))
+                            .map(|m| {
+                                via = 1;
+                                m.clone()
+                            })
+                            .or_else(|| {
+                                s.and_then(|s| s.by_ts.get(&r.ts_ms)).map(|m| {
+                                    via = 2;
+                                    m.clone()
+                                })
+                            })
+                            .or_else(|| {
+                                s.and_then(|s| s.freq_top()).map(|m| {
+                                    via = 3;
+                                    m.to_string()
+                                })
+                            });
+                        match hit {
+                            Some(m) => {
+                                match via {
+                                    1 => bf_turn += 1,
+                                    2 => bf_ts += 1,
+                                    _ => bf_session += 1,
+                                }
+                                m
+                            }
+                            None => {
+                                unknown_model += 1;
+                                "unknown".into() // 双锚点+频次均未命中,不猜(档案 §8)
+                            }
+                        }
+                    }
+                };
+                let model = bare_model(&resolved).to_string();
+                sessions.insert(r.session_id.clone());
+                models.insert(model.clone());
+                *agent_dist.entry(r.agent_name.clone()).or_insert(0) += 1;
+                match workspace.get(&r.session_id) {
+                    Some(w) => {
+                        *workspace_dist.entry(w.clone()).or_insert(0) += 1;
+                    }
+                    None => no_workspace += 1,
+                }
+                ts_min = ts_min.min(r.ts_ms);
+                ts_max = ts_max.max(r.ts_ms);
+                records.push(UsageRecord {
+                    source: "minimax",
+                    session_id: r.session_id,
+                    agent: Some(r.agent_name), // agent_name 白送子代理/任务维度(档案 §4)
+                    model,
+                    ts_ms: r.ts_ms,
+                    caliber: Caliber::RequestDelta,
+                    input_uncached: r.input_uncached,
+                    cache_read: r.cache_read,
+                    cache_write: r.cache_write,
+                    cache_write_1h: 0,
+                    output: r.output,
+                    reasoning_output: r.reasoning_output,
+                    cost_usd: r.cost,
+                    dedup_key: key,
+                });
+            }
+            if bf_turn + bf_ts + bf_session > 0 {
+                stats.notes.push(format!(
+                    "model 回填(messages.jsonl): turn锚 {} + ts锚 {} + 会话频次 {}(新版 runtime model 列 NULL,档案 §5.4)",
+                    bf_turn, bf_ts, bf_session
+                ));
             }
             stats.files_parsed += 1;
         }
@@ -385,7 +486,7 @@ impl UsageSource for MinimaxSource {
         if unknown_model > 0 {
             stats
                 .notes
-                .push(format!("{} 行 model 为 NULL,记 unknown(messages.jsonl 回填路径无实测样本,v1 不实现,档案 §8)", unknown_model));
+                .push(format!("{} 行 model 为 NULL 且 messages.jsonl 双锚点/会话频次均未命中,记 unknown 不猜(档案 §8)", unknown_model));
         }
         if cost_nonzero > 0 {
             stats.notes.push(format!(
@@ -406,6 +507,113 @@ impl UsageSource for MinimaxSource {
 /// 列集合包含判断(Vec<String> 含指定列名)。
 fn cols_contains(cols: &[String], c: &str) -> bool {
     cols.iter().any(|x| x == c)
+}
+
+/// 模型显示名归一:去 provider 前缀,只留最后一个 '/' 之后的部分
+/// ("minimax/MiniMax-M3"→"MiniMax-M3"、"custom_provider:deepseek/deepseek-flash"→
+/// "deepseek-flash"),与看板其他源的裸模型名对齐;无斜杠或尾段为空则原样返回。
+fn bare_model(m: &str) -> &str {
+    match m.rsplit_once('/') {
+        Some((_, tail)) if !tail.is_empty() => tail,
+        _ => m,
+    }
+}
+
+/// 单会话的 model 回填索引:双锚点(turn_id / 毫秒 ts)+ 频次兜底。
+struct SessionModels {
+    by_turn: HashMap<String, String>,
+    by_ts: HashMap<i64, String>,
+    freq: HashMap<String, u64>,
+}
+
+impl SessionModels {
+    /// 会话内最高频模型(频次高者优先,同频取字典序小者,保证确定性)。
+    fn freq_top(&self) -> Option<&str> {
+        self.freq
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(k, _)| k.as_str())
+    }
+}
+
+/// 扫 sessions_root 下 messages.jsonl,为 needed 中的会话建回填索引。
+/// 会话归属读同目录 manifest.json 的 sessionId(37 个历史目录全有;无 manifest 的
+/// messages.jsonl 无法安全归属,跳过并计数)。assistant 行 message 带
+/// {provider, model, timestamp} + 顶层 turn_id;模型串按 "provider/model" 重建,
+/// provider 缺失时退回裸 model。仅在确有 NULL 行时调用,常态零开销。
+fn load_model_backfill(
+    sessions_root: &Path,
+    needed: &HashSet<String>,
+    stats: &mut ScanStats,
+) -> HashMap<String, SessionModels> {
+    let mut map: HashMap<String, SessionModels> = HashMap::new();
+    if needed.is_empty() {
+        return map;
+    }
+    let mut no_manifest = 0u64;
+    for jsonl in walk_jsonl(sessions_root, None) {
+        if jsonl.file_name().is_some_and(|n| n != "messages.jsonl") {
+            continue;
+        }
+        // 同目录 manifest.json → sessionId;读不到则该文件无法归属,跳过
+        let Some(manifest) = jsonl.parent().map(|d| d.join("manifest.json")) else {
+            continue;
+        };
+        let sid = std::fs::read_to_string(&manifest)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.get("sessionId").and_then(|s| s.as_str()).map(str::to_string));
+        let sid = match sid {
+            None => {
+                no_manifest += 1;
+                continue;
+            }
+            Some(s) if !needed.contains(&s) => continue,
+            Some(s) => s,
+        };
+        let sess = map.entry(sid).or_insert_with(|| SessionModels {
+            by_turn: HashMap::new(),
+            by_ts: HashMap::new(),
+            freq: HashMap::new(),
+        });
+        for line in std::fs::read_to_string(&jsonl)
+            .ok()
+            .map(|s| s.lines().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default()
+        {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(msg) = v.get("message").filter(|m| m.is_object()) else {
+                continue;
+            };
+            if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                continue; // user/toolResult 行无 model
+            }
+            let Some(model) = msg
+                .get("model")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+            else {
+                continue;
+            };
+            let m = model.to_string(); // 裸名直取;前缀归一统一由出账阶段的 bare_model 完成
+            if let Some(t) = v.get("turn_id").and_then(|t| t.as_str()) {
+                sess.by_turn.insert(t.to_string(), m.clone());
+            }
+            if let Some(ts) = msg.get("timestamp").and_then(|t| t.as_i64()).map(norm_ms) {
+                sess.by_ts.insert(ts, m.clone());
+            }
+            *sess.freq.entry(m).or_insert(0) += 1;
+        }
+    }
+    if no_manifest > 0 {
+        stats.notes.push(format!(
+            "{} 个 messages.jsonl 同目录无 manifest.json/sessionId,回填跳过",
+            no_manifest
+        ));
+    }
+    map
 }
 
 /// HashMap 分布 → "k=v, k=v"(按值降序再按键,保证确定性)。

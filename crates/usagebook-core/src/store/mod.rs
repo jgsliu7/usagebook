@@ -14,8 +14,8 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// 7:kimi-work 源接入(桌面版内嵌运行时)+ kimi 核收编 tools.register_user_tool(§10)。
-pub const PARSER_VERSION: &str = "7";
+/// 10:minimax 源 model 回填 + 模型名去 provider 前缀(裸名与其他源对齐;8/9 为未发布中间版本)。
+pub const PARSER_VERSION: &str = "10";
 const SCHEMA_VERSION: i32 = 2;
 const LOCK_PROTOCOL_VERSION: u32 = 1;
 
