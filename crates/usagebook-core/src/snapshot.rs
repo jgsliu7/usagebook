@@ -163,10 +163,10 @@ pub fn build_snapshot(refresh_secs: u64, verbose: bool) -> Snapshot {
     }
     // cc-switch rollups 空窗回填(跨源去重与重叠源规范 §五 C 类/§七):
     // 覆盖集来自本轮原生记录,回填行按 日期×app 整日替换,只补原生无覆盖的日期。
-    // 单表直读(本机 261 行),不走 L1/L2 文件缓存。
+    // 单表直读(本机 261 行),不走 L1/L2 文件缓存。原生源清单与回填侧共用同一常量。
     let covered: std::collections::HashSet<(String, String)> = records
         .iter()
-        .filter(|r| matches!(r.source, "claude" | "codex" | "opencode" | "pi"))
+        .filter(|r| crate::sources::ccswitch_rollup::BACKFILL_NATIVE_SOURCES.contains(&r.source))
         .map(|r| (r.source.to_string(), common::ms_to_local_date(r.ts_ms)))
         .collect();
     let (backfilled, bf_stats) = crate::sources::ccswitch_rollup::backfill(&covered);

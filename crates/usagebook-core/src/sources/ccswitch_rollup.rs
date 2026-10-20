@@ -6,8 +6,10 @@
 //! 纪律:只补原生适配器"无覆盖"的日期,拼接处按 日期×app 整日替换,禁止同日混采两源;
 //!       行级表 proxy_request_logs 不采(与原生适配器 100% 重叠,双计);
 //!       小时粒度不可得——整日挂本地 0 点桶,禁止均匀分摊编造。
-//! 口径:rollups 的 input 已归一 fresh(与 input_uncached 同义;claude 本就 exclusive,
-//!       codex 实测 input≪cache_read);output 为 cc-switch 合并口径(不含单列 reasoning);
+//! 口径:新版 rollups 的 input 已归一 fresh(input_token_semantics=2,与 input_uncached 同义);
+//!       老版库 codex 行(semantics 0/1)input 含缓存,按 cc-switch sql_helpers::fresh_input_sql
+//!       同规则逐行减去后再聚合(claude/opencode/pi 存储即 exclusive,直取);
+//!       output 为 cc-switch 合并口径(不含单列 reasoning);
 
 use crate::common::*;
 use crate::model::*;
@@ -16,15 +18,20 @@ use std::path::{Path, PathBuf};
 
 pub struct CcswitchRollupSource;
 
+/// 回填覆盖的原生源,同时是 rollups.app_type → 本项目源 id 的映射(两者同名)。
+/// snapshot.rs 的原生覆盖集过滤与此处 native_of 共用这一份清单——两处漂移会双计或漏回填。
+pub const BACKFILL_NATIVE_SOURCES: &[&str] = &["claude", "codex", "opencode", "pi"];
+
+/// cc-switch 侧"存储 input 含缓存"的 app(sql_helpers::CACHE_INCLUSIVE_APP_TYPES 镜像);
+/// 仅 codex 在本项目映射范围内,其余列出以保持与上游规则逐字一致。
+const CACHE_INCLUSIVE_APPS_SQL: &str = "'codex', 'gemini', 'grokbuild'";
+
 /// rollups.app_type → 本项目原生源 id。未列出的 app_type 不回填(计数上报)。
 fn native_of(app_type: &str) -> Option<&'static str> {
-    match app_type {
-        "claude" => Some("claude"),
-        "codex" => Some("codex"),
-        "opencode" => Some("opencode"),
-        "pi" => Some("pi"),
-        _ => None,
-    }
+    BACKFILL_NATIVE_SOURCES
+        .iter()
+        .copied()
+        .find(|s| *s == app_type)
 }
 
 fn db_path() -> Option<PathBuf> {
@@ -97,13 +104,39 @@ pub fn backfill_at(
     }
     // 六元组 PK 同日多行(model 维度拆分)→ SQL 端 GROUP BY 归并(档案 §8);
     // 显式列名,禁 SELECT *;缺列按 0 由 COALESCE 兜底 + 计数上报。
-    let mut stmt = match conn.prepare(
+    // input 逐行归一 fresh 后再 SUM:镜像 cc-switch sql_helpers::fresh_input_sql——
+    // semantics 2(fresh)直取;含缓存 app 的 1(total)减 cr+cw、0(legacy)减 cr(不够减则直取);
+    // 其余 app 直取。input_token_semantics 列为 v13 迁移新增,老库缺列时整体按 legacy(0)处理。
+    let has_semantics = conn
+        .prepare("SELECT input_token_semantics FROM usage_daily_rollups LIMIT 0")
+        .is_ok();
+    let sem = if has_semantics {
+        "COALESCE(input_token_semantics,0)"
+    } else {
+        "0"
+    };
+    let fresh_input = format!(
+        "CASE \
+           WHEN {sem} = 2 THEN COALESCE(input_tokens,0) \
+           WHEN app_type IN ({apps}) AND {sem} = 1 \
+                AND COALESCE(input_tokens,0) >= COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0) \
+             THEN COALESCE(input_tokens,0) - COALESCE(cache_read_tokens,0) - COALESCE(cache_creation_tokens,0) \
+           WHEN app_type IN ({apps}) AND {sem} = 0 \
+                AND COALESCE(input_tokens,0) >= COALESCE(cache_read_tokens,0) \
+             THEN COALESCE(input_tokens,0) - COALESCE(cache_read_tokens,0) \
+           ELSE COALESCE(input_tokens,0) END",
+        apps = CACHE_INCLUSIVE_APPS_SQL
+    );
+    let sql = format!(
         "SELECT date, app_type, model, \
-                SUM(COALESCE(input_tokens,0)), SUM(COALESCE(cache_read_tokens,0)), \
+                SUM({fresh_input}), SUM(COALESCE(cache_read_tokens,0)), \
                 SUM(COALESCE(cache_creation_tokens,0)), SUM(COALESCE(output_tokens,0)), \
-                SUM(COALESCE(request_count,0)) \
+                SUM(COALESCE(request_count,0)), \
+                SUM(CASE WHEN app_type IN ({apps}) AND {sem} IN (0,1) THEN 1 ELSE 0 END) \
          FROM usage_daily_rollups GROUP BY date, app_type, model ORDER BY date",
-    ) {
+        apps = CACHE_INCLUSIVE_APPS_SQL
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
             stats
@@ -122,12 +155,14 @@ pub fn backfill_at(
             r.get::<_, i64>(5)?,
             r.get::<_, i64>(6)?,
             r.get::<_, i64>(7)?,
+            r.get::<_, i64>(8)?,
         ))
     });
     let mut records = Vec::new();
     let mut skipped_covered = 0u64;
     let mut skipped_unknown_app = 0u64;
     let mut skipped_empty = 0u64;
+    let mut normalized_legacy_rows = 0i64;
     let Ok(rows) = rows else {
         stats
             .notes
@@ -135,7 +170,7 @@ pub fn backfill_at(
         return (vec![], stats);
     };
     for row in rows.flatten() {
-        let (date, app_type, model, i, cr, cw, o, n_req) = row;
+        let (date, app_type, model, i, cr, cw, o, n_req, legacy_rows) = row;
         let Some(native) = native_of(&app_type) else {
             skipped_unknown_app += 1;
             continue;
@@ -148,6 +183,7 @@ pub fn backfill_at(
             skipped_empty += 1;
             continue;
         }
+        normalized_legacy_rows += legacy_rows;
         // 日期 → 本地 0 点(epoch 毫秒);小时曲线该日呈 0 点单桶,不做分摊编造。
         let ts_ms = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
             .ok()
@@ -199,6 +235,11 @@ pub fn backfill_at(
     if skipped_empty > 0 {
         stats.notes.push(format!(
             "cc-switch 全零/无法解析日期行 {skipped_empty}(跳过)"
+        ));
+    }
+    if normalized_legacy_rows > 0 {
+        stats.notes.push(format!(
+            "cc-switch 老口径 rollup 行 {normalized_legacy_rows}(semantics 0/1,input 含缓存)已按 fresh 规则减去缓存"
         ));
     }
     (records, stats)

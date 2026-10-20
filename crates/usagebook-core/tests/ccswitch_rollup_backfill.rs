@@ -21,6 +21,8 @@ const ROLLUP_DDL: &str = "CREATE TABLE usage_daily_rollups (
     input_token_semantics INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model))";
 
+// Keep each fixture's SQL column values visible at its call site.
+#[allow(clippy::too_many_arguments)]
 fn insert(
     conn: &rusqlite::Connection,
     d: &str,
@@ -34,6 +36,27 @@ fn insert(
     conn.execute(
         "INSERT INTO usage_daily_rollups (date, app_type, provider_id, model, request_count, input_tokens, output_tokens, cache_read_tokens) VALUES (?1, ?2, '_x', ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![d, app, model, n, i, o, cr],
+    )
+    .unwrap();
+}
+
+/// 带 cache_creation 与 input_token_semantics 的夹具(0=legacy/1=total/2=fresh,cc-switch 常量)。
+#[allow(clippy::too_many_arguments)]
+fn insert_sem(
+    conn: &rusqlite::Connection,
+    d: &str,
+    app: &str,
+    model: &str,
+    i: i64,
+    cr: i64,
+    cw: i64,
+    o: i64,
+    n: i64,
+    sem: i64,
+) {
+    conn.execute(
+        "INSERT INTO usage_daily_rollups (date, app_type, provider_id, model, request_count, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, input_token_semantics) VALUES (?1, ?2, '_x', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![d, app, model, n, i, o, cr, cw, sem],
     )
     .unwrap();
 }
@@ -75,16 +98,18 @@ fn backfill_day_replacement_and_counts() {
         300,
         40,
     );
-    // codex 空窗日 → 回填;input 已归一 fresh 直取
-    insert(
+    // codex 空窗日 → 回填;新版 rollup(semantics=2)input 已归一 fresh 直取
+    insert_sem(
         &conn,
         "2026-08-01",
         "codex",
         "gpt-6-astra",
         700,
         2100,
+        0,
         90,
         7,
+        2,
     );
     // 未映射 app_type → 不回填
     insert(&conn, "2026-07-01", "mcode", "x", 10, 10, 10, 1);
@@ -163,4 +188,104 @@ fn snapshot_n_accumulates_request_count() {
         usagebook_core::snapshot::snapshot_from_records(&[rec], 60, 1_789_050_000_000, vec![]);
     assert_eq!(snap.totals.b.n, 5744, "n 按记录携带的请求数累加");
     assert_eq!(snap.totals.b.i, 10);
+}
+
+#[test]
+fn legacy_semantics_rows_follow_ccswitch_fresh_rule() {
+    // 镜像 cc-switch sql_helpers::fresh_input_sql:只有"存储 input 含缓存"的 app(codex)的
+    // 0(legacy)/1(total)行要减缓存;2(fresh)与非含缓存 app(claude/opencode/pi)一律直取。
+    let db = temp_db("sem");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(ROLLUP_DDL).unwrap();
+    insert_sem(&conn, "2026-05-01", "codex", "m", 1000, 300, 0, 10, 1, 0); // legacy:1000-300
+    insert_sem(&conn, "2026-05-02", "codex", "m", 1000, 300, 100, 10, 1, 1); // total:1000-300-100
+    insert_sem(&conn, "2026-05-03", "codex", "m", 100, 300, 100, 10, 1, 1); // 不够减 → 直取
+    insert_sem(&conn, "2026-05-04", "codex", "m", 1000, 300, 100, 10, 1, 2); // fresh → 直取
+    insert_sem(&conn, "2026-05-05", "claude", "m", 500, 200, 0, 10, 1, 0); // 非含缓存 app → 直取
+    insert_sem(&conn, "2026-05-06", "opencode", "m", 400, 100, 0, 10, 1, 0); // 非含缓存 app → 直取
+    drop(conn);
+
+    let (records, stats) =
+        usagebook_core::sources::ccswitch_rollup::backfill_at(&db, &HashSet::new());
+    let input_of = |d: &str| {
+        records
+            .iter()
+            .find(|r| r.session_id == d)
+            .unwrap_or_else(|| panic!("{d} 行缺失: {records:?}"))
+            .input_uncached
+    };
+    assert_eq!(input_of("2026-05-01"), 700, "legacy 减 cache_read");
+    assert_eq!(
+        input_of("2026-05-02"),
+        600,
+        "total 减 cache_read+cache_creation"
+    );
+    assert_eq!(
+        input_of("2026-05-03"),
+        100,
+        "不够减时直取,不得出现负数/0 清零"
+    );
+    assert_eq!(input_of("2026-05-04"), 1000, "fresh 直取");
+    assert_eq!(
+        input_of("2026-05-05"),
+        500,
+        "claude 存储即 exclusive,semantics 无关"
+    );
+    assert_eq!(
+        input_of("2026-05-06"),
+        400,
+        "opencode 不在含缓存清单,semantics 无关"
+    );
+    let c1 = records
+        .iter()
+        .find(|r| r.session_id == "2026-05-01")
+        .unwrap();
+    assert_eq!(
+        (c1.cache_read, c1.cache_write),
+        (300, 0),
+        "缓存列本身不受归一影响"
+    );
+    assert!(
+        stats.notes.iter().any(|n| n.contains("老口径 rollup 行 3")),
+        "3 行 codex 老口径(05-01/02/03)应计数上报: {:?}",
+        stats.notes
+    );
+}
+
+#[test]
+fn missing_semantics_column_is_treated_as_legacy() {
+    // v13 迁移前的老库没有 input_token_semantics 列:查询不得整体失败,整体按 legacy(0)处理。
+    let ddl = ROLLUP_DDL.replace(
+        "\n    input_token_semantics INTEGER NOT NULL DEFAULT 0,",
+        "",
+    );
+    assert_ne!(ddl, ROLLUP_DDL, "夹具 DDL 必须真的去掉了 semantics 列");
+    let db = temp_db("nocol");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(&ddl).unwrap();
+    insert(&conn, "2026-04-01", "codex", "m", 1000, 300, 10, 1); // legacy:1000-300
+    insert(&conn, "2026-04-02", "claude", "m", 500, 200, 10, 1); // 直取
+    drop(conn);
+
+    let (records, _) = usagebook_core::sources::ccswitch_rollup::backfill_at(&db, &HashSet::new());
+    assert_eq!(records.len(), 2, "{records:?}");
+    let codex = records
+        .iter()
+        .find(|r| r.session_id == "2026-04-01")
+        .unwrap();
+    let claude = records
+        .iter()
+        .find(|r| r.session_id == "2026-04-02")
+        .unwrap();
+    assert_eq!(codex.input_uncached, 700);
+    assert_eq!(claude.input_uncached, 500);
+}
+
+#[test]
+fn native_source_list_is_single_source_of_truth() {
+    // snapshot.rs 覆盖集过滤与 native_of 共用此常量;改动需同步档案 13 §9 与横切规范 §五。
+    assert_eq!(
+        usagebook_core::sources::ccswitch_rollup::BACKFILL_NATIVE_SOURCES,
+        &["claude", "codex", "opencode", "pi"]
+    );
 }

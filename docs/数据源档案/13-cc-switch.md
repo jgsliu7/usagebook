@@ -72,7 +72,7 @@
 | opencode_session | 7,409 excl 形 / 159 incl 形(无约束) | **exclusive** | input 直取 |
 | pi_session | 147 excl 形 / 5 incl 形(无约束) | **exclusive**(与 [10-pi](10-pi.md) §4 一致) | input 直取 |
 
-- **`input_token_semantics` 列(0=claude/codex/opencode 全部行,2=pi 全部行)含义 ❓ 未解**:CSDN 文未提及;且 **0 同时覆盖 exclusive(claude)与 inclusive(codex)两族**,证明该枚举不携带可用的语义信息 → **适配器禁止依赖此列**,一律按通道套用本项目各源档案 §4(再次印证"字段名/列值不能判断语义,映射表是唯一依据")。
+- **`input_token_semantics` 列含义(2026-10-20 自 cc-switch 源码 `services/sql_helpers.rs` 解码)**:0=legacy(input 含 cache_read)/1=total(input 含 cache_read+cache_creation)/2=fresh(已归一,不含缓存);**仅对 `CACHE_INCLUSIVE_APP_TYPES = codex/gemini/grokbuild`(存储 input 含缓存的 app)有意义**,claude/opencode/pi 存储即 exclusive、与该列无关——这解释了早先"0 同时覆盖 claude 与 codex"的困惑(claude 的 0 只是默认值)。适配器纪律不变:**不以此列判断通道口径**(映射表仍是唯一依据);但 rollup 回填必须镜像 cc-switch `fresh_input_sql` 对含缓存 app 的 0/1 老行逐行减缓存(老版库升级后遗留行的防护;列缺失按 legacy 处理),实现见 `sources/ccswitch_rollup.rs`。本机实测(2026-10-20):claude 157 行 0/2 混有、codex 103/opencode 39/pi 4 行全为 2,归一前后 input 总量 1,045,900,021 逐位一致、老口径 0 行。
 - `created_at` 秒 → ×1000;request_delta 口径(每行一请求)。
 - 成本:TEXT Decimal 四分项 + total;claude 通道成本可作 cost-state 之外的校验线(rollups 级)。
 
@@ -114,7 +114,7 @@
 | rollups 六元组 PK 同日多行 | 聚合 GROUP BY date |
 | 行级表滚动清理 | 任何行级统计随清理漂移 → 只依赖 rollups |
 | created_at 秒 | ×1000 归一(横切规范通用规则) |
-| input_token_semantics ❓ | 禁止依赖;按通道套各源档案 §4 |
+| input_token_semantics | 不据此判通道口径;含缓存 app(codex)的 0/1 老行按 cc-switch fresh_input_sql 减缓存,2 直取 |
 
 ## 9. v1 支持结论
 
