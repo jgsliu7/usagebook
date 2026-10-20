@@ -6,13 +6,24 @@
 //!   usagebook doctor     本机数据源自检(哪些源会生效/在哪/多大)
 
 use clap::{Parser, Subcommand};
-use usagebook_core::{registered_sources, report};
+use usagebook_core::registered_sources;
 
+mod ledger_cli;
+mod ledger_http;
 mod logging_setup;
 mod serve;
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(name = "__ledger-reader", hide = true)]
+    LedgerReader,
+    /// 持久账本管理（初始化、刷新、备份、删除和恢复）
+    Ledger {
+        #[command(subcommand)]
+        command: ledger_cli::LedgerCommand,
+    },
+    /// 从已提交账本与未迁移来源查询
+    Report(ledger_cli::ReportArgs),
     /// 启动本地看板(HTTP,自动刷新)
     Serve {
         /// 监听端口
@@ -114,112 +125,43 @@ const LOG_ENV_OVERRIDES: &[&str] = &[
 
 fn main() {
     let args = Args::parse();
-    // 订阅器初始化必须在 parse 之后:clap 对 --version/--help 先退出,抢跑会污染其全等输出。
     logging_setup::init(args.verbose);
-    if let Some(cmd) = args.command {
-        match cmd {
-            Command::Doctor { check } => {
-                doctor(check, args.json);
-                return;
-            }
-            Command::Serve {
-                port,
-                refresh_secs,
-                open,
-            } => {
-                if args.source != "all" || args.days.is_some() || args.max_files.is_some() {
-                    eprintln!(
-                        "错误:--source / --days / --max-files 与 serve 不兼容(看板始终统计全部来源),\n请去掉这些参数后重试,例:usagebook serve --port 8080"
-                    );
-                    std::process::exit(2);
-                }
-                serve::run(port, refresh_secs, open);
-                return;
+    match args.command {
+        Some(Command::LedgerReader) => {
+            if let Err(e) = usagebook_core::ledger::ingest::reader_helper_main() {
+                ledger_cli::fail(&e, e.exit_code())
             }
         }
-    }
-    let adapters = registered_sources();
-    // --source 动态校验:源 id 集随注册表增长,不再维护枚举(doctor 输出全集)
-    if args.source != "all" && !adapters.iter().any(|a| a.id() == args.source) {
-        eprintln!(
-            "错误:未知源 '{}';可用值:all 或 {}",
-            args.source,
-            adapters
-                .iter()
-                .map(|a| a.id())
-                .collect::<Vec<_>>()
-                .join(" / ")
-        );
-        std::process::exit(2);
-    }
-    let mut all_records = Vec::new();
-
-    if !args.json {
-        println!("usagebook v{} —— 数据源扫描\n", env!("CARGO_PKG_VERSION"));
-    }
-    for a in &adapters {
-        if args.source != "all" && a.id() != args.source {
-            continue;
+        Some(Command::Doctor { check }) => doctor(check, args.json),
+        Some(Command::Ledger { command }) => ledger_cli::run(command),
+        Some(Command::Report(report)) => ledger_cli::report(report, args.json),
+        Some(Command::Serve {
+            port,
+            refresh_secs,
+            open,
+        }) => {
+            if args.source != "all" || args.days.is_some() || args.max_files.is_some() {
+                ledger_cli::fail("serve does not accept report filters", 2)
+            }
+            ledger_http::run(port, refresh_secs, open);
         }
-        let roots = a.discover_roots();
-        let roots_disp = if roots.is_empty() {
-            "(未发现)".to_string()
-        } else {
-            roots
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        if !args.json {
-            println!("[{}] 根: {}", a.id(), roots_disp);
-        }
-        let t0 = std::time::Instant::now();
-        // 抽样调试(--max-files)保持一次性直读;其余走统一缓存缝(L1+L2;。
-        let (records, stats) = if args.max_files.is_some() {
-            a.scan(args.max_files)
-        } else {
-            usagebook_core::common::scan_source_cached(a.as_ref(), &roots)
-        };
-        if !args.json {
-            let replay = if stats.replayed > 0 {
-                format!(" · 重绕 {}", stats.replayed)
-            } else {
-                String::new()
-            };
-            let clash = if stats.key_clash > 0 {
-                format!(" · 键碰撞 {}", stats.key_clash)
-            } else {
-                String::new()
-            };
-            let suffix = replay + &clash;
-            println!(
-                "    文件 {}/{} · 行 {} · 未知类型 {} · 坏行 {} · 用量记录 {} · {}ms{}",
-                stats.files_parsed,
-                stats.files_seen,
-                stats.lines_total,
-                stats.lines_unknown_type,
-                stats.lines_bad_json,
-                records.len(),
-                t0.elapsed().as_millis(),
-                suffix
+        None => {
+            if args.max_files.is_some() {
+                ledger_cli::fail("Use doctor --check for diagnostic scans; limited scans cannot represent a ledger report",2)
+            }
+            ledger_cli::report(
+                ledger_cli::ReportArgs {
+                    source: if args.source == "all" {
+                        Vec::new()
+                    } else {
+                        vec![args.source]
+                    },
+                    days: args.days,
+                    ..Default::default()
+                },
+                args.json,
             );
-            for n in &stats.notes {
-                println!("    · {}", n);
-            }
         }
-        all_records.extend(records);
-    }
-
-    if all_records.is_empty() {
-        eprintln!(
-            "\n未发现用量记录。可运行 `usagebook doctor --check` 检查数据源。\n反馈问题时请提供版本和诊断计数；不要粘贴原始对话或密钥。"
-        );
-    }
-    if args.json {
-        println!("{}", report::json_report(&all_records, args.days));
-    } else {
-        report::print_report(&all_records, args.days);
     }
 }
 

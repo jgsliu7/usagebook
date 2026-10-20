@@ -1,0 +1,518 @@
+'use strict';
+/* 原看板的数据适配：服务端完成统计；浏览器保存轻量实体目录、当前视图和用户已展开的汇总页。 */
+let v2Status = null, v2View = null, v2Controller = null, coldRetryTimer = null;
+let viewGeneration = 0, restoringSelection = true, manualRefresh = null, pendingQueryKey = null;
+let globalTotalsCache = null;
+const catalogs = {source:{items:[],next:null,total:'0'},model:{items:[],next:null,total:'0'}};
+const labels = {source:new Map(),model:new Map()};
+const modelColorIndices = new Map();
+const previousCatalogIds = {source:null,model:null};
+const catalogSequences={source:0,model:0};
+const filterPanels = {source:null,model:null};
+const METRIC_IDS = {total:'total',input:'input_uncached',cr:'cache_read',cw:'cache_write',output:'output_combined',reason:'reasoning_output'};
+const unknownMetric = () => ({state:'unknown',known_value:null});
+const words = (zh,en) => state.lang === 'en-US' ? en : zh;
+const selected = (sel,id) => !sel || (sel.exclude ? !sel.has(id) : sel.has(id));
+const selector = (sel,dim) => {
+  if(!sel)return {mode:'all'};
+  const ids=[...sel];
+  // The UI keeps the original checked set; large selections use its equivalent complement on the wire.
+  if(dim&&ids.length>10000)return {mode:sel.exclude?'include':'exclude',ids:catalogItems(dim).map(x=>x.id).filter(id=>!sel.has(id))};
+  return {mode:sel.exclude?'exclude':'include',ids};
+};
+const catalogItems = dim => catalogs[dim].items;
+const stampKey = stamp => JSON.stringify(stamp);
+const setScanningText = txt => { $('#scanning-txt').textContent = txt; };
+
+// Only chart geometry becomes Number. Text, tooltips, totals and ratios use decimal strings/BigInt.
+function formatInteger(value, compact = true) {
+  if (value == null) return '—';
+  const n = BigInt(value), negative = n < 0n, abs = negative ? -n : n;
+  const units = state.unit === 'zh'
+    ? [[1000000000000n,'万亿',2],[100000000n,'亿',2],[10000n,'万',1]]
+    : [[1000000000000n,'T',2],[1000000000n,'B',2],[1000000n,'M',2],[1000n,'K',1]];
+  if (compact) for (const [scale,suffix,digits] of units) if (abs >= scale) {
+    const base = 10n ** BigInt(digits), rounded = (abs * base + scale / 2n) / scale;
+    return (negative?'-':'') + (rounded/base).toString() + '.' + (rounded%base).toString().padStart(digits,'0') + suffix;
+  }
+  return n.toLocaleString('en-US');
+}
+function metricText(value, compact = true) {
+  if (!value || value.state === 'unknown' || value.known_value == null) return words('未知','Unknown');
+  return formatInteger(value.known_value,compact);
+}
+function metricTitle(value) {
+  return metricText(value,false);
+}
+function metricHTML(value, compact = true) {
+  return `<span title="${escapeHtml(metricTitle(value))}">${escapeHtml(metricText(value,compact))}</span>`;
+}
+function ratioText(a,b) {
+  if (!a || !b || a.known_value == null || b.known_value == null || BigInt(b.known_value) <= 0n) return '—';
+  const denominator=BigInt(b.known_value),n=(BigInt(a.known_value)*1000n+denominator/2n)/denominator;
+  return `${n/10n}.${n%10n}%`;
+}
+// Keep the original compact tooltip units without repeating data-quality labels.
+function tooltipMetricText(value) {
+  return metricText(value);
+}
+function sumMetricValues(values) {
+  let total=0n,known=0,complete=true;
+  for(const value of values){
+    if(value?.known_value!=null&&value.state!=='unknown'){total+=BigInt(value.known_value);known++;}
+    if(value?.state!=='exact'||value.known_value==null)complete=false;
+  }
+  return {state:complete?'exact':known?'partial':'unknown',known_value:known||complete?total.toString():null};
+}
+function showLoadFailure(error) {
+  loadFailed = true;
+  if (DATA && DATA.ready) renderStatus();
+  else { $('#status').textContent=t('status.connFail'); setScanningText(t('status.connFailScan')); }
+  if (error && error.name !== 'AbortError') {
+    const note=$('#ledger-note');note.hidden=false;note.textContent=words('读取失败：','Unable to load: ')+error.message;
+  }
+}
+async function apiV2(path,body,signal) {
+  const controller=new AbortController();
+  const abort=()=>controller.abort();
+  if(signal?.aborted)controller.abort();else signal?.addEventListener('abort',abort,{once:true});
+  let timeout;
+  try {
+    return await Promise.race([
+      (async()=>{
+        const response=await fetch('/api/v2/'+path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined,cache:'no-store',signal:controller.signal});
+        let value;try{value=await response.json();}catch{throw new Error(`HTTP ${response.status}`);}
+        if(!response.ok){const detail=typeof value.error==='object'?value.error:{code:value.error,message:value.message};const e=new Error(detail?.message||`HTTP ${response.status}`);e.code=detail?.code;throw e;}
+        return value;
+      })(),
+      new Promise((_,reject)=>{timeout=setTimeout(()=>{controller.abort();reject(new Error(words('请求超时，请重试','Request timed out; please retry')));},15000);}),
+    ]);
+  } finally {clearTimeout(timeout);signal?.removeEventListener('abort',abort);}
+}
+function currentQueryKey() {
+  return JSON.stringify([state.win,state.rs,state.re,localDayStr(),_selKey(state.srcSel),_selKey(state.mdlSel),state.metric,state.group,v2Status?.stamp?.report_timezone]);
+}
+function buildQuery(windowOverride) {
+  const bounds=rangeBounds();
+  return {window:windowOverride||(bounds?{kind:'calendar',start_date:bounds[0],end_date_exclusive:addDay(bounds[1],1)}:{kind:'all'}),report_timezone:v2Status.stamp.report_timezone,as_of_ms:null,sources:selector(state.srcSel,'source'),models:selector(state.mdlSel,'model'),metric:METRIC_IDS[state.metric],group_by:state.group};
+}
+function comparisonSpec() {
+  if(state.win==='all')return null;
+  if(isDayWin(state.win)&&winDay()===localDayStr())return {kind:'yesterday_same_local_time'};
+  const [start,end]=rangeBounds();let from;
+  if(state.win==='thisweek'||state.win==='lastweek')from=addDay(start,-7);
+  else if(state.win==='thismonth'||state.win==='lastmonth'){const d=new Date(start+'T12:00:00Z');d.setUTCMonth(d.getUTCMonth()-1);from=d.toISOString().slice(0,10);}
+  else from=addDay(start,-(Math.round((Date.parse(end)-Date.parse(start))/86400000)+1));
+  return {kind:'explicit',window:{kind:'calendar',start_date:from,end_date_exclusive:start}};
+}
+function comparisonLabel() {
+  if(isDayWin(state.win))return winDay()===localDayStr()?t('cmp.yesterdaySame'):t('cmp.prevDay');
+  if(state.win==='thisweek')return t('cmp.lastWk');if(state.win==='lastweek')return t('cmp.prevWk');
+  if(state.win==='thismonth')return t('cmp.lastMo');if(state.win==='lastmonth')return t('cmp.prevMo');
+  return state.win==='custom'?t('cmp.prevSeg'):t('cmp.prevN',RANGE_DAYS_N[state.win]);
+}
+function registerLabels(dim,items) {
+  for(const item of items){labels[dim].set(item.id,item.label);if(dim==='source')SRC_LABELS[item.id]=item.label;
+    else if(item.color_index!=null)modelColorIndices.set(item.id,Number(item.color_index));}
+}
+async function readCatalog(dim,search='',append=false,signal) {
+  const sequence=++catalogSequences[dim],old=catalogs[dim], cursor=append?old.next:null;
+  const result=await apiV2('catalog',{dimension:dim,search,page:{limit:200,cursor}},signal);
+  if(signal?.aborted||sequence!==catalogSequences[dim])return result;
+  if(append&&old.stamp)verifyStamp(old,result);
+  registerLabels(dim,result.items);
+  if(!search)catalogs[dim]={items:append?[...old.items,...result.items]:result.items,next:result.next_cursor,total:result.total_count,stamp:result.stamp};
+  return result;
+}
+async function readFullCatalog(dim,signal) {
+  await readCatalog(dim,'',false,signal);
+  const stamp=catalogs[dim].stamp;
+  while(catalogs[dim].next&&!signal?.aborted){
+    const page=await readCatalog(dim,'',true,signal);
+    verifyStamp({stamp},page);
+  }
+}
+function syncSelections() {
+  for(const dim of ['source','model']){
+    const key=dim==='source'?'srcSel':'mdlSel',ids=catalogItems(dim).map(x=>x.id),previous=previousCatalogIds[dim];
+    let sel=state[key];
+    if(sel&&ids.length){
+      if(sel.exclude)sel=new Set(ids.filter(id=>!sel.has(id)));
+      if(sel.size){
+        const lower=new Map(ids.map(id=>[id.toLowerCase(),id]));
+        const alive=new Set([...sel].map(id=>lower.get(id.toLowerCase())).filter(Boolean));
+        if(previous)for(const id of ids)if(!previous.has(id))alive.add(id);
+        sel=alive.size===0?(previous?sel:null):alive.size===ids.length?null:alive;
+      }
+      state[key]=sel;persist(dim==='source'?SRC_LS_KEY:MDL_LS_KEY,sel);
+    }
+    previousCatalogIds[dim]=new Set(ids);
+  }
+}
+function migrateModels() {
+  if(!state.mdlSel)return;
+  const next=new Set();next.exclude=!!state.mdlSel.exclude;
+  for(const name of state.mdlSel){
+    if(name==='m1:u'||name.startsWith('m1:n:')){next.add(name);continue;}
+    const normalized=name.toLowerCase(),bytes=new TextEncoder().encode(normalized);
+    const encoded=btoa(Array.from(bytes,b=>String.fromCharCode(b)).join('')).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+    const id=name?'m1:n:'+encoded:'m1:u';next.add(id);labels.model.set(id,name);
+  }
+  state.mdlSel=next;persist(MDL_LS_KEY,next);
+}
+async function fetchDashboard(signal) {
+  const key=currentQueryKey(),query=buildQuery(), trend=state.win.includes('week')?{unit:'week',periods:10,anchor_date:localDayStr()}:state.win.includes('month')?{unit:'month',periods:12,anchor_date:localDayStr()}:null;
+  const response=await apiV2('query',{kind:'dashboard',query,series_unit:'day',max_points:10000,table_limit:100,comparison:comparisonSpec(),trend},signal);
+  const payload=response.payload.data, fixed={...query,as_of_ms:response.as_of_ms}, extra=[];
+  let day=payload.latest_day,sourceTable=payload.source_table,modelTable=payload.model_table;
+  // Future-dated facts and daily evidence can become eligible as time advances
+  // without changing the data stamp. Totals must share this query's cutoff.
+  const globalKey=stampKey(response.stamp)+'|'+response.as_of_ms;
+  const isGlobal=query.window.kind==='all'&&query.sources.mode==='all'&&query.models.mode==='all';
+  let globalMetrics=isGlobal?payload.totals.metrics:globalTotalsCache?.key===globalKey?globalTotalsCache.metrics:null;
+  if(isGlobal)globalTotalsCache={key:globalKey,metrics:globalMetrics};
+  if(!globalMetrics)extra.push(apiV2('query',{kind:'totals',query:{...fixed,window:{kind:'all'},sources:{mode:'all'},models:{mode:'all'},group_by:'none',metric:'total'}},signal).then(r=>{
+    verifyStamp(response,r);globalMetrics=r.payload.data.metrics;
+    if(!signal?.aborted)globalTotalsCache={key:globalKey,metrics:globalMetrics};
+  }));
+  if(isDayWin(state.win)&&day?.date!==winDay()){
+    const date=winDay();extra.push(apiV2('query',{kind:'day',query:{...fixed,window:{kind:'calendar',start_date:date,end_date_exclusive:addDay(date,1)}},date},signal).then(r=>{verifyStamp(response,r);day=r.payload.data;}));
+  }
+  // Detail rows always rank by total tokens, independent of the selected chart metric.
+  if(query.metric!=='total')for(const dimension of ['source','model'])extra.push(apiV2('query',{kind:'table',query:{...fixed,metric:'total'},dimension,scope:'facet',page:{limit:100,cursor:null}},signal).then(r=>{verifyStamp(response,r);if(dimension==='source')sourceTable=r.payload.data;else modelTable=r.payload.data;}));
+  await Promise.all(extra);
+  // A background refresh keeps rows the user already reached by scrolling.
+  if(v2View?.key===key)for(const dim of ['source','model']){
+    const page=dim==='source'?sourceTable:modelTable,target=v2View.tables[dim].rows.length;
+    while(page.next_cursor&&page.rows.length<target){
+      const r=await apiV2('query',{kind:'table',query:{...fixed,metric:'total'},dimension:dim,scope:'facet',page:{limit:100,cursor:page.next_cursor}},signal);
+      verifyStamp(response,r);page.rows.push(...r.payload.data.rows);page.next_cursor=r.payload.data.next_cursor;
+    }
+  }
+  return {key,query:fixed,response,day,globalMetrics,tables:{source:sourceTable,model:modelTable},tableBusy:new Set()};
+}
+function verifyStamp(expected,actual) {
+  if(stampKey(expected.stamp)!==stampKey(actual.stamp)){const e=new Error(words('数据已更新，正在重新读取','Data changed; reloading'));e.code='CURSOR_STALE';throw e;}
+}
+async function load(passive) {
+  const seq=++loadSeq;pendingQueryKey=currentQueryKey();v2Controller?.abort();const controller=v2Controller=new AbortController();
+  clearTimeout(coldRetryTimer);coldRetryTimer=null;
+  try {
+    const status=await apiV2('status?arf='+(passive===true?'':state.arf),undefined,controller.signal);
+    if(seq!==loadSeq)return;v2Status=status;
+    registerLabels('source',(status.sources||[]).map(s=>({id:s.id,label:s.label||s.id})));
+    if(!status.ready){
+      if(!DATA){$('#app').hidden=true;$('#scanning').hidden=false;setScanningText(status.refresh_error?t('status.scanFailRetry'):t('scan.first'));}
+      else renderStatus();
+      coldRetryTimer=setTimeout(()=>load(true),status.refresh_error?5000:3000);return;
+    }
+    // Source membership is as-of dependent; model names are snapshot metadata.
+    const changedCatalogs=['source','model'].filter(dim=>dim==='source'||!catalogs[dim].stamp||stampKey(catalogs[dim].stamp)!==stampKey(status.stamp));
+    if(changedCatalogs.length){
+      await Promise.all(changedCatalogs.map(dim=>readFullCatalog(dim,controller.signal)));
+      if(seq!==loadSeq)return;
+      syncSelections();
+    }
+    pendingQueryKey=currentQueryKey();
+    let next;
+    for(let attempt=0;attempt<2;attempt++){
+      try{next=await fetchDashboard(controller.signal);break;}
+      catch(e){if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){v2Status=await apiV2('status?arf=',undefined,controller.signal);continue;}throw e;}
+    }
+    if(seq!==loadSeq)return;
+    // Only the server's global check may invalidate a restored nonempty model selection.
+    if(restoringSelection&&state.mdlSel&&!state.mdlSel.exclude&&state.mdlSel.size&&next.response.warnings.includes('ALL_SELECTED_MODELS_UNKNOWN')){
+      restoringSelection=false;state.mdlSel=null;persist(MDL_LS_KEY,null);return load(true);
+    }
+    restoringSelection=false;v2View=next;loadFailed=false;
+    registerLabels('source',next.tables.source.rows);registerLabels('model',next.tables.model.rows);
+    if(state.metric==='cw'&&!cwVisible()){state.metric='total';segSync('#seg-metric',v=>v==='total');return load(true);}
+    DATA={ready:true,generated_at_ms:Number(status.generated_at_ms||next.response.as_of_ms),view_generation:++viewGeneration,last_scan_failed:!!status.refresh_error,version:status.version,sources:status.sources||[]};
+    if(!status.refresh_error&&BigInt(status.refresh_generation||'0')!==BigInt(rescanTimedOutGen||'0'))rescanTimedOut=false;
+    $('#scanning').hidden=true;$('#app').hidden=false;
+    prepareDays();next.key=currentQueryKey();renderPayload();
+  } catch(e){if(seq===loadSeq&&e.name!=='AbortError'){showLoadFailure(e);if(!DATA)coldRetryTimer=setTimeout(()=>load(true),5000);}}
+  finally {if(seq===loadSeq)pendingQueryKey=null;}
+}
+function render() {
+  setWinSegUi();renderSelectorButtons();
+  if(v2View&&v2View.key===currentQueryKey()){renderPayload();return;}
+  if(pendingQueryKey!==currentQueryKey())load(true);
+}
+function prepareDays() {
+  const extent=v2View.response.payload.data.date_extent;
+  daysAll=[extent.first,extent.last].filter(Boolean);
+  const today=localDayStr(), first=extent.first||'', last=extent.last||'';
+  for(const id of ['day-pick','rs-pick','re-pick']){const el=$('#'+id);el.min=first;el.max=id==='day-pick'&&last&&last<today?today:last;}
+  if(!state.rs){state.rs=last?addDay(last,-6):'';state.re=last;}
+  for(const[id,value]of [['day-pick',isDayWin(state.win)?winDay():''],['rs-pick',state.rs],['re-pick',state.re]])if(document.activeElement!==$('#'+id))$('#'+id).value=value||'';
+  if(isDayWin(state.win)){
+    $('#day-prev').disabled=!first||addDay(winDay(),-1)<first;
+    $('#day-next').disabled=!last||addDay(winDay(),1)>last;
+  }
+}
+function cwVisible() {
+  const m=v2View?.globalMetrics;if(!m)return true;
+  if(m.cache_write.known_value==null||m.total.known_value==null)return true;
+  return BigInt(m.cache_write.known_value)*1000n>=BigInt(m.total.known_value);
+}
+function renderPayload() {
+  renderedDay=localDayStr();prepareDays();setWinSegUi();renderSelectorButtons();
+  $('#seg-metric [data-v="cw"]').hidden=!cwVisible()&&state.metric!=='cw';
+  renderCards();renderStatus();renderCharts();renderModelTable();renderSourceTable();
+  if(!loadFailed){$('#ledger-note').textContent='';$('#ledger-note').hidden=true;}
+  for(const dimension of ['source','model']){
+    const panel=filterPanels[dimension];if(panel&&!panel.element.hidden){
+      if(panel.key!==filterWindowKey())buildFilterPanel(dimension);else renderFilterList(dimension);
+    }
+  }
+  requestAnimationFrame(()=>{for(const chart of Object.values(charts))try{chart.resize();}catch{}loadVisibleTablePages();});
+}
+function renderCards() {
+  const d=v2View.response.payload.data,m=d.totals.metrics, none=(state.srcSel&&!state.srcSel.exclude&&!state.srcSel.size)||(state.mdlSel&&!state.mdlSel.exclude&&!state.mdlSel.size);
+  const sub=(none?t('cards.noneSel'):rangeLabel())+' · '+t('cards.requests',metricText(m.requests,false))+((state.srcSel||state.mdlSel)&&!none?t('cards.filtered'):'');
+  let comparison='';const previous=d.comparison;
+  if(previous?.comparable){const a=m.total,b=previous.totals.metrics.total;if(a.state==='exact'&&b.state==='exact'&&a.known_value!=null&&b.known_value!=null){
+    const current=BigInt(a.known_value),before=BigInt(b.known_value);
+    if(before>0n){const diff=current-before,rounded=(diff<0n?-((-diff*100n+before/2n)/before):((diff*100n+before/2n)/before));comparison=' · vs '+comparisonLabel()+' '+(rounded>=0n?'+':'')+rounded+'%';}
+    else if(current>0n)comparison=' · vs '+comparisonLabel()+t('cmp.zeroPrev');
+  }else comparison=' · '+comparisonLabel()+': '+metricText(b);}
+  const hasTotal=m.total.known_value!=null&&BigInt(m.total.known_value)>0n;
+  const items=[[t('card.total'),m.total,sub+comparison,true],[t('card.input'),m.input_uncached,hasTotal?ratioText(m.input_uncached,m.total)+t('card.inputSub'):'—'],[t('card.cr'),m.cache_read,hasTotal?ratioText(m.cache_read,m.total)+t('card.crSub'):'—']];
+  if(cwVisible())items.push([t('card.cw'),m.cache_write,hasTotal?ratioText(m.cache_write,m.total)+t('card.cwSub'):'—']);
+  items.push([t('card.output'),m.output_combined,hasTotal?ratioText(m.output_combined,m.total)+t('card.reasonShare',ratioText(m.reasoning_output,m.output_combined)):'—']);
+  $('#cards').innerHTML=items.map(([label,value,detail,highlight])=>`<div class="card${highlight?' hl':''}"><div class="k">${escapeHtml(label)}</div><div class="v" title="${escapeHtml(metricTitle(value))}">${escapeHtml(metricText(value))}</div><div class="sub">${escapeHtml(detail)}</div></div>`).join('');
+}
+function renderStatus() {
+  if(!DATA?.ready)return;
+  const bits=[],asOf=t('status.dataAsOf',localDate(DATA.generated_at_ms)),stale=localDayStr(new Date(DATA.generated_at_ms))!==localDayStr();
+  const warning=text=>`<span class="st-warn">${escapeHtml(text)}</span>`;
+  if(loadFailed)bits.push(warning(t('st.connFailShow')));else if(v2Status?.refresh_error)bits.push(warning(t('st.scanFailShow')));
+  else if(stale)bits.push(warning(t('st.waitData')));
+  if(loadFailed||v2Status?.refresh_error||stale)bits.push(escapeHtml(asOf));
+  if(pendingQueryKey&&pendingQueryKey!==v2View?.key)bits.push(words('正在读取所选范围…','Loading selected range…'));
+  const failed=(v2Status?.sources||[]).filter(s=>s.error&&s.error!=='LOADING').length;
+  if(failed)bits.push(warning(t('st.srcFailed',failed)));
+  if(rescanTimedOut)bits.push(warning(t('st.rescanTimeout')));
+  if(v2Status?.refreshing)bits.push(`<span class="st-scan">${t('st.bgScan')}</span>`);
+  if(rescanBusy)bits.push(`<span class="st-scan">${t('st.manualScan')}</span>`);
+  const isolated=(v2Status?.sources||[]).reduce((n,s)=>n+BigInt(s.isolated_objects||'0'),0n);
+  if(isolated)bits.push(warning(words(`${isolated} 个文件已隔离`,`${isolated} files isolated`)));
+  if(!state.arf)bits.push(t('st.arfOff'));else if(!rescanBusy)bits.push(`<span aria-hidden="true">${t('st.arf',state.arf,Math.max(0,Math.ceil((arfNextAt-Date.now())/1000)))}</span>`);
+  const el=$('#status'),text=bits.join(' · ');if(el.dataset.last!==text){if(text.includes('<'))el.innerHTML=text;else el.textContent=text;el.dataset.last=text;}
+  el.title=[t('status.dataAsOf',localDate(DATA.generated_at_ms)),...dataNotes(),...(v2Status?.sources||[]).filter(s=>s.error).map(s=>`${srcLabel(s.id)}: ${s.error}`),v2Status?.refresh_error||''].filter(Boolean).join('\n');
+  const header=document.querySelector('header h1');if(header)header.title=t('status.dataAsOf',localDate(DATA.generated_at_ms));
+  if(DATA.version)$('#ver').textContent=t('ver.note',DATA.version);
+}
+function dataNotes() {
+  if(!v2View)return [];
+  const r=v2View.response,d=r.payload.data,notes=[];
+  if(r.source_coverage==='partial')notes.push(words('部分来源暂未读完，当前统计可能不完整。','Some sources are incomplete; totals may be partial.'));
+  if(r.warnings.includes('LIVE_HISTORY_UNPROTECTED'))notes.push(words('部分来源仍依赖原始历史文件。','Some sources still depend on their original history files.'));
+  if(r.warnings.includes('DAY_EVIDENCE_EXCLUDED'))notes.push(words('有时区或覆盖范围待确认的日汇总，暂未计入。','Daily records with unverified timezone or coverage are excluded.'));
+  if(d.totals.coverage.grain==='day'||d.totals.coverage.grain==='mixed')notes.push(words('日汇总计入总量；小时图仅展示真实的小时记录。','Totals include daily records; hourly charts show only known hourly usage.'));
+  if(d.series.compressed)notes.push(words('时间跨度较长，主图已按周或月合并显示。','The long date range is grouped by week or month.'));
+  return notes;
+}
+function displayKey(key){return key.id==='__other__'?t('bucket.other'):key.label;}
+function chartColor(key,index){return state.group==='source'?srcColor(key.id):key.id==='__other__'?'#8b949e':mdlStableColor(key.id);}
+function drawSeries(id,series,onClick,presentation={}) {
+  const keys=series?.keys||[],points=series?.points||[];
+  // Keys represent actual records; a zero metric must not hide their original legends.
+  const used=keys.map((key,index)=>({key,index}));
+  const datasets=used.map(({key,index},i)=>{
+    const color=chartColor(key,i);
+    return {label:displayKey(key),data:points.map(p=>p.values[index]?.known_value==null?null:Number(p.values[index].known_value)),exactValues:points.map(p=>p.values[index]||unknownMetric()),
+      backgroundColor:presentation.selectedIndex==null?color+'cc':points.map((_,pi)=>color+(pi===presentation.selectedIndex?'ee':'66')),
+      borderColor:color,borderWidth:1,borderRadius:2};
+  });
+  const options=stackOpts(t(METRICS[state.metric].labelKey));
+  options.plugins.tooltip.filter=it=>{const v=it.dataset.exactValues[it.dataIndex];return v.state!=='exact'||BigInt(v.known_value||'0')!==0n;};
+  options.plugins.tooltip.callbacks.label=it=>it.dataset.label+': '+tooltipMetricText(it.dataset.exactValues[it.dataIndex]);
+  options.plugins.tooltip.callbacks.title=items=>{
+    if(!items.length)return '';
+    const total=sumMetricValues(items.map(it=>it.dataset.exactValues[it.dataIndex]));
+    return items[0].label+' · '+t('sub.total',tooltipMetricText(total));
+  };
+  if(onClick)options.onClick=(event,elements)=>{if(elements?.length)onClick(points[elements[0].index],elements[0].index);};
+  mkChart(id,{type:'bar',data:{labels:points.map(p=>presentation.label?presentation.label(p):p.label),datasets},options});
+}
+function daySeries(day) {
+  return {keys:day?.keys||[],points:(day?.hours||Array.from({length:24},(_,hour)=>({hour,values:[]}))).map(h=>({label:String(h.hour).padStart(2,'0')+(h.state==='nonexistent'?' ∅':h.intervals?.length>1?' ↺':''),values:h.values}))};
+}
+function renderCharts() {
+  const d=v2View.response.payload.data,single=isDayWin(state.win);
+  $('#day-prev').hidden=!single;$('#day-next').hidden=!single;$('#day-back').hidden=!single||state.win==='today';
+  $('#hourly-panel').hidden=single;$('#grid2').classList.toggle('single',single);
+  $('#daily-h2').textContent=t(single?'h2.dayHourly':'h2.daily');
+  const metric=d.totals.metrics[METRIC_IDS[state.metric]];
+  $('#daily-sub').textContent=single&&metric.state==='exact'&&metric.known_value==='0'?t('empty.noSel'):t(single?'sub.dayTotal':'sub.total',metricText(metric));
+  drawSeries('#chartDaily',single?daySeries(v2View.day):d.series,single?null:point=>{
+    if(d.series.unit==='day')enterDay(point.label);else {state.win='custom';state.rs=dateInReportZone(point.start_ms);state.re=addDay(dateInReportZone(point.end_ms_exclusive),-1);render();}
+  });
+  if(!single){
+    if(d.trend){
+      const unit=state.win.includes('week')?'week':'month';$('#hourly-h2').textContent=t(unit==='week'?'h2.trendWk':'h2.trendMo');$('#hourly-sub').textContent=t(unit==='week'?'sub.trendWk':'sub.trendMo',unit==='week'?10:12);
+      const selectedWindow=state.win,selectedIndex=d.trend.points.length-1-(['thisweek','thismonth'].includes(selectedWindow)?0:1);
+      drawSeries('#chartHourly',d.trend,(point,index)=>{
+        if(index===selectedIndex)state.win=selectedWindow;
+        else {state.win='custom';state.rs=dateInReportZone(point.start_ms);state.re=addDay(dateInReportZone(point.end_ms_exclusive),-1);}
+        render();
+      },{selectedIndex,label:point=>unit==='week'?point.label.slice(5):point.label.slice(0,7)});
+    }else{
+      $('#hourly-h2').textContent=t('h2.hourly');$('#hourly-sub').textContent=v2View.day?t('sub.hourlyDay',v2View.day.date,metricText(v2View.day.total.metrics[METRIC_IDS[state.metric]])):t('empty.none');
+      drawSeries('#chartHourly',daySeries(v2View.day));
+    }
+  }
+  renderDoughnut();
+}
+function dateInReportZone(ms) {
+  const parts=new Intl.DateTimeFormat('en-US',{timeZone:v2Status.stamp.report_timezone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(Number(ms)));
+  const get=type=>parts.find(p=>p.type===type).value;return `${get('year')}-${get('month')}-${get('day')}`;
+}
+function renderDoughnut() {
+  const d=v2View.response.payload.data.distribution,rows=d.rows,total=BigInt(d.known_total||'0'),hasSlices=rows.length>0&&total>0n;
+  $('#doughnut-h2').textContent=t(state.group==='model'?'h2.modelShare':'h2.sourceShare');
+  const canvas=$('#chartSource'),empty=$('#doughnut-empty');empty.hidden=hasSlices;empty.textContent=d.complete?t('empty.noSel'):metricText(unknownMetric());
+  if(canvas)canvas.style.display=hasSlices?'':'none';
+  if(!hasSlices){if(charts['#chartSource']){charts['#chartSource'].destroy();delete charts['#chartSource'];}return;}
+  const datasets=[{data:rows.map(r=>r.value.known_value==null?null:Number(r.value.known_value)),exactValues:rows.map(r=>r.value),backgroundColor:rows.map((r,i)=>chartColor(r,i)+'dd'),borderColor:'#0b0e14',borderWidth:2}];
+  const options={responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{boxWidth:10,boxHeight:10}},tooltip:{callbacks:{label:it=>tooltipMetricText(it.dataset.exactValues[it.dataIndex])}}}};
+  mkChart('#chartSource',{type:'doughnut',data:{labels:rows.map(r=>`${displayKey(r)} ${ratioText(r.value,{state:d.complete?'exact':'partial',known_value:total.toString()})}`),datasets},options,plugins:[centerTextPlugin],$center:{v:formatInteger(total),l:t('dough.center',t(METRICS[state.metric].labelKey))}});
+}
+function renderModelTable(){renderDetailTable('model');}
+function renderSourceTable(){renderDetailTable('source');}
+function renderDetailTable(dim) {
+  const page=v2View.tables[dim],model=dim==='model',cw=cwVisible(),sel=model?state.mdlSel:state.srcSel;
+  let html=model?`<tr><th>${t('tbl.model')}</th><th style="text-align:left">${t('tbl.source')}</th><th>${t('tbl.input')}</th><th>${t('tbl.cr')}</th>${cw?`<th>${t('tbl.cw')}</th>`:''}<th>${t('tbl.output')}</th><th>${t('tbl.sum')}</th><th>${t('tbl.share')}</th><th>${t('tbl.requests')}</th></tr>`:`<tr><th>${t('tbl.source')}</th><th>${t('tbl.requests')}</th><th>${t('tbl.input')}</th><th>${t('tbl.cr')}</th>${cw?`<th>${t('tbl.cw')}</th>`:''}<th>${t('tbl.output')}</th><th>${t('tbl.sum')}</th></tr>`;
+  for(const row of page.rows){const m=row.bundle.metrics,on=selected(sel,row.id),cls=(model?'mrow':'srcrow')+(sel?(on?' solo-on':' solo-off'):'');
+    const name=model?escapeHtml(row.label):`<span class="srcdot" style="background:${srcColor(row.id)}"></span>${escapeHtml(row.label)}`;
+    html+=`<tr class="${cls}" role="button" tabindex="0" data-${model?'m':'s'}="${escapeHtml(row.id)}" aria-pressed="${!!sel&&on}" title="${escapeHtml(t(model?'tbl.clickModel':'tbl.clickSource'))}"><td class="mname">${name}</td>`;
+    html+=model?`<td style="text-align:left">${(row.sources||[]).map(id=>`<span class="srcdot" style="background:${srcColor(id)}"></span>${escapeHtml(srcLabel(id))}`).join(' ')}</td>`:`<td>${metricHTML(m.requests,false)}</td>`;
+    for(const key of ['input_uncached','cache_read',...(cw?['cache_write']:[]),'output_combined'])html+=`<td>${metricHTML(m[key])}</td>`;
+    html+=`<td><b>${metricHTML(m.total)}</b></td>`;
+    if(model){
+      const share=shareText(row.share),bar=share==='—'?'':`<span class="share-bar" style="width:${share}"></span>`;
+      html+=`<td class="share-cell" title="${escapeHtml(shareTitle(row.share))}">${bar}<span class="share-txt">${escapeHtml(share)}</span></td><td>${metricHTML(m.requests,false)}</td>`;
+    }
+    html+='</tr>';
+  }
+  if(!page.rows.length)html+=`<tr><td colspan="${(model?8:6)+(cw?1:0)}" class="empty-tip">${t(model?'empty.noSel':'empty.noRange')}</td></tr>`;
+  setTableHTML('tbl-'+dim,html);
+  $('#more-'+dim).hidden=!page.next_cursor;
+}
+function shareText(share) {
+  if(share?.ratio_decimal==null)return '—';
+  const [whole,fraction='']=share.ratio_decimal.split('.'),denominator=10n**BigInt(fraction.length);
+  return ratioText({known_value:(BigInt(whole)*denominator+BigInt(fraction||'0')).toString()},{known_value:denominator.toString()});
+}
+function shareTitle(share) {
+  return shareText(share);
+}
+async function loadTablePage(dim) {
+  const view=v2View;if(!view||view.tableBusy.has(dim)||!view.tables[dim].next_cursor)return;
+  view.tableBusy.add(dim);renderDetailTable(dim);
+  try{const result=await apiV2('query',{kind:'table',query:{...view.query,metric:'total'},dimension:dim,scope:'facet',page:{limit:100,cursor:view.tables[dim].next_cursor}},v2Controller?.signal);
+    if(view!==v2View||view.key!==currentQueryKey())return;verifyStamp(view.response,result);const page=result.payload.data;
+    view.tables[dim]={...page,rows:[...view.tables[dim].rows,...page.rows]};registerLabels(dim,page.rows);DATA.view_generation=++viewGeneration;
+  }catch(e){if(view===v2View&&view.key===currentQueryKey()){if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code))load(true);else showLoadFailure(e);}}
+  finally{view.tableBusy.delete(dim);if(view===v2View&&view.key===currentQueryKey())renderDetailTable(dim);}
+}
+function renderSelectorButtons() {
+  for(const dim of ['source','model']){
+    const sel=dim==='source'?state.srcSel:state.mdlSel,button=$(dim==='source'?'#src-ms-btn':'#mdl-ms-btn'),ids=catalogItems(dim).map(x=>x.id);
+    let label=t(dim==='source'?'ms.allSrc':'ms.allMdl'),sub=ids.length?t('ms.nItems',ids.length):'';
+    if(sel){const live=ids.filter(id=>selected(sel,id));
+      if(!live.length){label=t(dim==='source'?'ms.noSrc':'ms.noMdl');sub='';}
+      else if(live.length===1){label=labels[dim].get(live[0])||live[0];sub=t('ms.oneItem');}
+      else {label=t('ms.selected',live.length,ids.length);sub='';}
+    }
+    button.classList.toggle('filter-on',!!sel);button.innerHTML=`<span class="lbl">${escapeHtml(label)}</span> <span class="cnt">${sub?escapeHtml(sub)+' · ':''}▾</span>`;
+  }
+}
+function filterWindowKey(){return JSON.stringify([rangeBounds(),v2View?.response.stamp]);}
+function buildFilterPanel(dim) {
+  if(!v2View)return;
+  const element=$(dim==='source'?'#src-ms-panel':'#mdl-ms-panel'),previous=filterPanels[dim];
+  const scroll=element.querySelector('.ms-list')?.scrollTop||0;
+  previous?.controller.abort();
+  const panel=filterPanels[dim]={element,key:filterWindowKey(),search:element.dataset.q||'',items:catalogItems(dim),next:null,stats:new Map(),statsNext:null,statsDone:false,busy:false,sequence:0,visibleLimit:previous?.visibleLimit||200,controller:new AbortController()};
+  element.innerHTML=`<div class="ms-head"><input class="ms-search" placeholder="${escapeHtml(t('ms.search',catalogs[dim].total))}" value="${escapeHtml(panel.search)}"><button class="ms-act" data-act="all">${t('ms.all')}</button><button class="ms-act" data-act="none">${t('ms.none')}</button></div><div class="ms-list"></div><div class="ms-error" role="status" style="color:#f2cc60;padding:0 8px"></div>`;
+  element.querySelector('.ms-search').addEventListener('input',e=>{if(e.isComposing)return;panel.search=e.target.value;element.dataset.q=panel.search;panel.visibleLimit=200;renderFilterList(dim);});
+  for(const act of ['all','none'])element.querySelector(`[data-act="${act}"]`).onclick=()=>{const key=dim==='source'?'srcSel':'mdlSel';state[key]=act==='all'?null:new Set();persist(dim==='source'?SRC_LS_KEY:MDL_LS_KEY,state[key]);render();};
+  const list=element.querySelector('.ms-list');
+  list.onchange=e=>{const checkbox=e.target.closest('input[data-v]');if(checkbox)(dim==='source'?toggleSrc:toggleMdl)(checkbox.dataset.v);};
+  list.addEventListener('scroll',()=>{if(list.scrollTop+list.clientHeight>=list.scrollHeight-80&&panel.visibleLimit<panel.items.length){panel.visibleLimit+=200;renderFilterList(dim);}});
+  renderFilterList(dim);list.scrollTop=scroll;
+  // Only compact current-window summaries are read, when a selector is opened.
+  (async()=>{await readFilterPage(dim,false);while(panel===filterPanels[dim]&&!panel.controller.signal.aborted&&panel.statsNext)await readFilterPage(dim,true);})();
+}
+async function readFilterPage(dim,append) {
+  const panel=filterPanels[dim];if(!panel||panel.busy)return;
+  const seq=++panel.sequence,view=v2View;panel.busy=true;
+  try{
+    const query={...view.query,sources:{mode:'all'},models:{mode:'all'},metric:'total'};
+    const ranking=await apiV2('query',{kind:'table',query,dimension:dim,scope:'facet',page:{limit:200,cursor:append?panel.statsNext:null}},panel.controller.signal);
+    if(panel!==filterPanels[dim]||seq!==panel.sequence)return;
+    verifyStamp(view.response,ranking);
+    const data=ranking.payload.data;if(!append)panel.stats.clear();
+    for(const row of data.rows)panel.stats.set(row.id,row);
+    panel.statsNext=data.next_cursor;panel.statsDone=!data.next_cursor;registerLabels(dim,data.rows);
+    panel.element.querySelector('.ms-error').textContent='';
+  }catch(e){if(panel===filterPanels[dim]&&seq===panel.sequence&&e.name!=='AbortError'){
+    panel.statsNext=null;
+    if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){panel.key='';load(true);}else panel.element.querySelector('.ms-error').textContent=e.message;
+  }}finally{if(panel===filterPanels[dim]&&seq===panel.sequence){panel.busy=false;renderFilterList(dim);}}
+}
+function renderFilterList(dim) {
+  const panel=filterPanels[dim];if(!panel)return;
+  const list=panel.element.querySelector('.ms-list'),scroll=list.scrollTop,focused=document.activeElement?.dataset?.v,sel=dim==='source'?state.srcSel:state.mdlSel;
+  const search=panel.search.trim().toLowerCase();
+  const rows=panel.items.filter(item=>!search||item.label.toLowerCase().includes(search)||item.id.toLowerCase().includes(search)).slice().sort((a,b)=>{
+    const av=panel.stats.get(a.id)?.bundle.metrics.total.known_value,bv=panel.stats.get(b.id)?.bundle.metrics.total.known_value;
+    if(av!=null&&bv!=null)return BigInt(av)===BigInt(bv)?0:BigInt(av)>BigInt(bv)?-1:1;
+    return av!=null?-1:bv!=null?1:0;
+  }).slice(0,panel.visibleLimit||200);
+  list.innerHTML=rows.map(item=>{const row=panel.stats.get(item.id),label=item.label||labels[dim].get(item.id)||item.id,value=row?.bundle.metrics.total;
+    const detail=value&&(value.state!=='exact'||BigInt(value.known_value||'0')>0n)?metricText(value)+' · '+shareText(row.share):'—';
+    return `<label class="ms-item"><input type="checkbox" data-v="${escapeHtml(item.id)}" ${selected(sel,item.id)?'checked':''}><span class="srcdot" style="background:${dim==='source'?srcColor(item.id):mdlStableColor(item.id)}"></span><span class="lbl">${escapeHtml(label)}</span><span class="share" title="${row?escapeHtml(metricTitle(value)+' · '+shareTitle(row.share)):''}">${escapeHtml(detail)}</span></label>`;
+  }).join('')||`<div class="ms-item" style="color:var(--dim);cursor:default">${t('ms.noMatch')}</div>`;
+  list.scrollTop=scroll;if(focused)list.querySelector(`input[data-v="${CSS.escape(focused)}"]`)?.focus();
+}
+function loadVisibleTablePages() {
+  if(!v2View||v2View.key!==currentQueryKey())return;
+  for(const dim of ['model','source']){
+    const el=$('#more-'+dim);if(el.hidden)continue;
+    const box=el.getBoundingClientRect();
+    if(box.top<window.innerHeight+160&&box.bottom>=0)loadTablePage(dim);
+  }
+}
+function rescanUntilNew(done) {
+  if(manualRefresh)manualRefresh.finish();
+  const op={finished:false,timers:new Set(),controller:new AbortController()};manualRefresh=op;
+  const active=()=>manualRefresh===op&&!op.finished;
+  const later=(fn,ms)=>{const timer=setTimeout(()=>{op.timers.delete(timer);if(active())fn();},ms);op.timers.add(timer);};
+  op.finish=(timedOut=false,failed=false)=>{if(!active())return;op.finished=true;for(const timer of op.timers)clearTimeout(timer);op.controller.abort();manualRefresh=null;rescanBusy=false;if(!failed)rescanTimedOut=timedOut;rescanTimedOutGen=v2Status?.refresh_generation||'0';$('#btn-refresh').disabled=false;$('#btn-refresh').textContent=t('btn.refresh');renderStatus();if(done)done({ok:!timedOut&&!failed,timedOut,failed});};
+  rescanBusy=true;$('#btn-refresh').disabled=true;$('#btn-refresh').textContent=t('btn.rescaning');renderStatus();later(()=>op.finish(true),90000);
+  (async()=>{
+    try{
+      const initial=await apiV2('status?arf=',undefined,op.controller.signal);if(!active())return;
+      const base=BigInt(initial.refresh_generation||'0');
+      await apiV2('refresh',{},op.controller.signal);if(!active())return;
+      const poll=async()=>{try{
+        const status=await apiV2('status?arf=',undefined,op.controller.signal);if(!active())return;v2Status=status;renderStatus();
+        if(BigInt(status.refresh_generation||'0')!==base&&!status.refreshing){await load(true);if(active())op.finish(false,!!status.refresh_error);return;}
+      }catch(e){if(active())showLoadFailure(e);}if(active())later(poll,1000);};
+      later(poll,300);
+    }catch(e){if(active()){showLoadFailure(e);op.finish(false,true);}}
+  })();
+}
+
+/* ---------------- 启动 ---------------- */
+// 旧布局脚本已完成控件绑定与偏好恢复，这里是唯一的数据启动点。
+migrateModels();
+window.addEventListener('scroll',loadVisibleTablePages,{passive:true});
+window.addEventListener('resize',loadVisibleTablePages);
+applyArf();
+setInterval(()=>{if(!DATA?.ready||document.hidden)return;if(renderedDay!==localDayStr())render();else renderStatus();},1000);
+load();

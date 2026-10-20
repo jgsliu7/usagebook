@@ -4,7 +4,7 @@
 //! File projections are replaced only if their observed revision still matches.
 
 pub mod cursor;
-mod lifecycle;
+pub(crate) mod lifecycle;
 
 pub use cursor::{judge, judge_reload, seal_at, tail_seal, FileCursor, Verdict, TAIL_SEAL_BYTES};
 

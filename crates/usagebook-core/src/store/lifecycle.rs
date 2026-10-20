@@ -8,16 +8,16 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
-pub(super) struct Lease {
+pub(crate) struct Lease {
     _file: File,
 }
 
 impl Lease {
-    pub(super) fn shared(path: &Path) -> io::Result<Self> {
+    pub(crate) fn shared(path: &Path) -> io::Result<Self> {
         Self::acquire(path, false)
     }
 
-    pub(super) fn exclusive(path: &Path) -> io::Result<Self> {
+    pub(crate) fn exclusive(path: &Path) -> io::Result<Self> {
         Self::acquire(path, true)
     }
 

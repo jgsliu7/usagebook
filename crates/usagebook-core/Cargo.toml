@@ -12,16 +12,22 @@ regression-hooks = []
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
 chrono.workspace = true
+chrono-tz = "0.10"
+uuid = { version = "=1.18.1", features = ["v4"] }
+base64 = "0.22"
 zstd.workspace = true
 rayon.workspace = true
 sha2.workspace = true
 tracing.workspace = true
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup", "hooks", "functions"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }

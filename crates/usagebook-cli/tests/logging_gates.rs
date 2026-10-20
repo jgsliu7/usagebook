@@ -237,12 +237,16 @@ fn invalid_log_env_silent_for_onetshot() {
         base.stderr, with_env.stderr,
         "非法日志变量不得给一次性命令的 stderr 增加任何行"
     );
-    serde_json::from_slice::<serde_json::Value>(&base.stdout)
-        .expect("基线 stdout 必须是完整 JSON(双向校验)");
-    serde_json::from_slice::<serde_json::Value>(&with_env.stdout)
-        .expect("带非法变量时 stdout 必须仍是完整 JSON(双向校验)");
-    serde_json::from_slice::<serde_json::Value>(&with_env.stdout)
-        .expect("--json stdout 必须完整可解析");
+    // Ledger v2 streams one bounded JSON page per line.
+    for output in [&base.stdout, &with_env.stdout] {
+        let text = std::str::from_utf8(output).expect("stdout 必须为 UTF-8");
+        assert!(!text.is_empty());
+        for line in text.lines() {
+            let page: serde_json::Value =
+                serde_json::from_str(line).expect("NDJSON 每行必须完整可解析，不能夹带日志");
+            assert!(page.get("stamp").is_some() && page.get("payload").is_some());
+        }
+    }
 }
 
 /// store 降级 fixture(cfg(unix)):垃圾库 + 目录只读 → 轮转失败 → "降级直读"进 stderr;
@@ -269,12 +273,13 @@ fn json_stdout_pure_with_store_degrade() {
     std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("降级"), "store 降级信息必须留在 stderr: {err}");
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("--json 模式 stdout 必须纯净可解析(store 降级不得污染管道)");
-    assert!(
-        v.is_object() && v.get("totals").is_some(),
-        "JSON 结构存在且含 totals"
-    );
+    let text = std::str::from_utf8(&out.stdout).expect("stdout 必须为 UTF-8");
+    assert!(!text.is_empty());
+    for line in text.lines() {
+        let page: serde_json::Value = serde_json::from_str(line)
+            .expect("--json 的每个 NDJSON 页必须纯净可解析(store 降级不得污染管道)");
+        assert!(page.get("stamp").is_some() && page.get("payload").is_some());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,8 +366,8 @@ fn dual_instance_second_degrades_file_layer() {
         "第二实例看板必须照常服务"
     );
     std::thread::sleep(Duration::from_millis(400));
-    let resp = http_get(port_a, "/api/data").expect("第一实例仍响应");
-    assert!(resp.contains("200"), "第一实例 /api/data: {resp}");
+    let resp = http_get(port_a, "/api/v2/status").expect("第一实例仍响应");
+    assert!(resp.contains("200"), "第一实例 /api/v2/status: {resp}");
     let (_bo, be) = kill(&mut b);
     assert!(
         be.contains("文件日志降级") || be.contains("日志目录锁"),

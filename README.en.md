@@ -65,6 +65,27 @@ usagebook serve      # local dashboard (add --open to launch browser)
 usagebook doctor     # discover source dirs; --check verifies parsing
 ```
 
+### Durable ledger (first version)
+
+Claude Code now has an opt-in durable ledger. Other sources remain visible in the same dashboard and are marked **unprotected**:
+
+```bash
+usagebook ledger init --timezone UTC
+usagebook ledger refresh --source claude
+usagebook ledger status
+usagebook serve
+```
+
+Saved Claude usage survives source cleanup. Unchanged files skip body reads; damaged files are isolated, and the dashboard marks incomplete coverage. The ledger stores usage metadata, never conversation text. Request facts and daily summaries are retained; expired hourly caches can be recomputed from facts.
+
+The default `usage-ledger.db` lives in `~/Library/Application Support/usagebook/` on macOS, `$XDG_DATA_HOME/usagebook/` (default `~/.local/share/usagebook/`) on Linux, and `%LOCALAPPDATA%\usagebook\` on Windows. Override the complete filename with `USAGEBOOK_LEDGER_PATH`. The legacy scan-cache settings do not disable or delete this ledger.
+
+Stop the server before maintenance. Use `ledger backup --output FILE`, `ledger check`, and `ledger restore --input FILE --dry-run`. `ledger forget --source claude --from DATE --to DATE --dry-run` previews deletion. Apply a reviewed preview with `--apply --preview-token TOKEN`. Restoring an old backup preserves current deletion controls. A corrupt ledger produces an error; it is never silently replaced with an empty database.
+
+API changes: `/api/data` returns 410. The dashboard uses `/api/v2/status`, `/api/v2/query`, and `/api/v2/catalog`; integer values are decimal strings. `report --json` streams NDJSON pages; `report --query-file FILE` accepts the query DTO. Exit code 5 means readable results were emitted with incomplete source coverage.
+
+This version has been tested on macOS. Linux/Windows application-level validation and large-scale release benchmarks remain release gates. Use local disks; blocking operations on mounted source directories are not yet fully isolated.
+
 > **Note for international users**: CLI terminal output is currently Chinese only (multilingual CLI is on the roadmap). The dashboard is fully bilingual. `INSTALL.md`, `CONTRIBUTING.md` and `SECURITY.md` are also Chinese only for now.
 
 ## Updating
@@ -73,7 +94,7 @@ The tool never checks for updates online (zero network at runtime — see `SECUR
 
 ## Privacy & local state
 
-usagebook keeps scan-acceleration state at `~/.usagebook/` (logical base path; derived cache files live alongside): file paths and a whitelist of usage metadata (model names, session ids, token counts, message ids, timestamps) only — **never prompts, tool calls, or code content**. Purely local, zero network. Set `USAGEBOOK_INCREMENTAL=off` to disable it entirely, or point `USAGEBOOK_DATA_DIR` elsewhere.
+usagebook keeps legacy scan-acceleration state at `~/.usagebook/` (logical base path; derived cache files live alongside): file paths and a whitelist of usage metadata (model names, session ids, token counts, message ids, timestamps) only — **never prompts, tool calls, or code content**. Purely local, zero network. Set `USAGEBOOK_INCREMENTAL=off` to disable this legacy cache, or point `USAGEBOOK_DATA_DIR` elsewhere. Durable ledger storage is separate.
 
 ### Runtime logs
 
@@ -90,6 +111,7 @@ usagebook keeps scan-acceleration state at `~/.usagebook/` (logical base path; d
 | Variable | Purpose | Default |
 |---|---|---|
 | `USAGEBOOK_DATA_DIR` | usagebook's own cache directory (never touches any tool's original logs) | `~/.usagebook` |
+| `USAGEBOOK_LEDGER_PATH` | Complete path to the durable ledger database | Platform data directory above |
 | `USAGEBOOK_INCREMENTAL` | set to `off` to disable the incremental cache | enabled |
 | `USAGEBOOK_STATE_DB` | state database file location (diagnostics/advanced) | `<DATA_DIR>/state.db` |
 | `USAGEBOOK_LOG_DIR` | runtime log directory; `off` disables file logging | `<DATA_DIR>/logs` |
@@ -103,7 +125,7 @@ Troubleshooting: attach that directory when reporting issues (redact first — p
 ## Disclaimer
 
 - usagebook only **reads** existing local files for statistics; it never modifies any tool's data and makes no network requests at runtime.
-- Statistics are bounded by the logs that still exist. If a source tool deletes or rotates its logs, later statistics may shrink; the snapshot cache is a startup cache, not a permanent ledger or session backup.
+- Saved Claude ledger facts survive source cleanup. Unmigrated sources still depend on their remaining logs. Records removed before their first successful import cannot be recovered.
 - usagebook is not affiliated with any of the listed AI coding tools; all names and trademarks belong to their respective owners.
 
 ## License

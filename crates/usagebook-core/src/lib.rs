@@ -19,6 +19,7 @@
 //! 11. **装配层不感知重叠**:跨源不重叠由适配器层保证,report/snapshot 不做记录级去重。
 
 pub mod common;
+pub mod ledger;
 pub mod logging;
 pub mod model;
 pub mod report;

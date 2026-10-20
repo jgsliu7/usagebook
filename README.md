@@ -78,10 +78,9 @@ cargo build --release --locked # 首次会下载依赖；SQLite/zstd 随源码�
 
 ```bash
 usagebook                          # 全源扫描 + 按日/工具/模型报表
-usagebook --days 7 --json          # JSON 输出(脚本消费,与报表同口径)
+usagebook --days 7 --json          # NDJSON 分页输出，每行一个查询结果页
 usagebook --source claude          # 只看 Claude Code
 usagebook --days 7                 # 最近 7 天
-usagebook --source codex --max-files 50   # 抽样调试
 usagebook doctor                   # 目录发现自检:根在哪/体积多大
 usagebook doctor --check           # 进一步检查解析结果（大目录需要等待）
 usagebook serve                    # 本地看板 → http://127.0.0.1:7878
@@ -89,7 +88,7 @@ usagebook serve --open             # 启动成功后打开看板
 usagebook serve --port 8080 --refresh-secs 30
 ```
 
-`--refresh-secs` 是没有页面轮询时的回退重扫间隔；看板开着时，右上角"自动刷新"档位会直接驱动服务端按同节奏重扫（停止轮询后回退到该值）。
+`--refresh-secs` 控制后台采集间隔；页面自动刷新或手动刷新也可发起一次合并刷新。关闭页面自动刷新不会停止后台采集。`--days N` 是滚动 N×24 小时，看板的近 N 天则按报表当地日期计算。
 
 看板能力：
 
@@ -99,19 +98,51 @@ usagebook serve --port 8080 --refresh-secs 30
 - **筛选**：来源 / 模型双多选下拉（搜索 / 全选 / 全不选；数字跟随当前时间窗，点击明细行切换，选择按浏览器记忆）
 - **占比环**：跟随当前分组（来源 / 模型）切换，环心显示合计，图例带百分比
 - **汇总卡片**：随时间窗与筛选联动，附总量环比——今天比较昨日同期（截至本轮扫描时刻）；本周/本月比较完整的上周/上月并明确标注；历史周/月比较完整前期；近 N 天比较前 N 天
-- **五桶指标切换**：缓存写占全量 token 不足 0.1% 时自动隐藏该指标
-- **单位制**：万/亿 ↔ K/M/B 中英文切换，坐标轴与悬浮提示统一
+- **六种指标**：全部、未缓存输入、缓存读取、缓存写入、普通输出、推理输出
+- **精确数字**：表格和提示保留完整整数，超过 JavaScript 安全整数范围也不丢精度
 - **自动刷新**：10s / 30s / 1分 / 关，可选档位
-- **快照磁盘缓存**：服务重启先显示缓存结果，后台重扫更新
-- 图表库 Chart.js 随二进制分发，零外网依赖
+- **按需查询**：已迁移来源直接查询账本，表格分页读取；未迁移来源后台扫描后临时汇合
+- 图表资源随二进制分发，零外网依赖
 
 边界说明：图表的指标切换不改变"总量 Tokens"卡片及其环比的总量口径；今日同期不可计算或缓存仍属于前一天时，不显示该环比；整轮扫描或连接失败时，已有结果继续展示并标出数据截止时间；单个来源扫描失败会另行提示，本轮统计可能不完整；明细表跟随时间窗。
+
+### 长期账本（首版）
+
+首版完成 **Claude Code** 的持久化链路，其他来源继续显示在同一看板并标为“未保护”。首次使用先初始化，再导入：
+
+```bash
+usagebook ledger init --timezone Asia/Shanghai
+usagebook ledger refresh --source claude
+usagebook ledger status
+usagebook serve
+```
+
+账本仅保存白名单用量元数据，不保存对话正文。成功入账的 Claude 历史在原文件被清理后仍保留；未读取就消失的记录无法恢复。未变化的文件跳过正文，坏文件隔离并显示缺口，正常文件继续入账。已保存候选出现矛盾时撤去有争议的贡献，修复后重新裁决，不能把暂时的部分结果当完整统计。
+
+数据保存在独立的 `usage-ledger.db`：macOS 为 `~/Library/Application Support/usagebook/`，Linux 为 `${XDG_DATA_HOME:-~/.local/share}/usagebook/`，Windows 为 `%LOCALAPPDATA%\usagebook\`。可用 `USAGEBOOK_LEDGER_PATH` 指定完整文件路径。请求明细和日摘要长期保留；小时缓存可以淘汰，旧日仍能从明细查询。账本与旧扫描缓存分开，关闭或清理旧缓存不清除账本。
+
+维护前停止 `serve` 及其他连接。同一账本只允许一个采集写入者；备份、恢复、忘记历史和时区重建需独占锁：
+
+```bash
+usagebook ledger backup --output ./usage-backup.db
+usagebook ledger check
+usagebook ledger restore --input ./usage-backup.db --dry-run
+usagebook ledger forget --source claude --from 2026-10-01 --to 2026-10-07 --dry-run
+usagebook ledger pause --source claude
+usagebook ledger resume --source claude
+usagebook ledger audit --source claude
+```
+
+恢复和忘记操作先输出影响预览；检查后用同一命令加 `--apply --preview-token <预览返回值>` 执行。忘记记录会留下防止重新导入的规则；恢复旧备份也保留当前删除规则。出现损坏时明确报错，不会自动建空库。请使用本地磁盘；挂载目录的阻塞文件操作尚未通过完整隔离验收。三平台文件格式一致，Linux/Windows 的完整运行测试仍待发布前执行。
+
+接口变化：`/api/data` 已退场（410），查询使用 `/api/v2/status`、`/api/v2/query`、`/api/v2/catalog`。整数在接口中为十进制字符串；`report --json` 输出 NDJSON 页。完整筛选 DTO 可通过 `report --query-file FILE` 使用。退出码 5 表示已输出可读结果但来源覆盖不完整。
 
 ### 环境变量
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
 | `USAGEBOOK_DATA_DIR` | usagebook 自己的缓存目录(不会改变任何工具的原始日志目录) | `~/.usagebook` |
+| `USAGEBOOK_LEDGER_PATH` | 独立长期账本的完整文件路径 | 见上述各平台数据目录 |
 | `USAGEBOOK_INCREMENTAL` | 设为 `off` 停用增量缓存,退回每次全量扫描 | 开启 |
 | `USAGEBOOK_STATE_DB` | 状态库逻辑基址(诊断与高级用法)，实际文件位于按代次派生的目录 | `<DATA_DIR>/state.db` |
 | `USAGEBOOK_LOG_DIR` | 运行日志目录;设为 `off` 关闭文件日志 | `<DATA_DIR>/logs` |
