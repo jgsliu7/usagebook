@@ -281,6 +281,7 @@ impl UsageSource for GooseSource {
                         model,
                         ts_ms,
                         caliber: Caliber::RequestDelta, // 会话终态一次性入账(§5)
+                        request_count: 1,
                         input_uncached,
                         cache_read: cr,
                         cache_write: cw,
@@ -389,6 +390,7 @@ fn scan_ledger(
                 model,
                 ts_ms,
                 caliber: Caliber::RequestDelta,
+                request_count: 1,
                 input_uncached: input_incl.saturating_sub(cr).saturating_sub(cw),
                 cache_read: cr,
                 cache_write: cw,

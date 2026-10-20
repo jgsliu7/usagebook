@@ -324,6 +324,7 @@ impl UsageSource for CodexSource {
                                 model: st.model.clone(),
                                 ts_ms,
                                 caliber: Caliber::RequestDelta,
+                                request_count: 1,
                                 input_uncached: in_unc,
                                 cache_read: b[1],
                                 cache_write: b[2],

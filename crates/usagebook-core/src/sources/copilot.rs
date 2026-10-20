@@ -207,6 +207,7 @@ impl UsageSource for CopilotSource {
                         model: model.clone(),
                         ts_ms: s.ts_ms,
                         caliber: Caliber::RequestDelta,
+                        request_count: 1,
                         input_uncached: d[0],
                         cache_read: d[1],
                         cache_write: d[2],
@@ -383,6 +384,7 @@ impl UsageSource for CopilotSource {
                     model: row.model,
                     ts_ms: row.ts_ms,
                     caliber: Caliber::RequestDelta,
+                    request_count: 1,
                     input_uncached: row.buckets[0],
                     cache_read: row.buckets[1],
                     cache_write: row.buckets[2],
@@ -508,6 +510,7 @@ fn scan_session_store(
                 model,
                 ts_ms,
                 caliber: Caliber::RequestDelta, // 逐请求,免差分(§7.1)
+                request_count: 1,
                 input_uncached: input.saturating_sub(cr).saturating_sub(cw),
                 cache_read: cr,
                 cache_write: cw,

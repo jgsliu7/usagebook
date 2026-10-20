@@ -220,6 +220,7 @@ impl UsageSource for KiroSource {
                             model,
                             ts_ms,
                             caliber: Caliber::RequestDelta,
+                            request_count: 1,
                             input_uncached: i,
                             cache_read: 0, // 库无缓存列(§4)
                             cache_write: 0,

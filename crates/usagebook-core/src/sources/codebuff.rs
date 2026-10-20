@@ -268,6 +268,7 @@ impl UsageSource for CodebuffSource {
                     model,
                     ts_ms,
                     caliber: Caliber::RequestDelta,
+                    request_count: 1,
                     input_uncached: i,
                     cache_read: cr,
                     cache_write: cw,

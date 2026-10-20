@@ -119,3 +119,5 @@
 ## 9. v1 支持结论
 
 **⏸ 行级表不做采集(与自有适配器 100% 重叠,双计);v1.1 做 rollups 空窗回填通道**(claude GC 空窗 2026-04-09→09-06;opencode 待直读其本地 `~/.local/share/opencode/opencode.db` 立档案后,rollups 仅兜底),前置依赖:**跨源去重/重叠源横切规范(docs/)先行**。档案冻结 v1.0。
+
+> **v1.1 落地(2026-10-19)**:回填通道已实现——源 id `ccswitch-rollup`,装配层注入原生覆盖集后按 §5.5 整日替换激活(独立 trait 扫描恒空);`UsageRecord` 增 `request_count` 列承载日请求数。实现与逐位验证见根仓库 docs/features/20261019-ccswitch历史回填/。本机回填 143 天 / 190 亿 token / 152,241 请求。

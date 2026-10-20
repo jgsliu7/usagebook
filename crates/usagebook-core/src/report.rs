@@ -248,6 +248,7 @@ mod tests {
             output: 0,
             reasoning_output: 0,
             cost_usd: None,
+            request_count: 1,
             dedup_key: format!("k{ts_ms}"),
         }
     }

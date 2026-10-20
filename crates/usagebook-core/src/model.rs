@@ -35,8 +35,16 @@ pub struct UsageRecord {
     pub reasoning_output: u64,
     /// 源自带成本(官方口径,如 TRAE dollar_float / Claude cost-state);估算成本不落此字段
     pub cost_usd: Option<f64>,
+    /// 该记录承载的请求数:常规记录恒 1;日聚合回填行(ccswitch-rollup)为该日请求数。
+    /// 序列化缺省 1,兼容既有 L2 缓存行。
+    #[serde(default = "request_count_one")]
+    pub request_count: u32,
     /// 去重键(各源档案 §5)
     pub dedup_key: String,
+}
+
+fn request_count_one() -> u32 {
+    1
 }
 
 impl UsageRecord {

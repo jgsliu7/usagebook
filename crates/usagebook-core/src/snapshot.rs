@@ -39,7 +39,8 @@ impl Buckets {
         self.cw += r.cache_write;
         self.o += r.output;
         self.r += r.reasoning_output;
-        self.n += 1;
+        // 常规记录恒 1;ccswitch-rollup 日聚合行携带该日请求数(max 防 0 值漏计)
+        self.n += u64::from(r.request_count).max(1);
         if let Some(c) = r.cost_usd {
             self.c += c;
         }
@@ -160,6 +161,21 @@ pub fn build_snapshot(refresh_secs: u64, verbose: bool) -> Snapshot {
         });
         records.extend(recs);
     }
+    // cc-switch rollups 空窗回填(跨源去重与重叠源规范 §五 C 类/§七):
+    // 覆盖集来自本轮原生记录,回填行按 日期×app 整日替换,只补原生无覆盖的日期。
+    // 单表直读(本机 261 行),不走 L1/L2 文件缓存。
+    let covered: std::collections::HashSet<(String, String)> = records
+        .iter()
+        .filter(|r| matches!(r.source, "claude" | "codex" | "opencode" | "pi"))
+        .map(|r| (r.source.to_string(), common::ms_to_local_date(r.ts_ms)))
+        .collect();
+    let (backfilled, bf_stats) = crate::sources::ccswitch_rollup::backfill(&covered);
+    source_scans.push(SourceScan {
+        source: "ccswitch-rollup".to_string(),
+        records: backfilled.len(),
+        stats: bf_stats,
+    });
+    records.extend(backfilled);
     let mut snap = snapshot_from_records(&records, refresh_secs, generated_at_ms, source_scans);
     snap.scan_ms = t0.elapsed().as_millis() as u64;
     snap

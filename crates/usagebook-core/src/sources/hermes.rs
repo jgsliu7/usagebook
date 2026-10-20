@@ -223,6 +223,7 @@ impl UsageSource for HermesSource {
                         model,
                         ts_ms,
                         caliber: Caliber::RequestDelta, // 会话终态一次性入账(§5)
+                        request_count: 1,
                         input_uncached: i,
                         cache_read: cr,
                         cache_write: cw,

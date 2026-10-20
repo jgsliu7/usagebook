@@ -608,7 +608,8 @@ impl UsageSource for DshSource {
                             model: model.clone(),
                             ts_ms,
                             caliber: Caliber::RequestDelta, // request_delta(§4 映射表)
-                            input_uncached: i,              // 硬约束一:已是 exclusive,直取勿减
+                            request_count: 1,
+                            input_uncached: i, // 硬约束一:已是 exclusive,直取勿减
                             cache_read: cr,
                             cache_write: cw,
                             cache_write_1h: 0,

@@ -224,6 +224,7 @@ impl UsageSource for CodebuddyIdeSource {
                 model,
                 ts_ms,
                 caliber: Caliber::RequestDelta,
+                request_count: 1,
                 input_uncached,
                 cache_read,
                 cache_write,

@@ -302,6 +302,7 @@ pub(crate) fn scan_buddy_wire(
                 model,
                 ts_ms,
                 caliber: Caliber::RequestDelta,
+                request_count: 1,
                 input_uncached: buckets.input_uncached,
                 cache_read: buckets.cache_read,
                 cache_write: buckets.cache_write,

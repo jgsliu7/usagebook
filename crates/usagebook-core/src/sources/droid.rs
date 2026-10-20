@@ -180,6 +180,7 @@ impl UsageSource for DroidSource {
                         model,
                         ts_ms,
                         caliber: Caliber::RequestDelta, // 会话终态一次性入账,重扫稳定(§5)
+                        request_count: 1,
                         input_uncached: i,
                         cache_read: cr,
                         cache_write: cw,

@@ -300,6 +300,7 @@ fn scan_sqlite_agent(
             model,
             ts_ms,
             caliber: Caliber::RequestDelta,
+            request_count: 1,
             input_uncached: i, // exclusive 直取(§7.3,勿减 cache)
             cache_read: cr,
             cache_write: cw,
@@ -389,6 +390,7 @@ fn scan_jsonl_agent(
                 model,
                 ts_ms,
                 caliber: Caliber::RequestDelta,
+                request_count: 1,
                 input_uncached: i,
                 cache_read: cr,
                 cache_write: cw,

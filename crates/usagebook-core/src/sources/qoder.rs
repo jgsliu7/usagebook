@@ -132,6 +132,7 @@ fn scan_ide_db(
                 model,
                 ts_ms,
                 caliber: Caliber::RequestDelta,
+                request_count: 1,
                 input_uncached: input,
                 cache_read: cached,
                 cache_write: 0, // token_info 无 cache_write(§2)
@@ -255,6 +256,7 @@ impl UsageSource for QoderSource {
                         model,
                         ts_ms,
                         caliber: Caliber::RequestDelta,
+                        request_count: 1,
                         input_uncached: i,
                         cache_read: cr,
                         cache_write: cw,

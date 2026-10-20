@@ -180,6 +180,13 @@ pub const SOURCE_CATALOG: &[SourceInfo] = &[
         label: "OpenCode",
         tier: SourceTier::Verified,
     },
+    // 二手镜像回填通道(档案 13/横切规范 §五 C 类):只读 cc-switch 日汇总,
+    // 整日替换补原生源无覆盖的日期;独立扫描恒空,装配层注入覆盖集后激活。
+    SourceInfo {
+        id: "ccswitch-rollup",
+        label: "CC Switch 回填",
+        tier: SourceTier::Community,
+    },
 ];
 
 /// 全部已登记数据源(顺序即报表顺序,与 SOURCE_CATALOG 保持一致)。
@@ -213,6 +220,7 @@ pub fn registered_sources() -> Vec<Box<dyn UsageSource>> {
         Box::new(sources::kiro::KiroSource),
         Box::new(sources::qoder::QoderSource),
         Box::new(sources::opencode::OpencodeSource),
+        Box::new(sources::ccswitch_rollup::CcswitchRollupSource),
     ]
 }
 

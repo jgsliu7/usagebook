@@ -251,6 +251,7 @@ fn scan_db(
                     model: p.model,
                     ts_ms: p.ts_ms,
                     caliber: Caliber::RequestDelta,
+                    request_count: 1,
                     input_uncached: p.input,
                     cache_read: p.cache_read,
                     cache_write: p.cache_write,
@@ -339,6 +340,7 @@ fn scan_db(
                     model,
                     ts_ms,
                     caliber: Caliber::RequestDelta, // 会话终态一次性入账(§4 同 droid 裁决)
+                    request_count: 1,
                     input_uncached: g(3),
                     cache_read: g(6),
                     cache_write: g(7),
@@ -493,6 +495,7 @@ impl UsageSource for OpencodeSource {
                             model: p.model,
                             ts_ms: p.ts_ms,
                             caliber: Caliber::RequestDelta,
+                            request_count: 1,
                             input_uncached: p.input,
                             cache_read: p.cache_read,
                             cache_write: p.cache_write,

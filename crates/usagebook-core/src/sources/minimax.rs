@@ -437,6 +437,7 @@ impl UsageSource for MinimaxSource {
                     model,
                     ts_ms: r.ts_ms,
                     caliber: Caliber::RequestDelta,
+                    request_count: 1,
                     input_uncached: r.input_uncached,
                     cache_read: r.cache_read,
                     cache_write: r.cache_write,

@@ -178,6 +178,7 @@ impl UsageSource for KiloSource {
                         model,
                         ts_ms,
                         caliber: Caliber::RequestDelta,
+                        request_count: 1,
                         input_uncached: i,
                         cache_read: cr,
                         cache_write: cw,

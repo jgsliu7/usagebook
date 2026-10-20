@@ -303,6 +303,7 @@ impl UsageSource for ClineSource {
                     model,
                     ts_ms,
                     caliber: Caliber::RequestDelta,
+                    request_count: 1,
                     input_uncached,
                     cache_read: cr,
                     cache_write: cw,

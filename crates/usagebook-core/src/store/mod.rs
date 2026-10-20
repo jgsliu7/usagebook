@@ -786,7 +786,14 @@ struct StoredRecord {
     output: u64,
     reasoning_output: u64,
     cost_usd: Option<f64>,
+    /// 旧载荷缺省(=1);回填日聚合行携带该日请求数
+    #[serde(default = "stored_request_count_one")]
+    request_count: i64,
     dedup_key: String,
+}
+
+fn stored_request_count_one() -> i64 {
+    1
 }
 
 impl From<&crate::model::UsageRecord> for StoredRecord {
@@ -808,6 +815,7 @@ impl From<&crate::model::UsageRecord> for StoredRecord {
             output: r.output,
             reasoning_output: r.reasoning_output,
             cost_usd: r.cost_usd,
+            request_count: u64::from(r.request_count) as i64,
             dedup_key: r.dedup_key.clone(),
         }
     }
@@ -842,6 +850,8 @@ impl From<StoredRecord> for crate::model::UsageRecord {
             output: r.output,
             reasoning_output: r.reasoning_output,
             cost_usd: r.cost_usd,
+            // 旧载荷无此列(默认 1);列存在时直取,max(1) 防 0
+            request_count: u32::try_from(r.request_count.max(1)).unwrap_or(u32::MAX),
             dedup_key: r.dedup_key,
         }
     }

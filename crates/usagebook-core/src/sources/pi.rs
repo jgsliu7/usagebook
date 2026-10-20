@@ -292,6 +292,7 @@ impl UsageSource for PiSource {
                                     model,
                                     ts_ms: ts,
                                     caliber: Caliber::RequestDelta,
+                                    request_count: 1,
                                     input_uncached: i,
                                     cache_read: cr,
                                     cache_write: cw,
