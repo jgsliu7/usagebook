@@ -97,6 +97,10 @@
 
 该规则不自动合并不同输入拆分、缺少总 `cache_creation_input_tokens` 的分段记录或退化键。参考项目中 split 先于总量到达的合成测试不作为本项目真机支持证明。键碰撞观察使用完整五桶,TTL 补全或冲突不单独认定为不同请求撞键。
 
+### 本项目退化键修订(2026-10-19)
+
+`requestId` 缺失时的退化键改为 `session_id + message.id`(**不含 timestamp**),与上文第 2 条照抄的 ccusage `hash(session_id, timestamp)` 收窄方式不同。原因:无 requestId 的流式重写会以不同 timestamp 重复落同一 `message.id`(本机实测同 usage 重复 33~54 行),键含 ts 时这些重复行全部逃过去重,总量虚高 1.5~2 倍。精确键(`message.id + requestId`)与跨会话副本(键含 session)行为不变;`message.id` 也缺失时才退到 `session_id + ts`。回归测试 `crates/usagebook-core/tests/claude_stream_dedup.rs`;修复记录见根仓库 docs/bugs/20261019-claude源token统计虚高/。
+
 ## 6. 开源实现参考(✅)
 
 | 项目 | 关键实现 | 位置 |

@@ -2,7 +2,7 @@
 //!
 //! 根:~/.claude/projects(CLAUDE_CONFIG_DIR 逗号多根 + XDG 回退)
 //! 行:assistant.message.usage 四字段(exclusive,input 不含 cache)
-//! 去重:精确键 message.id+requestId → 退化键 session+ts+msg_id;token 大者胜
+//! 去重:精确键 message.id+requestId → 退化键 session+message.id(msg_id 缺失才用 session+ts);token 大者胜
 //! 特殊:subagents/**/journal.jsonl 丢弃;<synthetic> 模型跳过;cost-state 作会话级基线
 
 use crate::common::*;
@@ -260,13 +260,20 @@ impl UsageSource for ClaudeSource {
                             cost_usd: None,
                             dedup_key: String::new(),
                         };
-                        // 三层键的 v1 简化:精确键优先,退化键兜底(档案 §5.2)
-                        let request_id = v.get("requestId").and_then(|x| x.as_str());
-                        let exact_key =
-                            !msg_id.is_empty() && request_id.is_some_and(|r| !r.is_empty());
-                        let key = match request_id {
-                            Some(r) if !r.is_empty() => format!("{}:{}", msg_id, r),
-                            _ => format!("{}:{}:{}", session_id, ts_ms, msg_id),
+                        // 三层键的 v1 简化:精确键优先,退化键兜底(档案 §5.2)。
+                        // 退化键不含 ts(2026-10-19 修):requestId 缺失时流式重写以不同 ts
+                        // 重复同一 message.id,含 ts 会让重复行全部逃过去重(实测虚高 1.5~2 倍)。
+                        let request_id = v
+                            .get("requestId")
+                            .and_then(|x| x.as_str())
+                            .filter(|r| !r.is_empty());
+                        let exact_key = !msg_id.is_empty() && request_id.is_some();
+                        let key = if let Some(r) = request_id {
+                            format!("{}:{}", msg_id, r)
+                        } else if !msg_id.is_empty() {
+                            format!("{}:{}", session_id, msg_id)
+                        } else {
+                            format!("{}:{}:", session_id, ts_ms)
                         };
                         let rec = UsageRecord {
                             dedup_key: key.clone(),
