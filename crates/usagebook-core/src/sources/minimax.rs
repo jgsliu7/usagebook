@@ -562,7 +562,11 @@ fn load_model_backfill(
         let sid = std::fs::read_to_string(&manifest)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.get("sessionId").and_then(|s| s.as_str()).map(str::to_string));
+            .and_then(|v| {
+                v.get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            });
         let sid = match sid {
             None => {
                 no_manifest += 1;
