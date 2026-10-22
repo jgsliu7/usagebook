@@ -101,6 +101,7 @@ I18N['zh-CN'] = {
   'st.arfOff': '自动刷新已关',
   'st.manualScan': '正在更新…',
   'st.arf': '自动刷新 {0}s({1}s 后)',
+  'st.nextRefresh': '距离下次刷新：{0}s',
   'st.srcDetail': '{0}：格式错误 {1} 行，未识别类型 {2} 行',
   'st.srcFailDetail': '{0}：本轮扫描失败，统计可能不完整。',
   'st.doctorHint': '可运行 usagebook doctor --check 排查；立即刷新可重新扫描。',

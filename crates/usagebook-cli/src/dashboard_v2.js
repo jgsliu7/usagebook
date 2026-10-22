@@ -360,7 +360,15 @@ function renderStatus() {
   if(rescanBusy)details.push(t('st.manualScan'));
   const isolated=(v2Status?.sources||[]).reduce((n,s)=>n+BigInt(s.isolated_objects||'0'),0n);
   if(isolated)details.push(words(`${isolated} 个文件已隔离`,`${isolated} files isolated`));
-  details.push(state.arf?t('st.arf',state.arf,Math.max(0,Math.ceil((arfNextAt-Date.now())/1000))):t('st.arfOff'));
+  const remaining=Math.max(0,Math.ceil((arfNextAt-Date.now())/1000));
+  const refreshDetail=state.arf?t('st.arf',state.arf,remaining):t('st.arfOff');
+  details.push(refreshDetail);
+  // Keep the ticking digits outside the live status message and reserve their space.
+  const countdown=$('#refresh-countdown');
+  countdown.hidden=!state.arf;
+  countdown.textContent=state.arf?t('st.nextRefresh',remaining):'';
+  countdown.title=refreshDetail;
+  countdown.setAttribute('aria-label',refreshDetail);
   const updating=!!(pending||v2Status?.refreshing||rescanBusy);
   const saved=loadFailed||rescanTimedOut||stale||isolated>0n||(scanNotice&&(v2Status?.refresh_error||failed));
   const el=$('#status'),text=t(updating?'st.shortUpdating':saved?'st.shortSaved':'st.shortReady');

@@ -101,6 +101,7 @@ I18N['en-US'] = {
   'st.arfOff': 'Auto refresh off',
   'st.manualScan': 'Updating…',
   'st.arf': 'Auto refresh {0}s (in {1}s)',
+  'st.nextRefresh': 'Next refresh: {0}s',
   'st.srcDetail': '{0}: {1} malformed line(s), {2} unknown-type line(s)',
   'st.srcFailDetail': '{0}: scan failed this round; stats may be incomplete.',
   'st.doctorHint': 'Run usagebook doctor --check to diagnose; refresh to rescan.',

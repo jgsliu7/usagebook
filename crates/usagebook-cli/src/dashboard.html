@@ -33,11 +33,13 @@
     border-bottom: 1px solid var(--border);
     margin-bottom: 18px;
   }
-  .header-summary { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+  .header-summary { display: flex; align-items: center; gap: 12px; min-width: 0; }
   .header-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 12px 16px; }
   header h1 { font-size: 20px; margin: 0; letter-spacing: .5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   header h1 .logo { color: var(--accent); }
-  #status { color: var(--muted); font-size: 12.5px; flex: 0 0 112px; width: 112px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .header-status { display: flex; flex-direction: column; flex: 0 0 148px; width: 148px; height: 38px; min-width: 0; color: var(--muted); font-size: 12.5px; line-height: 18px; }
+  #status { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #refresh-countdown { white-space: nowrap; font-variant-numeric: tabular-nums; }
   #btn-refresh {
     background: var(--panel2); color: var(--fg);
     border: 1px solid var(--border); border-radius: 8px;
@@ -188,7 +190,10 @@
   <header>
     <div class="header-summary">
     <h1 title=""><span class="logo">▸</span> usagebook <span style="color:var(--muted);font-weight:400" data-i18n="brand.sub">本机 Token 用量看板</span></h1>
-    <span id="status" aria-live="polite"><span class="st-meta" data-i18n="status.connecting">连接中…</span></span>
+    <span class="header-status">
+      <span id="status" aria-live="polite"><span class="st-meta" data-i18n="status.connecting">连接中…</span></span>
+      <span id="refresh-countdown" hidden></span>
+    </span>
     </div>
     <div class="header-actions">
     <span class="arf-wrap"><span data-i18n="lbl.lang">语言</span>
