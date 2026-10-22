@@ -137,6 +137,7 @@ pub fn build_snapshot(refresh_secs: u64, verbose: bool) -> Snapshot {
                 eprintln!("扫描 [{}/{}] {} …", i + 1, total, a.id());
             }
             let (recs, stats) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = common::take_walk_error();
                 let roots = a.discover_roots();
                 common::scan_source_cached(a.as_ref(), &roots)
             }))

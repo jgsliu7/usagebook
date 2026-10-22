@@ -53,7 +53,7 @@ cargo build --release --locked  # binary at target/release/usagebook
 
 If `~/.local/bin` is not on your PATH, run `export PATH="$HOME/.local/bin:$PATH"` first.
 
-Uninstall: `sh install.sh --uninstall` (removes the binary; your data stays under `~/.usagebook`, delete it manually if you want a full wipe).
+Uninstall: `sh install.sh --uninstall` removes the binary and keeps local data. The legacy cache is under `~/.usagebook`; the durable ledger is in the separate platform data directory described below. Remove either location only if you intend to erase its data.
 
 Prebuilt archives are not published yet. Once available, download them from [GitHub Releases](https://github.com/jgsliu7/usagebook/releases) (macOS universal and Linux x86_64; no Windows archive for now) — unzip and run `sh install.sh` inside; no Rust toolchain needed.
 
@@ -70,13 +70,13 @@ usagebook doctor     # discover source dirs; --check verifies parsing
 Claude Code now has an opt-in durable ledger. Other sources remain visible in the same dashboard and are marked **unprotected**:
 
 ```bash
-usagebook ledger init --timezone UTC
+usagebook ledger init --timezone UTC   # --timezone defaults to the system timezone
 usagebook ledger refresh --source claude
 usagebook ledger status
 usagebook serve
 ```
 
-Saved Claude usage survives source cleanup. Unchanged files skip body reads; damaged files are isolated, and the dashboard marks incomplete coverage. The ledger stores usage metadata, never conversation text. Request facts and daily summaries are retained; expired hourly caches can be recomputed from facts.
+Saved Claude usage survives source cleanup. Unchanged files skip body reads; damaged files are isolated, and the dashboard marks incomplete coverage. The ledger stores usage metadata, never conversation text. Request facts are retained; daily rollups can be recomputed from facts.
 
 The default `usage-ledger.db` lives in `~/Library/Application Support/usagebook/` on macOS, `$XDG_DATA_HOME/usagebook/` (default `~/.local/share/usagebook/`) on Linux, and `%LOCALAPPDATA%\usagebook\` on Windows. Override the complete filename with `USAGEBOOK_LEDGER_PATH`. The legacy scan-cache settings do not disable or delete this ledger.
 
@@ -104,7 +104,7 @@ usagebook keeps legacy scan-acceleration state at `~/.usagebook/` (logical base 
 - **What is never logged**: conversation content, any credentials (API keys/tokens/cookies), raw session lines; error messages contain only counts/paths/error codes;
 - **Retention**: dual date + size rolling (20MiB per file), 14 days by default, hard cap 200MiB per log directory (excluding the active files for today and the cross-midnight writer, each at most 20MiB), cleaned automatically by the process itself — no logrotate needed; crashes are additionally recorded in `panic.log` in the same directory;
 - **Disable**: `USAGEBOOK_LOG_DIR=off` (tune retention/total via `USAGEBOOK_LOG_KEEP_DAYS` / `USAGEBOOK_LOG_MAX_TOTAL`);
-- **Delete anytime**: `rm -rf ~/.usagebook/logs` — statistics are unaffected (the source files are the truth).
+- **Delete anytime**: `rm -rf ~/.usagebook/logs` — runtime logs are separate from both the durable ledger and source files, so deleting them does not change statistics.
 
 #### Environment variables
 
@@ -120,7 +120,7 @@ usagebook keeps legacy scan-acceleration state at `~/.usagebook/` (logical base 
 
 Per-source directory override variables: see `usagebook doctor` and the source docs.
 
-Troubleshooting: attach that directory when reporting issues (redact first — paths may expose your username and project names). `RUST_LOG=usagebook_core=debug` temporarily raises diagnostic verbosity (once set, the variable takes full control — a human-facing message and the file layer may both carry the same line; use `RUST_LOG=usagebook_core=debug,usagebook_cli=info` to also keep the per-round dashboard summary); `-v/-vv` only raises terminal output. Known limits: ① the log directory does not support network filesystems (NFS/SMB) or shared directories; ② when two `serve` instances run on different ports, the second instance's file logging degrades automatically (dashboard unaffected); lines may interleave within a tiny race window (recoverable — the source files are the truth); ③ after a system clock jump backwards, the day's log may land in a "future-dated" filename; ④ if today's shards are wiped externally across restarts, shard numbering restarts at 001; ⑤ under extreme faults (disk full, rotation failing persistently) the bound on usage is enforced by auto-disabling the file layer after consecutive write failures, not by the 200MiB cap.
+Troubleshooting: attach that directory when reporting issues (redact first — paths may expose your username and project names). `RUST_LOG=usagebook_core=debug` temporarily raises diagnostic verbosity (once set, the variable takes full control — a human-facing message and the file layer may both carry the same line; use `RUST_LOG=usagebook_core=debug,usagebook_cli=info` to also keep the per-round dashboard summary); `-v/-vv` only raises terminal output. Known limits: ① the log directory does not support network filesystems (NFS/SMB) or shared directories; ② when two `serve` instances run on different ports, the second instance's file logging degrades automatically (dashboard unaffected); lines may interleave within a tiny race window (runtime logs are diagnostic and do not affect the ledger or statistics); ③ after a system clock jump backwards, the day's log may land in a "future-dated" filename; ④ if today's shards are wiped externally across restarts, shard numbering restarts at 001; ⑤ under extreme faults (disk full, rotation failing persistently) the bound on usage is enforced by auto-disabling the file layer after consecutive write failures, not by the 200MiB cap.
 
 ## Disclaimer
 

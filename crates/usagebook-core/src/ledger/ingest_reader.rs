@@ -28,6 +28,12 @@ pub(super) struct Job {
 pub(super) struct IdentityJob {
     pub ledger: PathBuf,
     pub observation: Observation,
+    pub purpose: IdentityPurpose,
+}
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(super) enum IdentityPurpose {
+    CounterpartAlreadySuppressed,
+    IncomingAlreadySuppressed,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct IdentityProof {
@@ -490,8 +496,11 @@ fn run_identity(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
         let ledger = Ledger::open(&identity.ledger, false)?;
         require_stamp(&job.path, job.len, job.mtime)?;
         super::super::types::regression_stop("identity_before_body");
-        let proof =
-            prove_identity_connection_with(&ledger.conn, &identity.observation, &mut |n| {
+        let proof = prove_identity_connection_with(
+            &ledger.conn,
+            &identity.observation,
+            identity.purpose,
+            &mut |n| {
                 check_cancelled(job)?;
                 bytes += n;
                 budget_bytes += n;
@@ -506,7 +515,8 @@ fn run_identity(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
                     heartbeat = Instant::now();
                 }
                 Ok(())
-            })?;
+            },
+        )?;
         if budget_bytes > 0 {
             throttle_read(job, budget_bytes, &mut emit)?;
         }
@@ -570,6 +580,7 @@ pub(super) fn helper_input_backpressure_regression() -> Result<bool> {
         identity: Some(IdentityJob {
             ledger: PathBuf::from("unused"),
             observation,
+            purpose: IdentityPurpose::CounterpartAlreadySuppressed,
         }),
     };
     let started = Instant::now();

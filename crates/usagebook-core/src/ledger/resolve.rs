@@ -3,8 +3,15 @@
 use super::{metrics, types::*, Ledger};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 
-const RESOLVER_VERSION: &str = "ledger-resolver-v1";
+const RESOLVER_VERSION: &str = "ledger-resolver-v2";
+
+#[derive(Clone, Copy)]
+pub(crate) enum RebuildCause {
+    Automatic,
+    ExplicitDelete,
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct PublishSummary {
@@ -123,6 +130,8 @@ struct FrozenRun {
 
 /// Freeze every scope with new persisted evidence; failed or unread files are irrelevant.
 fn next_run(c: &Connection) -> Result<Option<FrozenRun>> {
+    // This tuple mirrors the fixed SQL projection and is destructured immediately.
+    #[allow(clippy::type_complexity)]
     let active:Option<(i64,String,String,i64,i64,Option<String>,String,String,i64)>=c.query_row(
         "SELECT run_id,identity_family,namespace_key,lower_observation_id,upper_observation_id,last_publish_key,epoch,resolver_version,identity_version FROM ingest_runs WHERE state='publishing' ORDER BY run_id LIMIT 1",[],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
@@ -132,8 +141,30 @@ fn next_run(c: &Connection) -> Result<Option<FrozenRun>> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     if let Some((id, family, namespace, lower, upper, last, re, rv, ri)) = active {
-        if re != epoch || rv != RESOLVER_VERSION || ri != iv {
+        if re != epoch
+            || ri != iv
+            || lower < 0
+            || upper < lower
+            || !matches!(rv.as_str(), "ledger-resolver-v1" | RESOLVER_VERSION)
+        {
             return Err(LedgerError::UpgradeRequiresDrain);
+        }
+        if rv != RESOLVER_VERSION {
+            if let Some(last) = &last {
+                let exists: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM usage_observations o WHERE o.identity_family=?1 AND o.namespace_key=?2 AND o.observation_id>?3 AND o.observation_id<=?4 AND (o.identity_key IS NOT NULL OR (o.identity_family='claude' AND o.fact_kind='request' AND o.native_message_id IS NOT NULL)) AND (CASE WHEN o.identity_family='claude' AND o.fact_kind='request' AND o.native_message_id IS NOT NULL THEN 'm:'||lower(hex(o.native_message_id)) ELSE 'k:'||o.identity_key END)=?5)",
+                    params![family,namespace,lower,upper,last], |r| r.get(0),
+                )?;
+                if !exists {
+                    return Err(LedgerError::UpgradeRequiresDrain);
+                }
+            }
+            // publish_key and its binary ordering are unchanged. This update is
+            // in the writer's IMMEDIATE transaction, before any remaining unit.
+            c.execute(
+                "UPDATE ingest_runs SET resolver_version=?1 WHERE run_id=?2 AND state='publishing'",
+                params![RESOLVER_VERSION, id],
+            )?;
         }
         return Ok(Some(FrozenRun {
             id,
@@ -201,7 +232,26 @@ impl Ledger {
                 regression_stop("t3_after_commit");
             }
             let Some(mut run) = r else { break };
-            make_run_units(&self.conn, &run)?;
+            // A bounded refresh calls publish_some repeatedly on this writer.
+            // The frozen run and TEMP keys have not changed between slices.
+            // A new process has an empty TEMP table and rebuilds it normally.
+            let cached: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ledger_run_units WHERE run_id=?1)",
+                [run.id],
+                |row| row.get(0),
+            )?;
+            if !cached {
+                make_run_units(&self.conn, &run)?;
+            }
+            if let Some(last) = &run.last {
+                let valid: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ledger_run_units WHERE run_id=?1 AND publish_key=?2)",
+                    params![run.id,last], |row| row.get(0),
+                )?;
+                if !valid {
+                    return Err(LedgerError::UpgradeRequiresDrain);
+                }
+            }
             loop {
                 // Separate first-page and resumed SQL so the composite key is a range seek.
                 let key: Option<String> = match &run.last {
@@ -216,7 +266,14 @@ impl Ledger {
                 if !valid {
                     return Err(LedgerError::StaleObservation);
                 }
-                let changed = rebuild_unit(&tx, &run.family, &run.namespace, &key, run.upper)?;
+                let changed = rebuild_unit(
+                    &tx,
+                    &run.family,
+                    &run.namespace,
+                    &key,
+                    run.upper,
+                    RebuildCause::Automatic,
+                )?;
                 if !changed {
                     super::db::bump(&tx)?;
                 }
@@ -568,6 +625,383 @@ fn decide(c: &Connection, canonical: &str) -> Result<Decision> {
     })
 }
 
+#[derive(Clone)]
+struct OldSelection {
+    key: String,
+    selected_id: i64,
+    state: String,
+    conflict: bool,
+    fact_kind: String,
+}
+
+fn insert_decision(
+    c: &Connection,
+    key: &str,
+    selected_id: Option<i64>,
+    state: &str,
+    conflict: bool,
+    fact_kind: &str,
+) -> Result<()> {
+    c.execute(
+        "INSERT INTO ledger_unit_decisions VALUES(?1,?2,?3,?4,?5)",
+        params![key, selected_id, state, i64::from(conflict), fact_kind],
+    )?;
+    Ok(())
+}
+
+fn monotonic_replacement(old: &Observation, new: &Observation) -> bool {
+    if old.fact_kind != new.fact_kind
+        || !matches!(
+            old.fact_kind.as_str(),
+            "session_total" | "session_cost" | "day"
+        )
+        || (old.fact_kind == "day"
+            && (old.revision_authority.as_deref() != Some("native-day-cumulative")
+                || new.revision_authority != old.revision_authority))
+    {
+        return false;
+    }
+    let a = Projection::from(old);
+    let b = Projection::from(new);
+    if a.fact_kind != b.fact_kind
+        || a.source != b.source
+        || a.tool != b.tool
+        || a.model != b.model
+        || a.session != b.session
+        || a.time != b.time
+        || a.date != b.date
+        || a.timezone != b.timezone
+        || a.day_start != b.day_start
+        || a.day_end != b.day_end
+    {
+        return false;
+    }
+    let (Ok(old_metrics), Ok(new_metrics)) =
+        (metrics::evaluate(&a.metrics), metrics::evaluate(&b.metrics))
+    else {
+        return false;
+    };
+    if old_metrics
+        .iter()
+        .zip(new_metrics.iter())
+        .any(|(old, new)| {
+            (old.state == ValueState::Exact && new.state != ValueState::Exact)
+                || old
+                    .known_value
+                    .is_some_and(|value| new.known_value.is_none_or(|next| next < value))
+        })
+    {
+        return false;
+    }
+    match (a.cost, b.cost) {
+        (Some((av, ascale, ac)), Some((bv, bscale, bc))) if ac == bc => {
+            let scale = ascale.max(bscale);
+            i128::from(bv) * 10_i128.pow((scale - bscale) as u32)
+                >= i128::from(av) * 10_i128.pow((scale - ascale) as u32)
+        }
+        (Some(_), _) => false,
+        _ => true,
+    }
+}
+
+fn cumulative_candidate(
+    c: &Connection,
+    canonical: &str,
+    old: &Observation,
+) -> Result<Option<Observation>> {
+    if !matches!(
+        old.fact_kind.as_str(),
+        "session_total" | "session_cost" | "day"
+    ) {
+        return Ok(None);
+    }
+    let mut q = c.prepare("SELECT o.* FROM ledger_unit_members m JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility='eligible' AND o.action='upsert' ORDER BY o.observation_id")?;
+    let candidates = q
+        .query_map([canonical], load_observation)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(q);
+    let growing: Vec<_> = candidates
+        .into_iter()
+        .filter(|o| monotonic_replacement(old, o))
+        .collect();
+    let best = growing.iter().find(|candidate| {
+        growing
+            .iter()
+            .all(|other| monotonic_replacement(other, candidate))
+    });
+    Ok(best.cloned())
+}
+
+fn cumulative_conflict(c: &Connection, canonical: &str, selected: &Observation) -> Result<bool> {
+    let mut q = c.prepare("SELECT o.* FROM ledger_unit_members m JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility<>'identity_only'")?;
+    let mut rows = q.query([canonical])?;
+    while let Some(row) = rows.next()? {
+        let candidate = load_observation(row)?;
+        if candidate.eligibility != "eligible"
+            || candidate.action != "upsert"
+            || !monotonic_replacement(&candidate, selected)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn automatic_decisions(
+    c: &Connection,
+    family: &str,
+    namespace: &str,
+    ambiguity: Option<bool>,
+) -> Result<()> {
+    let mut old = Vec::<OldSelection>::new();
+    let mut q = c.prepare("SELECT e.identity_key,e.selected_observation_id,e.state,e.has_conflict,e.fact_kind FROM ledger_unit_old_keys k CROSS JOIN usage_events e WHERE e.identity_family=?1 AND e.namespace_key=?2 AND e.identity_key=k.identity_key AND e.state<>'unresolved' ORDER BY e.identity_key")?;
+    let rows = q.query_map(params![family, namespace], |r| {
+        Ok(OldSelection {
+            key: r.get(0)?,
+            selected_id: r.get(1)?,
+            state: r.get(2)?,
+            conflict: r.get::<_, i64>(3)? != 0,
+            fact_kind: r.get(4)?,
+        })
+    })?;
+    for row in rows {
+        old.push(row?);
+    }
+    drop(q);
+    if let Some(identity_conflict) = ambiguity {
+        // A fallback may point at more than one full request. Keep published
+        // selections, but still admit a new full request if no old fallback
+        // for its session could already represent that request.
+        let mut old_fallback_sessions = BTreeSet::new();
+        let mut old_fallback_without_session = false;
+        for item in &old {
+            let (request, session): (Option<String>, Option<String>) = c.query_row(
+                "SELECT native_request_id,native_session_id FROM usage_observations WHERE observation_id=?1",
+                [item.selected_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if request.is_none() {
+                if let Some(session) = session {
+                    old_fallback_sessions.insert(session);
+                } else {
+                    old_fallback_without_session = true;
+                }
+            }
+        }
+        for item in &old {
+            insert_decision(
+                c,
+                &item.key,
+                Some(item.selected_id),
+                &item.state,
+                item.conflict || identity_conflict,
+                &item.fact_kind,
+            )?;
+        }
+        let mut q = c.prepare("SELECT DISTINCT m.canonical_key,o.native_session_id FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e CROSS JOIN usage_observations o WHERE e.raw_key=m.raw_key AND o.observation_id=e.id AND o.native_request_id IS NOT NULL AND o.eligibility<>'identity_only' ORDER BY m.canonical_key")?;
+        let full = q
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(q);
+        for (canonical, session) in full {
+            if old_fallback_without_session
+                || session
+                    .as_ref()
+                    .is_some_and(|s| old_fallback_sessions.contains(s))
+            {
+                continue;
+            }
+            let exists: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ledger_unit_decisions WHERE identity_key=?1)",
+                [&canonical],
+                |r| r.get(0),
+            )?;
+            if exists {
+                continue;
+            }
+            let decision = decide(c, &canonical)?;
+            let state = match decision.selected.as_ref() {
+                None => "unresolved",
+                Some(o) if o.action == "retract" => "retracted",
+                Some(_) => "active",
+            };
+            insert_decision(
+                c,
+                &canonical,
+                decision.selected.as_ref().map(|o| o.observation_id),
+                state,
+                decision.conflict,
+                &decision.fact_kind,
+            )?;
+        }
+        c.execute("INSERT OR IGNORE INTO ledger_unit_decisions SELECT m.raw_key,NULL,'unresolved',?3,MIN(o.fact_kind) FROM ledger_unit_members m JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key JOIN usage_observations o ON o.observation_id=e.id WHERE o.eligibility<>'identity_only' AND m.raw_key NOT IN(SELECT identity_key FROM ledger_unit_decisions) AND NOT EXISTS(SELECT 1 FROM identity_alias a WHERE a.identity_family=?1 AND a.namespace_key=?2 AND a.alias_key=m.raw_key) GROUP BY m.raw_key", params![family,namespace,i64::from(identity_conflict)])?;
+        c.execute("INSERT OR IGNORE INTO ledger_unit_alias SELECT a.alias_key,a.canonical_key FROM ledger_unit_old_keys k JOIN identity_alias a ON a.alias_key=k.identity_key WHERE a.identity_family=?1 AND a.namespace_key=?2", params![family,namespace])?;
+        return Ok(());
+    }
+    let mut groups = BTreeMap::<String, Vec<OldSelection>>::new();
+    for item in old {
+        let group: Option<String> = c
+            .query_row(
+                "SELECT canonical_key FROM ledger_unit_members WHERE raw_key=?1",
+                [&item.key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(group) = group {
+            groups.entry(group).or_default().push(item);
+        } else {
+            insert_decision(
+                c,
+                &item.key,
+                Some(item.selected_id),
+                &item.state,
+                item.conflict,
+                &item.fact_kind,
+            )?;
+        }
+    }
+    let mut blocked = BTreeSet::new();
+    for (group, selected) in &groups {
+        if selected.len() > 1 {
+            blocked.insert(group.clone());
+            for item in selected {
+                insert_decision(
+                    c,
+                    &item.key,
+                    Some(item.selected_id),
+                    &item.state,
+                    true,
+                    &item.fact_kind,
+                )?;
+            }
+        } else if group != &selected[0].key {
+            c.execute(
+                "UPDATE ledger_unit_members SET canonical_key=?1 WHERE canonical_key=?2",
+                params![selected[0].key, group],
+            )?;
+        }
+    }
+    let mut prior = BTreeMap::<String, OldSelection>::new();
+    for (group, selected) in groups {
+        if !blocked.contains(&group) {
+            prior.insert(selected[0].key.clone(), selected[0].clone());
+        }
+    }
+    let mut q =
+        c.prepare("SELECT DISTINCT canonical_key FROM ledger_unit_members ORDER BY canonical_key")?;
+    let keys = q
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(q);
+    for canonical in keys {
+        if blocked.contains(&canonical) {
+            continue;
+        }
+        let decision = decide(c, &canonical)?;
+        if let Some(previous) = prior.get(&canonical) {
+            let old_observation = c.query_row(
+                "SELECT o.* FROM usage_observations o WHERE o.observation_id=?1",
+                [previous.selected_id],
+                load_observation,
+            )?;
+            let cumulative = if previous.state == "active" {
+                cumulative_candidate(c, &canonical, &old_observation)?
+            } else {
+                None
+            };
+            let next = cumulative.as_ref();
+            let selected_id = next.map_or(previous.selected_id, |o| o.observation_id);
+            let conflict = previous.conflict
+                || if let Some(selected) = next {
+                    cumulative_conflict(c, &canonical, selected)?
+                } else {
+                    decision.conflict
+                        || decision.selected.as_ref().is_none_or(|candidate| {
+                            let mut projection = Projection::from(&old_observation);
+                            !projection.merge(&Projection::from(candidate), false)
+                        })
+                };
+            insert_decision(
+                c,
+                &canonical,
+                Some(selected_id),
+                &previous.state,
+                conflict,
+                &previous.fact_kind,
+            )?;
+        } else {
+            let state = match decision.selected.as_ref() {
+                None => "unresolved",
+                Some(o) if o.action == "retract" => "retracted",
+                Some(_) => "active",
+            };
+            insert_decision(
+                c,
+                &canonical,
+                decision.selected.as_ref().map(|o| o.observation_id),
+                state,
+                decision.conflict,
+                &decision.fact_kind,
+            )?;
+        }
+    }
+    if !blocked.is_empty() {
+        c.execute("INSERT OR IGNORE INTO ledger_unit_alias SELECT a.alias_key,a.canonical_key FROM ledger_unit_old_keys k JOIN identity_alias a ON a.alias_key=k.identity_key WHERE a.identity_family=?1 AND a.namespace_key=?2 AND a.canonical_key IN(SELECT identity_key FROM ledger_unit_decisions)", params![family,namespace])?;
+    }
+    c.execute("INSERT OR IGNORE INTO ledger_unit_alias SELECT canonical_key,canonical_key FROM ledger_unit_members WHERE raw_key<>canonical_key AND canonical_key IN(SELECT identity_key FROM ledger_unit_decisions)", [])?;
+    c.execute("INSERT OR IGNORE INTO ledger_unit_alias SELECT raw_key,canonical_key FROM ledger_unit_members WHERE raw_key<>canonical_key AND canonical_key IN(SELECT identity_key FROM ledger_unit_decisions)", [])?;
+    c.execute("INSERT OR IGNORE INTO ledger_unit_alias SELECT a.alias_key,a.canonical_key FROM ledger_unit_old_keys k JOIN identity_alias a ON a.alias_key=k.identity_key WHERE a.identity_family=?1 AND a.namespace_key=?2 AND a.alias_key NOT IN(SELECT alias_key FROM ledger_unit_alias) AND a.canonical_key IN(SELECT identity_key FROM ledger_unit_decisions)", params![family,namespace])?;
+    // Identity-only observations may prove a full key for an already published
+    // fallback. They cannot contribute usage, but the alias is needed for forget.
+    let mut q = c.prepare("SELECT DISTINCT o.identity_key,o.native_session_id,o.native_request_id FROM ledger_unit_evidence e CROSS JOIN usage_observations o WHERE o.observation_id=e.id AND o.eligibility='identity_only' AND o.native_session_id IS NOT NULL AND o.native_request_id IS NOT NULL")?;
+    let identity_rows = q
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(q);
+    for (full_key, session, request) in identity_rows {
+        let session_pairs: i64 = c.query_row(
+            "SELECT COUNT(*) FROM ledger_unit_pairs WHERE session_id=?1",
+            [&session],
+            |r| r.get(0),
+        )?;
+        let request_pairs: i64 = c.query_row(
+            "SELECT COUNT(*) FROM ledger_unit_pairs WHERE request_id=?1",
+            [&request],
+            |r| r.get(0),
+        )?;
+        if session_pairs != 1 || request_pairs != 1 {
+            continue;
+        }
+        let fallback: Option<String> = c.query_row("SELECT d.identity_key FROM ledger_unit_decisions d JOIN usage_observations o ON o.observation_id=d.selected_id WHERE d.state='active' AND o.native_session_id=?1 AND o.native_request_id IS NULL LIMIT 1", [&session], |r| r.get(0)).optional()?;
+        if let Some(fallback) = fallback {
+            let full_is_decision: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ledger_unit_decisions WHERE identity_key=?1)",
+                [&full_key],
+                |r| r.get(0),
+            )?;
+            if !full_is_decision {
+                c.execute(
+                    "INSERT OR IGNORE INTO ledger_unit_alias VALUES(?1,?2)",
+                    params![fallback, fallback],
+                )?;
+                c.execute(
+                    "INSERT OR IGNORE INTO ledger_unit_alias VALUES(?1,?2)",
+                    params![full_key, fallback],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Caller owns BEGIN IMMEDIATE. No source I/O and no evidence above `upper` is read.
 pub(crate) fn rebuild_unit(
     c: &Connection,
@@ -575,10 +1009,13 @@ pub(crate) fn rebuild_unit(
     namespace: &str,
     key: &str,
     upper: i64,
+    cause: RebuildCause,
 ) -> Result<bool> {
     create_work_tables(c)?;
     let ambiguous = prepare_unit(c, family, namespace, key, upper)?;
-    if let Some(identity_conflict) = ambiguous {
+    if matches!(cause, RebuildCause::Automatic) {
+        automatic_decisions(c, family, namespace, ambiguous)?;
+    } else if let Some(identity_conflict) = ambiguous {
         c.execute("UPDATE ledger_unit_members SET canonical_key=raw_key", [])?;
         c.execute("INSERT INTO ledger_unit_decisions SELECT m.raw_key,NULL,'unresolved',?1,MIN(o.fact_kind) FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE o.eligibility<>'identity_only' GROUP BY m.raw_key",[i64::from(identity_conflict)])?;
     } else {
@@ -691,12 +1128,13 @@ fn change_rollup(c: &Connection, o: &Observation, sign: i64) -> Result<()> {
     if sums.iter().any(|v| *v < 0) {
         return Err(LedgerError::CorruptLedger);
     }
-    c.execute("DELETE FROM usage_rollups WHERE derived_version=?1 AND grain='hour' AND local_day=?2 AND report_source=?3 AND model_key=?4",params![version,day,o.report_source,o.model_key])?;
     if sums[0] == 0 {
         c.execute("DELETE FROM usage_rollups WHERE derived_version=?1 AND grain='day' AND bucket_start_ms=?2 AND report_source=?3 AND model_key=?4",params![version,start,o.report_source,o.model_key])?;
         return Ok(());
     }
-    let mut names=String::from("derived_version,grain,bucket_start_ms,bucket_end_ms,local_day,report_source,model_key,hour_cache_revision,");
+    let mut names = String::from(
+        "derived_version,grain,bucket_start_ms,bucket_end_ms,local_day,report_source,model_key,",
+    );
     names.push_str(&columns);
     let mut args: Vec<rusqlite::types::Value> = vec![
         version.into(),
@@ -706,7 +1144,6 @@ fn change_rollup(c: &Connection, o: &Observation, sign: i64) -> Result<()> {
         day.into(),
         o.report_source.clone().into(),
         o.model_key.clone().into(),
-        rusqlite::types::Value::Null,
     ];
     args.extend(sums.into_iter().map(Into::into));
     let placeholders = (1..=args.len())

@@ -1,18 +1,19 @@
 //! Bounded loopback query server. Only live adapters retain a process-local history snapshot.
 use serde_json::{json, Value};
 use std::{
-    io::Read,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
-    },
+    collections::BTreeSet,
+    net::TcpListener,
+    sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
 };
-use tiny_http::{Header, Method, Request, Response};
+#[path = "ledger_transport.rs"]
+mod transport;
+use tiny_http::{Header, Method, Response};
+use transport::{Connection, Request};
 use usagebook_core::ledger::{
     db,
     legacy::{LegacySnapshot, LegacySourceStatus},
-    query::QueryService,
+    query::{ModelCatalogCache, QueryService},
     query_types::{CatalogRequest, QueryRequest, MAX_BODY},
     types::{new_epoch, now_ms},
     Ledger,
@@ -21,6 +22,7 @@ struct State {
     snapshot: Arc<LegacySnapshot>,
     snapshot_fingerprint: [u8; 32],
     refreshing: bool,
+    pending_force: bool,
     error: Option<String>,
     refresh_secs: u64,
     desired_ms: u64,
@@ -31,6 +33,33 @@ struct State {
     refresh_generation: u64,
 }
 impl State {
+    // A queued manual request is already busy. Requests waiting before the next
+    // forced scan starts coalesce; requests arriving during it require one more.
+    // All transitions use the same State mutex as status publication.
+    fn request_refresh(&mut self) {
+        self.pending_force = true;
+        self.refreshing = true;
+    }
+    fn begin_scan(&mut self, now: i64, first: bool, due: bool) -> Option<bool> {
+        let forced = self.pending_force;
+        let viewed = self.last_request_ms >= self.last_scan_started_ms;
+        let empty = self.last_scan_completed_ms.is_none();
+        if !(first || forced || (due && (empty || viewed))) {
+            return None;
+        }
+        self.pending_force = false;
+        self.refreshing = true;
+        self.last_scan_started_ms = now;
+        Some(forced)
+    }
+    fn complete_scan(&mut self, error: Option<String>) {
+        if error.is_none() {
+            self.last_scan_completed_ms = Some(now_ms());
+        }
+        self.error = error;
+        self.refresh_generation = self.refresh_generation.saturating_add(1);
+        self.refreshing = self.pending_force;
+    }
     fn publish_snapshot(&mut self, mut snapshot: LegacySnapshot, fingerprint: [u8; 32]) {
         snapshot.generation = if fingerprint == self.snapshot_fingerprint {
             self.snapshot.generation.clone()
@@ -111,8 +140,8 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
     if port == 0 || refresh_secs < 5 {
         crate::ledger_cli::fail("port must be positive; refresh interval >= 5 seconds", 2)
     }
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .unwrap_or_else(|e| crate::ledger_cli::fail(e, 3));
+    let server =
+        TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| crate::ledger_cli::fail(e, 3));
     usagebook_core::store::prune_bad_backups();
     let _ = usagebook_core::logging::global().activate("serve");
     let path = db::default_path();
@@ -125,9 +154,14 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
         None
     };
     let transient = if writer.is_none() {
+        let tz = db::host_timezone_hint().unwrap_or_else(|| {
+            eprintln!(
+                "LEDGER_TIMEZONE_HINT_FAILED：未能确定系统时区，未初始化看板临时按 UTC 折算日界。"
+            );
+            "UTC".to_string()
+        });
         Some(
-            db::live_connection("Asia/Shanghai")
-                .unwrap_or_else(|e| crate::ledger_cli::fail(&e, e.exit_code())),
+            db::live_connection(&tz).unwrap_or_else(|e| crate::ledger_cli::fail(&e, e.exit_code())),
         )
     } else {
         None
@@ -152,6 +186,7 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
         snapshot_fingerprint: initial.content_fingerprint(),
         snapshot: Arc::new(initial),
         refreshing: true,
+        pending_force: false,
         error: None,
         refresh_secs,
         desired_ms: 0,
@@ -161,35 +196,24 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
         last_scan_completed_ms: None,
         refresh_generation: 0,
     }));
-    let trigger = Arc::new(AtomicBool::new(false));
     {
         let shared = shared.clone();
-        let trigger = trigger.clone();
         std::thread::spawn(move || {
             let mut writer = writer;
             let mut first = true;
             let mut last = Instant::now();
             let mut last_wall_ms = now_ms();
             loop {
-                let forced = trigger.swap(false, Ordering::AcqRel);
                 let now = now_ms();
-                let (interval_ms, viewed, empty) = {
-                    let state = shared.lock().unwrap();
-                    (
-                        state.effective_refresh_ms(now),
-                        state.last_request_ms >= state.last_scan_started_ms,
-                        state.last_scan_completed_ms.is_none(),
-                    )
+                let scan = {
+                    let mut state = shared.lock().unwrap();
+                    let interval_ms = state.effective_refresh_ms(now);
+                    let due = last.elapsed() >= Duration::from_millis(interval_ms)
+                        || now.saturating_sub(last_wall_ms).max(0) as u64 >= interval_ms;
+                    state.begin_scan(now, first, due)
                 };
-                let due = last.elapsed() >= Duration::from_millis(interval_ms)
-                    || now.saturating_sub(last_wall_ms).max(0) as u64 >= interval_ms;
-                if (first || forced || due) && (first || forced || empty || viewed) {
+                if let Some(forced) = scan {
                     first = false;
-                    {
-                        let mut state = shared.lock().unwrap();
-                        state.refreshing = true;
-                        state.last_scan_started_ms = now;
-                    }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                         || -> std::result::Result<LegacySnapshot, String> {
                             if std::env::var("USAGEBOOK_TEST_PANIC").as_deref() == Ok("1") {
@@ -216,10 +240,11 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
                                 .unwrap_or_else(|| transient.as_ref().unwrap());
                             let route_hash =
                                 QueryService::routing_hash(conn).map_err(|e| e.to_string())?;
+                            let previous_for_merge = shared.lock().unwrap().snapshot.clone();
                             {
-                                let previous = shared.lock().unwrap().snapshot.clone();
+                                let previous = &previous_for_merge;
                                 if previous.routing_hash != route_hash {
-                                    let mut snapshot = (*previous).clone();
+                                    let mut snapshot = (**previous).clone();
                                     snapshot.routing_hash = route_hash;
                                     for status in snapshot.sources.values_mut() {
                                         status.stale = true;
@@ -232,7 +257,50 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
                                         .publish_snapshot(snapshot, fingerprint);
                                 }
                             }
-                            crate::ledger_cli::load_legacy(conn).map_err(|e| e.to_string())
+                            let mut snapshot =
+                                crate::ledger_cli::load_legacy(conn).map_err(|e| e.to_string())?;
+                            // The interim LOADING snapshot may carry a new route hash while
+                            // still containing old live rows. Merge only against the snapshot
+                            // captured before that transition, and only for sources still live.
+                            let current_sources: BTreeSet<String> = snapshot
+                                .entries
+                                .iter()
+                                .map(|row| row.report_source().to_owned())
+                                .collect();
+                            let old_sources: BTreeSet<String> = previous_for_merge
+                                .entries
+                                .iter()
+                                .map(|row| row.report_source().to_owned())
+                                .collect();
+                            let failed: Vec<String> = snapshot
+                                .sources
+                                .iter()
+                                .filter(|(source, status)| {
+                                    status.stale
+                                        || status.error.is_some()
+                                        || (!current_sources.contains(source.as_str())
+                                            && old_sources.contains(source.as_str()))
+                                })
+                                .map(|(source, _)| source.clone())
+                                .collect();
+                            for source in failed {
+                                if !previous_for_merge.sources.contains_key(&source) {
+                                    continue;
+                                }
+                                snapshot.entries.retain(|row| row.report_source() != source);
+                                snapshot.entries.extend(
+                                    previous_for_merge
+                                        .entries
+                                        .iter()
+                                        .filter(|row| row.report_source() == source)
+                                        .cloned(),
+                                );
+                                if let Some(status) = snapshot.sources.get_mut(&source) {
+                                    status.stale = true;
+                                    status.error = Some("SOURCE_READ_FAILED".into());
+                                }
+                            }
+                            Ok(snapshot)
                         },
                     ));
                     let (snapshot, error) = match result {
@@ -263,12 +331,7 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
                     let fingerprint = snapshot.content_fingerprint();
                     let mut state = shared.lock().unwrap();
                     state.publish_snapshot(snapshot, fingerprint);
-                    if error.is_none() {
-                        state.last_scan_completed_ms = Some(now_ms());
-                    }
-                    state.error = error;
-                    state.refresh_generation = state.refresh_generation.saturating_add(1);
-                    state.refreshing = false;
+                    state.complete_scan(error);
                     last = Instant::now();
                     last_wall_ms = now_ms();
                 }
@@ -276,16 +339,17 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
             }
         });
     }
-    let (tx, rx) = mpsc::sync_channel::<Request>(2);
+    let (tx, rx) = mpsc::sync_channel::<Connection>(2);
     let rx = Arc::new(Mutex::new(rx));
     let assets = Arc::new(Assets::new());
+    let catalog_cache = Arc::new(ModelCatalogCache::default());
     for _ in 0..2 {
         let rx = rx.clone();
         let shared = shared.clone();
-        let trigger = trigger.clone();
         let path = path.clone();
         let stamp = stamp.clone();
         let assets = assets.clone();
+        let catalog_cache = catalog_cache.clone();
         std::thread::spawn(move || {
             let ledger = if db::exists_or_recoverable(&path) {
                 Some(
@@ -315,7 +379,9 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
-                handle(req, conn, &shared, &trigger, &assets, port);
+                if let Some(req) = Request::receive(req) {
+                    handle(req, conn, &shared, &assets, &catalog_cache, port);
+                }
             }
         });
     }
@@ -323,12 +389,19 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
     if open {
         crate::serve::open_dashboard(port)
     }
-    for req in server.incoming_requests() {
-        match tx.try_send(req) {
+    for stream in server.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!("HTTP accept failed: {error}");
+                continue;
+            }
+        };
+        match tx.try_send(Connection::new(stream)) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(req)) => error(req, 429, "BUSY"),
-            Err(mpsc::TrySendError::Disconnected(req)) => {
-                error(req, 503, "LEDGER_UNREADABLE");
+            Err(mpsc::TrySendError::Full(connection)) => connection.reject(),
+            Err(mpsc::TrySendError::Disconnected(connection)) => {
+                connection.reject();
                 break;
             }
         }
@@ -338,11 +411,11 @@ fn handle(
     mut req: Request,
     conn: &rusqlite::Connection,
     shared: &Arc<Mutex<State>>,
-    trigger: &AtomicBool,
     assets: &Assets,
+    catalog_cache: &ModelCatalogCache,
     port: u16,
 ) {
-    if !crate::serve::local_request(&req, port) {
+    if !crate::serve::local_request(req.headers(), port) {
         return error(req, 403, "FORBIDDEN");
     }
     let path = req.url().split('?').next().unwrap_or("/").to_owned();
@@ -385,7 +458,7 @@ fn handle(
         }
     }
     if path == "/api/v2/refresh" && req.method() == &Method::Post {
-        trigger.store(true, Ordering::Release);
+        shared.lock().unwrap().request_refresh();
         return response(
             req,
             json!({"refreshing":true}).to_string(),
@@ -411,7 +484,7 @@ fn handle(
             }),
         )
     };
-    let service = QueryService::new(conn, Some(&snapshot));
+    let service = QueryService::new(conn, Some(&snapshot)).with_catalog_cache(catalog_cache);
     let result: std::result::Result<Value, usagebook_core::ledger::query_types::QueryError> =
         if path == "/api/v2/status" && req.method() == &Method::Get {
             service.status().map(|mut s| {
@@ -438,15 +511,14 @@ fn handle(
             if req.body_length().is_some_and(|n| n > MAX_BODY) {
                 return error(req, 413, "BODY_TOO_LARGE");
             }
-            let mut bytes = Vec::new();
-            if req
-                .as_reader()
-                .take((MAX_BODY + 1) as u64)
-                .read_to_end(&mut bytes)
-                .is_err()
-            {
-                return error(req, 400, "INVALID_QUERY");
-            }
+            let bytes = match req.read_body() {
+                Ok(bytes) if bytes.len() <= MAX_BODY => bytes,
+                Ok(_) => return error(req, 413, "BODY_TOO_LARGE"),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return error(req, 408, "REQUEST_TIMEOUT");
+                }
+                Err(_) => return error(req, 400, "INVALID_QUERY"),
+            };
             if path == "/api/v2/query" {
                 QueryRequest::from_json(&bytes)
                     .and_then(|q| service.query(q))

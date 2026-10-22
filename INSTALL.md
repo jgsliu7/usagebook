@@ -22,7 +22,7 @@ sh install.sh
 "$HOME/.local/bin/usagebook" --version
 ```
 
-首次源码构建会下载锁定的依赖。只用已有依赖缓存可运行 `sh install.sh --offline`。期望版本输出为 `usagebook 0.1.0`。编译时间和磁盘占用取决于机器、网络与已有构建缓存，不承诺固定秒数。
+首次源码构建会下载锁定的依赖。只用已有依赖缓存可运行 `sh install.sh --offline`。期望版本输出为 `usagebook 0.2.0`。编译时间和磁盘占用取决于机器、网络与已有构建缓存，不承诺固定秒数。
 
 已具备上述工具并位于源码目录时，也可一条命令安装并打开看板：
 
@@ -104,7 +104,7 @@ cargo install --path crates/usagebook-cli --locked
 "$HOME/.local/bin/usagebook" serve --port 7879 --open
 ```
 
-看板仅绑定本机地址，图表库随程序分发，断网也可显示。首次扫描时间由日志体积决定；快照可加快后续启动，但不是永久历史账本。源工具删除旧日志后，统计可能减少。
+看板仅绑定本机地址，图表库随程序分发，断网也可显示。首次扫描时间由日志体积决定；快照可加快后续启动，但不是永久历史账本。已成功入账的 Claude 历史在源日志删除后仍保留；其他未保护来源的统计可能减少。
 
 运行中的程序只读取本机源文件并写入自己的缓存，不上传用量或会话，也不读取任何上传配置。获取源码、首次下载构建依赖和手动更新需要网络；系统浏览器自身的扩展与联网行为不由本程序控制。
 
@@ -116,6 +116,8 @@ USAGEBOOK_DATA_DIR=/absolute/path/usagebook-data "$HOME/.local/bin/usagebook" se
 
 `USAGEBOOK_DATA_DIR` 不会改变数据来源或复制原始日志。
 
+Claude Code 的长期账本是另一份数据，需按 [README 的长期账本步骤](README.md#长期账本首版)初始化；默认位于 macOS 的 `~/Library/Application Support/usagebook/usage-ledger.db` 或 Linux 的 `${XDG_DATA_HOME:-~/.local/share}/usagebook/usage-ledger.db`，也可用 `USAGEBOOK_LEDGER_PATH` 指定完整路径。清理 `~/.usagebook/` 扫描缓存不会清理它；删除账本文件则会丢失已保存的历史，请先用 `usagebook ledger backup` 备份。
+
 ## 4. 终端报表与导出
 
 ```bash
@@ -123,7 +125,7 @@ USAGEBOOK_DATA_DIR=/absolute/path/usagebook-data "$HOME/.local/bin/usagebook" se
 "$HOME/.local/bin/usagebook" --source codex --days 7 --json > usage-last-7-days.json
 ```
 
-统计的是可读取日志中的记录；来源、时间、模型覆盖都可能有限。费用金额不展示：各家工具计价差异很大且源数据覆盖不全，展示容易误导。CLI 的 JSON 示例导出 token 报表。报告问题时优先提供版本与 `doctor --check` 诊断计数，先脱敏路径和模型别名，不要提交原始会话或密钥。
+Claude Code 已入账的历史来自长期账本，其他来源仍统计可读取日志中的记录；来源、时间、模型覆盖都可能有限。费用金额不展示：各家工具计价差异很大且源数据覆盖不全，展示容易误导。CLI 的 JSON 示例导出 token 报表。报告问题时优先提供版本与 `doctor --check` 诊断计数，先脱敏路径和模型别名，不要提交原始会话或密钥。
 
 ## 5. 更新与卸载
 
@@ -139,7 +141,7 @@ sh install.sh
 
 发行包用户下载并校验新包、完整解压，在新包目录重新运行 `sh install.sh`。若使用自定义 `--prefix`，更新时传入相同目录。更新不会删除缓存或原始数据。
 
-升级/降级与本地状态库：状态库只是扫描加速缓存，统计真相始终在各工具的原始日志中。当前代次使用 `~/.usagebook/state.db.cache-p6-s2-l1/state.db`；解析语义、数据库结构或锁协议不兼容时会使用另一个目录，首次扫描重建。旧 `state.db` 和其他代次目录不会被读取、迁移或清理，因此新旧程序采用相同配置时可以同时运行。请勿将旧程序人为指向新版的实际库文件。
+升级/降级与本地状态库：`~/.usagebook/` 下的旧状态库只是扫描加速缓存；Claude 已入账历史保存在独立的 `usage-ledger.db`，不能通过重扫原始日志保证恢复。其他未保护来源仍依赖原始日志。当前缓存代次使用 `~/.usagebook/state.db.cache-p6-s2-l1/state.db`；解析语义、数据库结构或锁协议不兼容时会使用另一个目录，首次扫描重建。旧 `state.db` 和其他代次目录不会被读取、迁移或清理，因此新旧程序采用相同配置时可以同时运行。请勿将旧程序人为指向新版的实际库文件。
 
 `USAGEBOOK_STATE_DB` 现在是逻辑基址：`/x/custom.db` 对应 `/x/custom.db.cache-p6-s2-l1/state.db`，这是自定义路径配置的兼容变化；以 `usagebook doctor` 显示的实际路径为准。数据库连接整个生命周期持有目录外的稳定 `.lock` 文件锁。仅在所有使用者连接关闭、取得独占锁且确认损坏后，才会整体移动目录为 `<版本目录>.bad-<时间戳>-<序号>` 并重建。其他进程仍在使用，或出现锁冲突、权限、磁盘满等错误时，本进程改为全量扫描，不把这些错误当作损坏。当前代次的损坏备份最多保留三份。需要手动清理缓存或锁文件时，先停止所有使用该代次的 usagebook 进程。
 
@@ -149,7 +151,7 @@ sh install.sh
 sh "$HOME/.local/share/usagebook/install.sh" --uninstall
 ```
 
-自定义安装目录需同时传入相同的 `--prefix`。脚本只删除它管理的二进制和说明文件，保留缓存；仍运行的服务需在原终端按 Ctrl-C。若确定不再保留本产品缓存，可手动删除默认 `~/.usagebook`，或自己指定的 `USAGEBOOK_DATA_DIR`。不要删除任何 AI 工具的源目录。
+自定义安装目录需同时传入相同的 `--prefix`。脚本只删除它管理的二进制和说明文件，保留缓存与长期账本；仍运行的服务需在原终端按 Ctrl-C。若确定不再保留扫描缓存，可手动删除默认 `~/.usagebook`，或自己指定的 `USAGEBOOK_DATA_DIR`；这不会删除独立的长期账本。不要删除任何 AI 工具的源目录。
 
 Cargo 安装的程序使用 `cargo uninstall usagebook-cli` 卸载。
 

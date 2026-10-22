@@ -212,7 +212,7 @@ fn version_output_exact() {
     let out = Command::new(bin()).arg("--version").output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "usagebook 0.1.0"
+        "usagebook 0.2.0"
     );
     assert!(
         out.stderr.is_empty(),
@@ -625,7 +625,7 @@ fn verbose_flag_keeps_version_exact() {
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "usagebook 0.1.0"
+        "usagebook 0.2.0"
     );
     assert!(out.stderr.is_empty());
 }

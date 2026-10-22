@@ -1,4 +1,4 @@
-//! usagebook —— 各 AI 编程工具 token 用量统计(macOS 优先,Windows 实验性支持)。
+//! usagebook —— 各 AI 编程工具 token 用量统计。
 //! 数据源规范见 docs/数据源档案/(先档案、后代码)。
 //! 三种用法:
 //!   usagebook            终端报表扫描(--json 机器可读)
@@ -44,11 +44,7 @@ enum Command {
 }
 
 #[derive(Parser)]
-#[command(
-    name = "usagebook",
-    version,
-    about = "Mac/Windows 上各 AI 编程工具 token 用量统计"
-)]
+#[command(name = "usagebook", version, about = "本地 AI 编程工具 token 用量统计")]
 struct Args {
     /// 只统计指定数据源(源 id 见 usagebook doctor;仅终端报表生效,看板恒为全部)
     #[arg(long, default_value = "all")]

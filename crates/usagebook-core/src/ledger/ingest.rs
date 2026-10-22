@@ -21,6 +21,8 @@ use std::{
 
 const SLICE_BYTES: u64 = 4 * 1024 * 1024;
 const BATCH_ROWS: usize = 500;
+// Small files are cheaper to replay than to seal and verify on every append.
+const PREFIX_SEAL_MIN_BYTES: i64 = 1024 * 1024;
 #[derive(Debug, Default, Serialize)]
 pub struct RefreshSummary {
     pub files_seen: u64,
@@ -156,6 +158,31 @@ fn require_stamp(path: &Path, len: i64, mtime: Option<i64>) -> Result<()> {
         return Err(LedgerError::StaleObservation);
     }
     Ok(())
+}
+
+// A digest of every committed byte, not a sample of the beginning and end.
+// The stamp checks prevent certifying an ordinary concurrent rewrite as a
+// stable prefix. A missing or stale seal always falls back to full replay.
+fn hash_prefix(path: &Path, len: i64, mtime: Option<i64>, prefix_len: i64) -> Result<Vec<u8>> {
+    if prefix_len < 0 || prefix_len > len {
+        return Err(LedgerError::StaleObservation);
+    }
+    require_stamp(path, len, mtime)?;
+    let mut file = File::open(path).map_err(source_io)?;
+    let mut remaining = prefix_len as u64;
+    let mut hash = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..limit]).map_err(source_io)?;
+        if n == 0 {
+            return Err(LedgerError::StaleObservation);
+        }
+        hash.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    require_stamp(path, len, mtime)?;
+    Ok(hash.finalize().to_vec())
 }
 
 impl Ledger {
@@ -314,8 +341,39 @@ impl Ledger {
         if let Some(mut o) = old {
             let changed = o.len != len || o.mtime != mtime || o.state == "missing";
             if changed || o.state == "replay_required" {
+                // Only a completed, sealed old file can resume at its previous
+                // cursor. The full old prefix is verified before any new bytes
+                // enter the ledger; a rewrite takes the existing replay path.
+                if !full
+                    && o.state == "ready"
+                    && o.done
+                    && o.offset == o.len
+                    && o.len >= PREFIX_SEAL_MIN_BYTES
+                    && len > o.len
+                    && o.audit_due > now_ms()
+                {
+                    let seal: Option<Vec<u8>> = self.conn.query_row(
+                        "SELECT quick_fingerprint FROM source_objects WHERE object_id=?1",
+                        [o.id],
+                        |r| r.get(0),
+                    )?;
+                    if let Some(seal) = seal {
+                        if hash_prefix(path, len, mtime, o.len)? == seal {
+                            self.conn.execute(
+                                "UPDATE source_objects SET byte_length=?2,mtime_ns=?3,object_revision=object_revision+1,target_generation=content_generation,target_end=?2,target_done=0,last_observed_ms=?4,error_code=NULL,retry_after_ms=NULL,quick_fingerprint=NULL WHERE object_id=?1",
+                                params![o.id, len, mtime, now_ms()],
+                            )?;
+                            super::db::bump(&self.conn)?;
+                            o.len = len;
+                            o.mtime = mtime;
+                            o.revision += 1;
+                            o.done = false;
+                            return Ok(o);
+                        }
+                    }
+                }
                 let generation = new_epoch();
-                self.conn.execute("UPDATE source_objects SET content_generation=?2,byte_length=?3,mtime_ns=?4,object_revision=object_revision+1,state='ready',saved_offset=0,checkpoint_format=1,checkpoint=?5,target_generation=?2,target_end=?3,target_done=0,last_observed_ms=?6,error_code=NULL,retry_after_ms=NULL,audit_offset=0,audit_generation=NULL,audit_digest=NULL WHERE object_id=?1",params![o.id,generation,len,mtime,checkpoint(&generation,0),now_ms()])?;
+                self.conn.execute("UPDATE source_objects SET content_generation=?2,byte_length=?3,mtime_ns=?4,object_revision=object_revision+1,state='ready',saved_offset=0,checkpoint_format=1,checkpoint=?5,target_generation=?2,target_end=?3,target_done=0,last_observed_ms=?6,error_code=NULL,retry_after_ms=NULL,quick_fingerprint=NULL WHERE object_id=?1",params![o.id,generation,len,mtime,checkpoint(&generation,0),now_ms()])?;
                 super::db::bump(&self.conn)?;
                 o.generation = generation;
                 o.len = len;
@@ -325,14 +383,49 @@ impl Ledger {
                 o.done = false;
                 o.state = "ready".into();
                 o.retry = None;
-            } else if full
-                || (o.audit_due <= now_ms() && (explicit || !o.retry.is_some_and(|t| t > now_ms())))
-            {
-                self.conn.execute("UPDATE source_objects SET object_revision=object_revision+1,saved_offset=0,checkpoint_format=1,checkpoint=?2,target_generation=content_generation,target_end=byte_length,target_done=0,audit_offset=0 WHERE object_id=?1",params![o.id,checkpoint(&o.generation,0)])?;
-                super::db::bump(&self.conn)?;
-                o.offset = 0;
-                o.done = false;
-                o.revision += 1;
+            } else {
+                // Periodic audit for a sealed, unchanged file is a pure prefix
+                // hash check: no reparse and no reader job. A missing seal, a
+                // digest mismatch, or any read error falls through to the full
+                // re-read below, so in-place rewrites still re-enter the ledger.
+                let mut audit_verified = false;
+                if !full
+                    && o.state == "ready"
+                    && o.done
+                    && o.offset == o.len
+                    && o.len >= PREFIX_SEAL_MIN_BYTES
+                    && o.audit_due <= now_ms()
+                {
+                    let seal: Option<Vec<u8>> = self.conn.query_row(
+                        "SELECT quick_fingerprint FROM source_objects WHERE object_id=?1",
+                        [o.id],
+                        |r| r.get(0),
+                    )?;
+                    if let Some(seal) = seal {
+                        if let Ok(digest) = hash_prefix(path, len, mtime, o.len) {
+                            if digest == seal {
+                                let due = now_ms() + 86_400_000;
+                                self.conn.execute(
+                                    "UPDATE source_objects SET audit_completed_ms=?2,audit_due_ms=?3 WHERE object_id=?1",
+                                    params![o.id, now_ms(), due],
+                                )?;
+                                o.audit_due = due;
+                                audit_verified = true;
+                            }
+                        }
+                    }
+                }
+                if !audit_verified
+                    && (full
+                        || (o.audit_due <= now_ms()
+                            && (explicit || !o.retry.is_some_and(|t| t > now_ms()))))
+                {
+                    self.conn.execute("UPDATE source_objects SET object_revision=object_revision+1,saved_offset=0,checkpoint_format=1,checkpoint=?2,target_generation=content_generation,target_end=byte_length,target_done=0 WHERE object_id=?1",params![o.id,checkpoint(&o.generation,0)])?;
+                    super::db::bump(&self.conn)?;
+                    o.offset = 0;
+                    o.done = false;
+                    o.revision += 1;
+                }
             }
             return Ok(o);
         }
@@ -419,23 +512,39 @@ impl Ledger {
         if !valid {
             return Err(LedgerError::StaleObservation);
         }
+        // An appended or rewritten object has old candidates under its prior
+        // generation. Check those exact duplicates once before the normal
+        // collision-and-insert path; a first import keeps the cheaper path.
+        let first_generation: Option<String> = tx.query_row(
+            "SELECT content_generation FROM usage_observations INDEXED BY observations_object WHERE object_id=?1 ORDER BY observation_id LIMIT 1",
+            [o.id],
+            |r| r.get(0),
+        ).optional()?;
+        let replaying = first_generation.is_some_and(|generation| generation != o.generation);
         let mut inserted = 0;
         let mut duplicates = 0;
         let mut suppressed = 0;
         for observation in observations {
             if exact_suppressed(&tx, observation)? {
-                super::maintenance::suppress_incoming(&tx, observation)?;
+                super::maintenance::add_incoming_controls(&tx, observation)?;
                 suppressed += 1;
                 continue;
             }
             if weak_link(&tx, observation)? {
                 return Err(LedgerError::IdentityLinkNeedsReview);
             }
+            if replaying && unchanged_candidate(&tx, observation)? {
+                duplicates += 1;
+                continue;
+            }
             if insert_observation(&tx, observation)? {
                 inserted += 1;
             } else {
                 duplicates += 1;
             }
+        }
+        if suppressed > 0 {
+            super::maintenance::finish_incoming_suppression(&tx)?;
         }
         let new_revision:i64=tx.query_row("UPDATE source_objects SET saved_offset=?2,checkpoint_format=1,checkpoint=?3,object_revision=object_revision+1,target_done=?4,state=CASE WHEN ?4 OR state='replay_required' THEN 'ready' ELSE state END,error_code=CASE WHEN ?4 THEN NULL ELSE error_code END,failure_count=CASE WHEN ?4 THEN 0 ELSE failure_count END,retry_after_ms=CASE WHEN ?4 THEN NULL ELSE retry_after_ms END WHERE object_id=?1 RETURNING object_revision",params![o.id,offset,checkpoint(&o.generation,offset),done],|r|r.get(0))?;
         super::db::bump(&tx)?;
@@ -457,8 +566,26 @@ impl Ledger {
             return Ok(());
         }
         let digest = o.audit_hash.as_ref().unwrap().clone().finalize().to_vec();
-        self.conn.execute("UPDATE source_objects SET audit_completed_ms=?2,audit_due_ms=?3,audit_generation=content_generation,audit_offset=byte_length,audit_digest=?4 WHERE object_id=?1 AND target_done=1",params![o.id,now_ms(),now_ms()+86_400_000,digest])?;
+        self.conn.execute("UPDATE source_objects SET audit_completed_ms=?2,audit_due_ms=?3,quick_fingerprint=?4 WHERE object_id=?1 AND target_done=1",params![o.id,now_ms(),now_ms()+86_400_000,digest])?;
         summary.audit_completed += 1;
+        Ok(())
+    }
+
+    fn seal_completed_prefix(&self, o: &Object) -> Result<()> {
+        if !o.done || o.offset != o.len || o.len < PREFIX_SEAL_MIN_BYTES {
+            return Ok(());
+        }
+        // This is only a performance hint. A detected source change during
+        // hashing leaves it unsealed for a later full replay.
+        let digest = match hash_prefix(&o.path, o.len, o.mtime, o.len) {
+            Ok(digest) => digest,
+            Err(e) if is_source_error(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        self.conn.execute(
+            "UPDATE source_objects SET quick_fingerprint=?2 WHERE object_id=?1 AND content_generation=?3 AND saved_offset=byte_length AND target_done=1",
+            params![o.id, digest, o.generation],
+        )?;
         Ok(())
     }
 }
@@ -504,6 +631,21 @@ fn weak_link(conn: &rusqlite::Connection, o: &Observation) -> Result<bool> {
         return Ok(false);
     };
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE kind='identity_link' AND identity_family=?1 AND namespace_key=?2 AND link_version=1 AND link_key=?3)",params![o.identity_family,o.namespace_key,super::types::identity_link(&o.identity_family,&o.namespace_key,m)],|r|r.get(0))?)
+}
+fn suppressed_with_old_counterpart(conn: &rusqlite::Connection, o: &Observation) -> Result<bool> {
+    if o.identity_family != CLAUDE_FAMILY
+        || o.fact_kind != "request"
+        || o.native_message_id.is_none()
+        || !exact_suppressed(conn, o)?
+    {
+        return Ok(false);
+    }
+    let opposite_request_form = o.native_request_id.is_some();
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage_observations o INDEXED BY observations_claude_message_request WHERE o.identity_family='claude' AND o.namespace_key=?1 AND o.native_message_id=?2 AND o.fact_kind='request' AND (o.native_request_id IS NULL)=?3 AND NOT EXISTS(SELECT 1 FROM suppression_rules s WHERE s.kind='identity' AND s.identity_family=o.identity_family AND s.namespace_key=o.namespace_key AND s.identity_key=o.identity_key))",
+        params![o.namespace_key,o.native_message_id,opposite_request_form],
+        |r| r.get(0),
+    )?)
 }
 
 pub const OBSERVATION_COLUMNS:&str="observation_id,identity_family,namespace_key,identity_key,candidate_key,normalized_hash,object_id,content_generation,record_key,parser_version,identity_version,semantics_version,observed_ms,eligibility,action,revision_authority,revision_no,fact_kind,report_source,native_tool,model_key,model_display,session_key,native_session_id,native_message_id,native_request_id,occurred_ms,native_date,native_timezone,day_start_ms,day_end_ms,input_uncached,cache_read,cache_write,output_normal,output_reasoning,input_total,output_total,total_tokens,cache_write_1h,request_count,cost_state,cost_units,cost_scale,cost_currency";
@@ -592,6 +734,22 @@ fn num(v: Option<i64>) -> SqlValue {
     v.map(SqlValue::Integer).unwrap_or(SqlValue::Null)
 }
 /// Caller owns the candidate+checkpoint transaction.
+fn unchanged_candidate(conn: &rusqlite::Connection, o: &Observation) -> Result<bool> {
+    let existing: Option<Observation> = conn.query_row(
+        &format!("SELECT {OBSERVATION_COLUMNS} FROM usage_observations WHERE identity_family=?1 AND namespace_key=?2 AND candidate_key=?3 AND normalized_hash=?4"),
+        params![o.identity_family, o.namespace_key, o.candidate_key, o.normalized_hash],
+        observation_row,
+    ).optional()?;
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    // A changed identity or a hash collision still needs the original path's
+    // full checks; only the same native fact may bypass them.
+    Ok(existing.identity_key == o.identity_key
+        && native_identity_tuple(&existing) == native_identity_tuple(o)
+        && claude::normalized_bytes(&existing)? == claude::normalized_bytes(o)?)
+}
+
 pub(crate) fn insert_observation(conn: &rusqlite::Connection, o: &Observation) -> Result<bool> {
     if o.eligibility == "identity_only"
         && (o.native_message_id.is_none()
@@ -678,6 +836,7 @@ impl Ledger {
         &mut self,
         o: &Observation,
         proof: &reader::IdentityProof,
+        purpose: reader::IdentityPurpose,
     ) -> Result<()> {
         // Bind only the identity evidence: unrelated healthy commits and safe
         // cursor advances must not starve a completed probe.
@@ -707,9 +866,23 @@ impl Ledger {
         {
             return Err(LedgerError::StaleObservation);
         }
-        let suppressed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE kind='identity' AND identity_family=?1 AND namespace_key=?2 AND identity_key=?3)", params![o.identity_family,o.namespace_key,proof.counterpart], |r| r.get(0))?;
-        if !suppressed {
-            return Err(LedgerError::IdentityLinkNeedsReview);
+        match purpose {
+            reader::IdentityPurpose::CounterpartAlreadySuppressed => {
+                let suppressed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE kind='identity' AND identity_family=?1 AND namespace_key=?2 AND identity_key=?3)", params![o.identity_family,o.namespace_key,proof.counterpart], |r| r.get(0))?;
+                if !suppressed {
+                    return Err(LedgerError::IdentityLinkNeedsReview);
+                }
+            }
+            reader::IdentityPurpose::IncomingAlreadySuppressed => {
+                if !exact_suppressed(&tx, o)? {
+                    return Err(LedgerError::IdentityLinkNeedsReview);
+                }
+                let old: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM usage_observations WHERE identity_family=?1 AND namespace_key=?2 AND identity_key=?3 AND native_message_id=?4)",params![o.identity_family,o.namespace_key,proof.counterpart,message],|r|r.get(0))?;
+                if !old {
+                    return Err(LedgerError::IdentityLinkNeedsReview);
+                }
+                tx.execute("INSERT OR IGNORE INTO suppression_rules(kind,identity_family,namespace_key,identity_key,operation_id,created_ms)VALUES('identity',?1,?2,?3,'proved-late-identity',?4)",params![o.identity_family,o.namespace_key,proof.counterpart,now_ms()])?;
+            }
         }
         verify_identity_probe(&tx)?;
         super::maintenance::suppress_incoming(&tx, o)?;
@@ -727,11 +900,18 @@ pub(crate) fn prove_identity_connection(
     conn: &rusqlite::Connection,
     o: &Observation,
 ) -> Result<Option<String>> {
-    Ok(prove_identity_connection_with(conn, o, &mut |_| Ok(()))?.map(|proof| proof.counterpart))
+    Ok(prove_identity_connection_with(
+        conn,
+        o,
+        reader::IdentityPurpose::CounterpartAlreadySuppressed,
+        &mut |_| Ok(()),
+    )?
+    .map(|proof| proof.counterpart))
 }
 fn prove_identity_connection_with(
     conn: &rusqlite::Connection,
     o: &Observation,
+    purpose: reader::IdentityPurpose,
     progress: &mut impl FnMut(u64) -> Result<()>,
 ) -> Result<Option<reader::IdentityProof>> {
     let Some(message) = o.native_message_id.as_deref() else {
@@ -784,7 +964,10 @@ fn prove_identity_connection_with(
     } else {
         claude::identity_key("request/full", &[message, request.as_deref().unwrap()])
     };
-    let suppressed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE kind='identity' AND identity_family=?1 AND namespace_key=?2 AND identity_key=?3)",params![o.identity_family,o.namespace_key,counterpart],|r|r.get(0))?;
+    let suppressed = match purpose {
+        reader::IdentityPurpose::CounterpartAlreadySuppressed => conn.query_row("SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE kind='identity' AND identity_family=?1 AND namespace_key=?2 AND identity_key=?3)",params![o.identity_family,o.namespace_key,counterpart],|r|r.get(0))?,
+        reader::IdentityPurpose::IncomingAlreadySuppressed => exact_suppressed(conn,o)?,
+    };
     let current_epoch: String =
         conn.query_row("SELECT epoch FROM ledger_meta WHERE singleton=1", [], |r| {
             r.get(0)
@@ -1076,8 +1259,8 @@ struct ActiveRead {
     audit: bool,
     failed: bool,
     last_activity: Instant,
-    identity: Option<Observation>,
-    awaiting_identity: Option<Observation>,
+    identity: Option<(Observation, reader::IdentityPurpose)>,
+    awaiting_identity: Option<(Observation, reader::IdentityPurpose)>,
     deferred_identity: bool,
 }
 impl Ledger {
@@ -1194,7 +1377,9 @@ impl Ledger {
                     }
                     reader::Event::Identity { proof, .. } => {
                         let outcome = match (task.identity.as_ref(), proof.as_ref()) {
-                            (Some(o), Some(proof)) => self.apply_identity_proof(o, proof),
+                            (Some((o, purpose)), Some(proof)) => {
+                                self.apply_identity_proof(o, proof, *purpose)
+                            }
                             _ => Err(LedgerError::IdentityLinkNeedsReview),
                         };
                         match outcome {
@@ -1229,15 +1414,24 @@ impl Ledger {
                             active.insert(key, task);
                             continue;
                         }
-                        let weak = observations
-                            .iter()
-                            .find_map(|o| match weak_link(&self.conn, o) {
-                                Ok(true) => Some(Ok(o.clone())),
-                                Ok(false) => None,
-                                Err(e) => Some(Err(e)),
-                            })
-                            .transpose()?;
-                        if let Some(o) = weak {
+                        let mut weak = None;
+                        for o in &observations {
+                            if suppressed_with_old_counterpart(&self.conn, o)? {
+                                weak = Some((
+                                    o.clone(),
+                                    reader::IdentityPurpose::IncomingAlreadySuppressed,
+                                ));
+                                break;
+                            }
+                            if weak_link(&self.conn, o)? {
+                                weak = Some((
+                                    o.clone(),
+                                    reader::IdentityPurpose::CounterpartAlreadySuppressed,
+                                ));
+                                break;
+                            }
+                        }
+                        if let Some((o, purpose)) = weak {
                             // Stop this payload reader at its previous safe cursor.
                             // No usages from the blocked batch enter the database.
                             self.conn.execute("UPDATE source_objects SET state='error',error_code='IDENTITY_LINK_NEEDS_REVIEW',target_done=0,retry_after_ms=NULL WHERE object_id=?1", [task.object.id])?;
@@ -1247,7 +1441,7 @@ impl Ledger {
                                     && (!pool.has_quarantined_reader() || pool.helper_available())
                                 {
                                     identity_inflight = true;
-                                    task.awaiting_identity = Some(o);
+                                    task.awaiting_identity = Some((o, purpose));
                                 } else {
                                     // Retain only the object ID in the existing disk
                                     // queue after this payload reader has stopped.
@@ -1312,7 +1506,7 @@ impl Ledger {
                             self.requeue_object(&task.object, false, true, &mut next_turn)?;
                             continue;
                         }
-                        if let Some(observation) = task.awaiting_identity.take() {
+                        if let Some((observation, purpose)) = task.awaiting_identity.take() {
                             let probe_task = new_epoch();
                             let job = reader::Job {
                                 task: probe_task.clone(),
@@ -1328,6 +1522,7 @@ impl Ledger {
                                 identity: Some(reader::IdentityJob {
                                     ledger: self.path.clone(),
                                     observation: observation.clone(),
+                                    purpose,
                                 }),
                             };
                             // A timed-out native probe keeps its original slot.
@@ -1353,7 +1548,7 @@ impl Ledger {
                             } else {
                                 self.conn.execute("INSERT INTO acquisition_seen(object_id,probe_attempted) VALUES(?1,1) ON CONFLICT(object_id) DO UPDATE SET probe_attempted=1", [task.object.id])?;
                                 summary.identity_probes += 1;
-                                task.identity = Some(observation);
+                                task.identity = Some((observation, purpose));
                                 task.audit = false;
                                 task.failed = false;
                                 task.last_activity = Instant::now();
@@ -1399,6 +1594,8 @@ impl Ledger {
                                     self.complete_audit(&task.object, summary)?;
                                 }
                             }
+                        } else if task.object.done {
+                            self.seal_completed_prefix(&task.object)?;
                         }
                     }
                 }
@@ -1466,11 +1663,20 @@ pub fn identity_guard_change_regression(
     change: impl FnOnce(&mut Ledger) -> Result<()>,
 ) -> Result<()> {
     let reader = Ledger::open(ledger.path(), false)?;
-    let proof = prove_identity_connection_with(&reader.conn, observation, &mut |_| Ok(()))?
-        .ok_or(LedgerError::IncompleteEvidence)?;
+    let proof = prove_identity_connection_with(
+        &reader.conn,
+        observation,
+        reader::IdentityPurpose::CounterpartAlreadySuppressed,
+        &mut |_| Ok(()),
+    )?
+    .ok_or(LedgerError::IncompleteEvidence)?;
     drop(reader);
     change(ledger)?;
-    ledger.apply_identity_proof(observation, &proof)
+    ledger.apply_identity_proof(
+        observation,
+        &proof,
+        reader::IdentityPurpose::CounterpartAlreadySuppressed,
+    )
 }
 
 #[cfg(feature = "regression-hooks")]

@@ -3,6 +3,8 @@
 let v2Status = null, v2View = null, v2Controller = null, coldRetryTimer = null;
 let viewGeneration = 0, restoringSelection = true, manualRefresh = null, pendingQueryKey = null;
 let globalTotalsCache = null;
+const RETRY_WAIT_MS=180000, RETRY_DELAY_MS=5000, NOTICE_DELAY_MS=60000;
+let recoveryUntil=0, recoveryBase=null, loadFailureSince=null, scanIssueSince=null;
 const catalogs = {source:{items:[],next:null,total:'0'},model:{items:[],next:null,total:'0'}};
 const labels = {source:new Map(),model:new Map()};
 const modelColorIndices = new Map();
@@ -65,12 +67,38 @@ function sumMetricValues(values) {
   return {state:complete?'exact':known?'partial':'unknown',known_value:known||complete?total.toString():null};
 }
 function showLoadFailure(error) {
-  loadFailed = true;
-  if (DATA && DATA.ready) renderStatus();
-  else { $('#status').textContent=t('status.connFail'); setScanningText(t('status.connFailScan')); }
-  if (error && error.name !== 'AbortError') {
-    const note=$('#ledger-note');note.hidden=false;note.textContent=words('读取失败：','Unable to load: ')+error.message;
+  if(error?.name==='AbortError')return;
+  loadFailureSince??=Date.now();
+  if(DATA?.ready){
+    if(!recoveryUntil){recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=null;}
+    retryInBackground();
+    // Local statistics remain useful during a brief restart or connection hiccup.
+    if(Date.now()-loadFailureSince<NOTICE_DELAY_MS){renderStatus();return;}
+    loadFailed=true;$('#ledger-note').hidden=true;renderStatus();return;
   }
+  loadFailed=Date.now()-loadFailureSince>=NOTICE_DELAY_MS;
+  $('#status').textContent=t(loadFailed?'status.waiting':'status.connecting');
+  $('#status').title=[loadFailed?t('status.connFail'):'',t('status.connFailScan')].filter(Boolean).join('\n');
+  setScanningText(t('status.connFailScan'));$('#ledger-note').hidden=true;
+}
+function observeScanStatus(status) {
+  const issue=status.refresh_error||(status.sources||[]).some(s=>s.error&&s.error!=='LOADING');
+  if(issue)scanIssueSince??=Date.now();else scanIssueSince=null;
+  return !!issue;
+}
+function retryInBackground() {
+  if(document.hidden||manualRefresh||!recoveryUntil)return;
+  clearTimeout(coldRetryTimer);
+  const seq=loadSeq;
+  // Long scans can finish in their own time; after a while, just check less often.
+  const delay=Date.now()<recoveryUntil?RETRY_DELAY_MS:30000;
+  coldRetryTimer=setTimeout(()=>{coldRetryTimer=null;if(!document.hidden&&seq===loadSeq)load(true);},delay);
+}
+function resumeDashboard() {
+  recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=v2Status?.refresh_generation??null;
+  loadFailureSince=null;scanIssueSince=null;loadFailed=false;
+  if(DATA?.ready){$('#ledger-note').hidden=true;renderStatus();}
+  return load(true);
 }
 async function apiV2(path,body,signal) {
   const controller=new AbortController();
@@ -81,7 +109,7 @@ async function apiV2(path,body,signal) {
     return await Promise.race([
       (async()=>{
         const response=await fetch('/api/v2/'+path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined,cache:'no-store',signal:controller.signal});
-        let value;try{value=await response.json();}catch{throw new Error(`HTTP ${response.status}`);}
+        let value;try{value=await response.json();}catch(e){if(e.name==='AbortError')throw e;throw new Error(`HTTP ${response.status}`);}
         if(!response.ok){const detail=typeof value.error==='object'?value.error:{code:value.error,message:value.message};const e=new Error(detail?.message||`HTTP ${response.status}`);e.code=detail?.code;throw e;}
         return value;
       })(),
@@ -115,21 +143,26 @@ function registerLabels(dim,items) {
   for(const item of items){labels[dim].set(item.id,item.label);if(dim==='source')SRC_LABELS[item.id]=item.label;
     else if(item.color_index!=null)modelColorIndices.set(item.id,Number(item.color_index));}
 }
-async function readCatalog(dim,search='',append=false,signal) {
-  const sequence=++catalogSequences[dim],old=catalogs[dim], cursor=append?old.next:null;
-  const result=await apiV2('catalog',{dimension:dim,search,page:{limit:200,cursor}},signal);
-  if(signal?.aborted||sequence!==catalogSequences[dim])return result;
-  if(append&&old.stamp)verifyStamp(old,result);
-  registerLabels(dim,result.items);
-  if(!search)catalogs[dim]={items:append?[...old.items,...result.items]:result.items,next:result.next_cursor,total:result.total_count,stamp:result.stamp};
-  return result;
-}
 async function readFullCatalog(dim,signal) {
-  await readCatalog(dim,'',false,signal);
-  const stamp=catalogs[dim].stamp;
-  while(catalogs[dim].next&&!signal?.aborted){
-    const page=await readCatalog(dim,'',true,signal);
-    verifyStamp({stamp},page);
+  const sequence=++catalogSequences[dim];
+  // Selection recovery must only see complete directories, even after a failed page.
+  for(let attempt=0;attempt<2;attempt++){
+    try{
+      const items=[];let first=null,cursor=null;
+      do{
+        const page=await apiV2('catalog',{dimension:dim,search:'',page:{limit:200,cursor}},signal);
+        if(signal?.aborted||sequence!==catalogSequences[dim])return;
+        if(first)verifyStamp(first,page);else first=page;
+        items.push(...page.items);cursor=page.next_cursor;
+      }while(cursor);
+      registerLabels(dim,items);
+      catalogs[dim]={items,next:null,total:first.total_count,stamp:first.stamp};
+      return;
+    }catch(e){
+      if(signal?.aborted||sequence!==catalogSequences[dim])return;
+      if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code))continue;
+      throw e;
+    }
   }
 }
 function syncSelections() {
@@ -170,7 +203,7 @@ async function fetchDashboard(signal) {
   const globalKey=stampKey(response.stamp)+'|'+response.as_of_ms;
   const isGlobal=query.window.kind==='all'&&query.sources.mode==='all'&&query.models.mode==='all';
   let globalMetrics=isGlobal?payload.totals.metrics:globalTotalsCache?.key===globalKey?globalTotalsCache.metrics:null;
-  if(isGlobal)globalTotalsCache={key:globalKey,metrics:globalMetrics};
+  if(isGlobal&&!signal?.aborted)globalTotalsCache={key:globalKey,metrics:globalMetrics};
   if(!globalMetrics)extra.push(apiV2('query',{kind:'totals',query:{...fixed,window:{kind:'all'},sources:{mode:'all'},models:{mode:'all'},group_by:'none',metric:'total'}},signal).then(r=>{
     verifyStamp(response,r);globalMetrics=r.payload.data.metrics;
     if(!signal?.aborted)globalTotalsCache={key:globalKey,metrics:globalMetrics};
@@ -198,40 +231,57 @@ async function load(passive) {
   const seq=++loadSeq;pendingQueryKey=currentQueryKey();v2Controller?.abort();const controller=v2Controller=new AbortController();
   clearTimeout(coldRetryTimer);coldRetryTimer=null;
   try {
-    const status=await apiV2('status?arf='+(passive===true?'':state.arf),undefined,controller.signal);
-    if(seq!==loadSeq)return;v2Status=status;
+    let status=await apiV2('status?arf='+(passive===true?'':state.arf),undefined,controller.signal);
+    if(seq!==loadSeq)return {ok:false,superseded:true};v2Status=status;
+    let scanIssue=observeScanStatus(status);
     registerLabels('source',(status.sources||[]).map(s=>({id:s.id,label:s.label||s.id})));
     if(!status.ready){
-      if(!DATA){$('#app').hidden=true;$('#scanning').hidden=false;setScanningText(status.refresh_error?t('status.scanFailRetry'):t('scan.first'));}
-      else renderStatus();
-      coldRetryTimer=setTimeout(()=>load(true),status.refresh_error?5000:3000);return;
+      loadFailureSince=null;loadFailed=false;
+      if(!DATA){
+        $('#app').hidden=true;$('#scanning').hidden=false;setScanningText(status.refresh_error?t('status.scanFailRetry'):t('scan.first'));
+        coldRetryTimer=setTimeout(()=>{if(!document.hidden)load(true);},status.refresh_error?5000:3000);
+      }else{
+        renderStatus();if(!recoveryUntil){recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=status.refresh_generation;}
+        retryInBackground();
+      }
+      return {ok:false,pending:true};
     }
     // Source membership is as-of dependent; model names are snapshot metadata.
     const changedCatalogs=['source','model'].filter(dim=>dim==='source'||!catalogs[dim].stamp||stampKey(catalogs[dim].stamp)!==stampKey(status.stamp));
     if(changedCatalogs.length){
       await Promise.all(changedCatalogs.map(dim=>readFullCatalog(dim,controller.signal)));
-      if(seq!==loadSeq)return;
+      if(seq!==loadSeq)return {ok:false,superseded:true};
       syncSelections();
     }
     pendingQueryKey=currentQueryKey();
     let next;
     for(let attempt=0;attempt<2;attempt++){
       try{next=await fetchDashboard(controller.signal);break;}
-      catch(e){if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){v2Status=await apiV2('status?arf=',undefined,controller.signal);continue;}throw e;}
+      catch(e){if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){status=v2Status=await apiV2('status?arf=',undefined,controller.signal);scanIssue=observeScanStatus(status);continue;}throw e;}
     }
-    if(seq!==loadSeq)return;
+    if(seq!==loadSeq)return {ok:false,superseded:true};
     // Only the server's global check may invalidate a restored nonempty model selection.
     if(restoringSelection&&state.mdlSel&&!state.mdlSel.exclude&&state.mdlSel.size&&next.response.warnings.includes('ALL_SELECTED_MODELS_UNKNOWN')){
       restoringSelection=false;state.mdlSel=null;persist(MDL_LS_KEY,null);return load(true);
     }
-    restoringSelection=false;v2View=next;loadFailed=false;
+    restoringSelection=false;v2View=next;loadFailed=false;loadFailureSince=null;
     registerLabels('source',next.tables.source.rows);registerLabels('model',next.tables.model.rows);
     if(state.metric==='cw'&&!cwVisible()){state.metric='total';segSync('#seg-metric',v=>v==='total');return load(true);}
     DATA={ready:true,generated_at_ms:Number(status.generated_at_ms||next.response.as_of_ms),view_generation:++viewGeneration,last_scan_failed:!!status.refresh_error,version:status.version,sources:status.sources||[]};
     if(!status.refresh_error&&BigInt(status.refresh_generation||'0')!==BigInt(rescanTimedOutGen||'0'))rescanTimedOut=false;
     $('#scanning').hidden=true;$('#app').hidden=false;
     prepareDays();next.key=currentQueryKey();renderPayload();
-  } catch(e){if(seq===loadSeq&&e.name!=='AbortError'){showLoadFailure(e);if(!DATA)coldRetryTimer=setTimeout(()=>load(true),5000);}}
+    if(!recoveryUntil&&(status.refreshing||scanIssue)){recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=status.refresh_generation;}
+    if(recoveryUntil){
+      if(!status.refreshing&&!scanIssue&&(recoveryBase===null||status.refresh_generation!==recoveryBase)){recoveryUntil=0;recoveryBase=null;clearTimeout(coldRetryTimer);coldRetryTimer=null;}
+      else retryInBackground();
+    }
+    return {ok:true,status};
+  } catch(e){
+    if(seq!==loadSeq||e.name==='AbortError')return {ok:false,superseded:true};
+    showLoadFailure(e);if(!DATA)coldRetryTimer=setTimeout(()=>{if(!document.hidden)load(true);},5000);
+    return {ok:false};
+  }
   finally {if(seq===loadSeq)pendingQueryKey=null;}
 }
 function render() {
@@ -270,37 +320,53 @@ function renderPayload() {
 }
 function renderCards() {
   const d=v2View.response.payload.data,m=d.totals.metrics, none=(state.srcSel&&!state.srcSel.exclude&&!state.srcSel.size)||(state.mdlSel&&!state.mdlSel.exclude&&!state.mdlSel.size);
-  const sub=(none?t('cards.noneSel'):rangeLabel())+' · '+t('cards.requests',metricText(m.requests,false))+((state.srcSel||state.mdlSel)&&!none?t('cards.filtered'):'');
+  const sub=(none?t('cards.noneSel'):state.win==='today'?t('seg.today'):rangeLabel())+' · '+t('cards.requests',metricText(m.requests,false))+((state.srcSel||state.mdlSel)&&!none?t('cards.filtered'):'');
+  // 对比段是已转义 HTML:文本部分过 escapeHtml,仅注入受控 .delta 方向片;三角 aria-hidden,方向语义由 +/- 承载。
+  // 方向按取整后的百分比取号(取整为 0 视为持平)。两侧 exact 才显示百分比;任一侧 partial(live 来源缺字段的下界值,
+  // 实机常态)只给方向、title 注明按已知部分比较;任一侧 unknown 不给方向
   let comparison='';const previous=d.comparison;
-  if(previous?.comparable){const a=m.total,b=previous.totals.metrics.total;if(a.state==='exact'&&b.state==='exact'&&a.known_value!=null&&b.known_value!=null){
-    const current=BigInt(a.known_value),before=BigInt(b.known_value);
-    if(before>0n){const diff=current-before,rounded=(diff<0n?-((-diff*100n+before/2n)/before):((diff*100n+before/2n)/before));comparison=' · vs '+comparisonLabel()+' '+(rounded>=0n?'+':'')+rounded+'%';}
-    else if(current>0n)comparison=' · vs '+comparisonLabel()+t('cmp.zeroPrev');
-  }else comparison=' · '+comparisonLabel()+': '+metricText(b);}
+  if(previous?.comparable){
+    const a=m.total,b=previous.totals.metrics.total,label=comparisonLabel();
+    const known=a.known_value!=null&&b.known_value!=null&&a.state!=='unknown'&&b.state!=='unknown';
+    const exact=known&&a.state==='exact'&&b.state==='exact';
+    let dir=0,rounded=0n,before=0n;
+    if(known){const current=BigInt(a.known_value);before=BigInt(b.known_value);
+      if(before>0n){const diff=current-before;rounded=diff<0n?-((-diff*100n+before/2n)/before):(diff*100n+before/2n)/before;dir=rounded>0n?1:rounded<0n?-1:0;}
+      else if(current>0n)dir=1;}
+    const arrow=(inner,title)=>`<span class="delta ${dir>0?'up':'down'}"${title?` title="${escapeHtml(title)}"`:''}><span aria-hidden="true">${dir>0?'▲':'▼'}</span>${inner}</span>`;
+    if(!exact)comparison=escapeHtml(' · '+label+': '+metricText(b))+(dir?' '+arrow('',words('按已知部分比较,方向仅供参考','Direction from known portions only; indicative')):'');
+    else if(before>0n)comparison=escapeHtml(' · vs '+label+' ')+(dir?arrow(' '+(dir>0?'+':'')+rounded+'%'):'0%');
+    else if(dir)comparison=escapeHtml(' · vs '+label+' ')+arrow('')+' '+escapeHtml(t('cmp.zeroPrev'));
+  }
   const hasTotal=m.total.known_value!=null&&BigInt(m.total.known_value)>0n;
-  const items=[[t('card.total'),m.total,sub+comparison,true],[t('card.input'),m.input_uncached,hasTotal?ratioText(m.input_uncached,m.total)+t('card.inputSub'):'—'],[t('card.cr'),m.cache_read,hasTotal?ratioText(m.cache_read,m.total)+t('card.crSub'):'—']];
+  const items=[[t('card.total'),m.total,sub,true,comparison],[t('card.input'),m.input_uncached,hasTotal?ratioText(m.input_uncached,m.total)+t('card.inputSub'):'—'],[t('card.cr'),m.cache_read,hasTotal?ratioText(m.cache_read,m.total)+t('card.crSub'):'—']];
   if(cwVisible())items.push([t('card.cw'),m.cache_write,hasTotal?ratioText(m.cache_write,m.total)+t('card.cwSub'):'—']);
   items.push([t('card.output'),m.output_combined,hasTotal?ratioText(m.output_combined,m.total)+t('card.reasonShare',ratioText(m.reasoning_output,m.output_combined)):'—']);
-  $('#cards').innerHTML=items.map(([label,value,detail,highlight])=>`<div class="card${highlight?' hl':''}"><div class="k">${escapeHtml(label)}</div><div class="v" title="${escapeHtml(metricTitle(value))}">${escapeHtml(metricText(value))}</div><div class="sub">${escapeHtml(detail)}</div></div>`).join('');
+  $('#cards').innerHTML=items.map(([label,value,detail,highlight,delta])=>`<div class="card${highlight?' hl':''}"><div class="k">${escapeHtml(label)}</div><div class="v" title="${escapeHtml(metricTitle(value))}">${escapeHtml(metricText(value))}</div><div class="sub">${escapeHtml(detail)}${delta||''}</div></div>`).join('');
 }
 function renderStatus() {
   if(!DATA?.ready)return;
-  const bits=[],asOf=t('status.dataAsOf',localDate(DATA.generated_at_ms)),stale=localDayStr(new Date(DATA.generated_at_ms))!==localDayStr();
-  const warning=text=>`<span class="st-warn">${escapeHtml(text)}</span>`;
-  if(loadFailed)bits.push(warning(t('st.connFailShow')));else if(v2Status?.refresh_error)bits.push(warning(t('st.scanFailShow')));
-  else if(stale)bits.push(warning(t('st.waitData')));
-  if(loadFailed||v2Status?.refresh_error||stale)bits.push(escapeHtml(asOf));
-  if(pendingQueryKey&&pendingQueryKey!==v2View?.key)bits.push(words('正在读取所选范围…','Loading selected range…'));
+  const asOf=t('status.dataAsOf',localDate(DATA.generated_at_ms)),stale=localDayStr(new Date(DATA.generated_at_ms))!==localDayStr();
+  const details=[asOf];
+  const scanNotice=scanIssueSince!==null&&Date.now()-scanIssueSince>=NOTICE_DELAY_MS;
+  if(loadFailed)details.push(t('st.connFailShow'));else if(v2Status?.refresh_error&&scanNotice)details.push(t('st.scanFailShow'));
+  if(stale)details.push(t('st.waitData'));
+  const pending=(pendingQueryKey&&pendingQueryKey!==v2View?.key)||(v2View&&v2View.key!==currentQueryKey());
+  if(pending)details.push(words('正在读取所选范围…','Loading selected range…'));
   const failed=(v2Status?.sources||[]).filter(s=>s.error&&s.error!=='LOADING').length;
-  if(failed)bits.push(warning(t('st.srcFailed',failed)));
-  if(rescanTimedOut)bits.push(warning(t('st.rescanTimeout')));
-  if(v2Status?.refreshing)bits.push(`<span class="st-scan">${t('st.bgScan')}</span>`);
-  if(rescanBusy)bits.push(`<span class="st-scan">${t('st.manualScan')}</span>`);
+  if(failed&&scanNotice)details.push(t('st.srcFailed',failed));
+  if(rescanTimedOut)details.push(t('st.rescanTimeout'));
+  if(v2Status?.refreshing)details.push(t('st.bgScan'));
+  if(rescanBusy)details.push(t('st.manualScan'));
   const isolated=(v2Status?.sources||[]).reduce((n,s)=>n+BigInt(s.isolated_objects||'0'),0n);
-  if(isolated)bits.push(warning(words(`${isolated} 个文件已隔离`,`${isolated} files isolated`)));
-  if(!state.arf)bits.push(t('st.arfOff'));else if(!rescanBusy)bits.push(`<span aria-hidden="true">${t('st.arf',state.arf,Math.max(0,Math.ceil((arfNextAt-Date.now())/1000)))}</span>`);
-  const el=$('#status'),text=bits.join(' · ');if(el.dataset.last!==text){if(text.includes('<'))el.innerHTML=text;else el.textContent=text;el.dataset.last=text;}
-  el.title=[t('status.dataAsOf',localDate(DATA.generated_at_ms)),...dataNotes(),...(v2Status?.sources||[]).filter(s=>s.error).map(s=>`${srcLabel(s.id)}: ${s.error}`),v2Status?.refresh_error||''].filter(Boolean).join('\n');
+  if(isolated)details.push(words(`${isolated} 个文件已隔离`,`${isolated} files isolated`));
+  details.push(state.arf?t('st.arf',state.arf,Math.max(0,Math.ceil((arfNextAt-Date.now())/1000))):t('st.arfOff'));
+  const updating=!!(pending||v2Status?.refreshing||rescanBusy);
+  const saved=loadFailed||rescanTimedOut||stale||isolated>0n||(scanNotice&&(v2Status?.refresh_error||failed));
+  const el=$('#status'),text=t(updating?'st.shortUpdating':saved?'st.shortSaved':'st.shortReady');
+  if(el.dataset.last!==text){el.textContent=text;el.dataset.last=text;}
+  el.classList.toggle('st-scan',updating);
+  el.title=[...new Set([...details,...dataNotes(),...(v2Status?.sources||[]).filter(s=>s.error).map(s=>`${srcLabel(s.id)}: ${s.error}`),v2Status?.refresh_error||''].filter(Boolean))].join('\n');
   const header=document.querySelector('header h1');if(header)header.title=t('status.dataAsOf',localDate(DATA.generated_at_ms));
   if(DATA.version)$('#ver').textContent=t('ver.note',DATA.version);
 }
@@ -382,6 +448,13 @@ function renderDoughnut() {
 }
 function renderModelTable(){renderDetailTable('model');}
 function renderSourceTable(){renderDetailTable('source');}
+function sourceCacheReadShareHTML(metrics) {
+  const read=metrics.cache_read,total=metrics.total;
+  if(!read||!total||read.state==='unknown'||total.state==='unknown'||read.known_value==null||total.known_value==null)return '';
+  const cached=BigInt(read.known_value),sum=BigInt(total.known_value);
+  if(cached<=0n||sum<=0n||cached>sum)return '';
+  return ` <span style="color:var(--muted)">(${ratioText(read,total)})</span>`;
+}
 function renderDetailTable(dim) {
   const page=v2View.tables[dim],model=dim==='model',cw=cwVisible(),sel=model?state.mdlSel:state.srcSel;
   let html=model?`<tr><th>${t('tbl.model')}</th><th style="text-align:left">${t('tbl.source')}</th><th>${t('tbl.input')}</th><th>${t('tbl.cr')}</th>${cw?`<th>${t('tbl.cw')}</th>`:''}<th>${t('tbl.output')}</th><th>${t('tbl.sum')}</th><th>${t('tbl.share')}</th><th>${t('tbl.requests')}</th></tr>`:`<tr><th>${t('tbl.source')}</th><th>${t('tbl.requests')}</th><th>${t('tbl.input')}</th><th>${t('tbl.cr')}</th>${cw?`<th>${t('tbl.cw')}</th>`:''}<th>${t('tbl.output')}</th><th>${t('tbl.sum')}</th></tr>`;
@@ -389,7 +462,7 @@ function renderDetailTable(dim) {
     const name=model?escapeHtml(row.label):`<span class="srcdot" style="background:${srcColor(row.id)}"></span>${escapeHtml(row.label)}`;
     html+=`<tr class="${cls}" role="button" tabindex="0" data-${model?'m':'s'}="${escapeHtml(row.id)}" aria-pressed="${!!sel&&on}" title="${escapeHtml(t(model?'tbl.clickModel':'tbl.clickSource'))}"><td class="mname">${name}</td>`;
     html+=model?`<td style="text-align:left">${(row.sources||[]).map(id=>`<span class="srcdot" style="background:${srcColor(id)}"></span>${escapeHtml(srcLabel(id))}`).join(' ')}</td>`:`<td>${metricHTML(m.requests,false)}</td>`;
-    for(const key of ['input_uncached','cache_read',...(cw?['cache_write']:[]),'output_combined'])html+=`<td>${metricHTML(m[key])}</td>`;
+    for(const key of ['input_uncached','cache_read',...(cw?['cache_write']:[]),'output_combined'])html+=`<td>${metricHTML(m[key])}${!model&&key==='cache_read'?sourceCacheReadShareHTML(m):''}</td>`;
     html+=`<td><b>${metricHTML(m.total)}</b></td>`;
     if(model){
       const share=shareText(row.share),bar=share==='—'?'':`<span class="share-bar" style="width:${share}"></span>`;
@@ -410,12 +483,12 @@ function shareTitle(share) {
   return shareText(share);
 }
 async function loadTablePage(dim) {
-  const view=v2View;if(!view||view.tableBusy.has(dim)||!view.tables[dim].next_cursor)return;
+  const view=v2View,signal=v2Controller?.signal;if(!view||view.tableBusy.has(dim)||!view.tables[dim].next_cursor)return;
   view.tableBusy.add(dim);renderDetailTable(dim);
-  try{const result=await apiV2('query',{kind:'table',query:{...view.query,metric:'total'},dimension:dim,scope:'facet',page:{limit:100,cursor:view.tables[dim].next_cursor}},v2Controller?.signal);
+  try{const result=await apiV2('query',{kind:'table',query:{...view.query,metric:'total'},dimension:dim,scope:'facet',page:{limit:100,cursor:view.tables[dim].next_cursor}},signal);
     if(view!==v2View||view.key!==currentQueryKey())return;verifyStamp(view.response,result);const page=result.payload.data;
     view.tables[dim]={...page,rows:[...view.tables[dim].rows,...page.rows]};registerLabels(dim,page.rows);DATA.view_generation=++viewGeneration;
-  }catch(e){if(view===v2View&&view.key===currentQueryKey()){if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code))load(true);else showLoadFailure(e);}}
+  }catch(e){if(e.name!=='AbortError'&&!signal?.aborted&&view===v2View&&view.key===currentQueryKey()){if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code))load(true);else showLoadFailure(e);}}
   finally{view.tableBusy.delete(dim);if(view===v2View&&view.key===currentQueryKey())renderDetailTable(dim);}
 }
 function renderSelectorButtons() {
@@ -430,19 +503,23 @@ function renderSelectorButtons() {
     button.classList.toggle('filter-on',!!sel);button.innerHTML=`<span class="lbl">${escapeHtml(label)}</span> <span class="cnt">${sub?escapeHtml(sub)+' · ':''}▾</span>`;
   }
 }
-function filterWindowKey(){return JSON.stringify([rangeBounds(),v2View?.response.stamp]);}
+function filterWindowKey(){return JSON.stringify([rangeBounds(),v2View?.response.stamp,v2View?.response.as_of_ms]);}
 function buildFilterPanel(dim) {
   if(!v2View)return;
   const element=$(dim==='source'?'#src-ms-panel':'#mdl-ms-panel'),previous=filterPanels[dim];
   const scroll=element.querySelector('.ms-list')?.scrollTop||0;
   previous?.controller.abort();
   const panel=filterPanels[dim]={element,key:filterWindowKey(),search:element.dataset.q||'',items:catalogItems(dim),next:null,stats:new Map(),statsNext:null,statsDone:false,busy:false,sequence:0,visibleLimit:previous?.visibleLimit||200,controller:new AbortController()};
-  element.innerHTML=`<div class="ms-head"><input class="ms-search" placeholder="${escapeHtml(t('ms.search',catalogs[dim].total))}" value="${escapeHtml(panel.search)}"><button class="ms-act" data-act="all">${t('ms.all')}</button><button class="ms-act" data-act="none">${t('ms.none')}</button></div><div class="ms-list"></div><div class="ms-error" role="status" style="color:#f2cc60;padding:0 8px"></div>`;
-  element.querySelector('.ms-search').addEventListener('input',e=>{if(e.isComposing)return;panel.search=e.target.value;element.dataset.q=panel.search;panel.visibleLimit=200;renderFilterList(dim);});
-  for(const act of ['all','none'])element.querySelector(`[data-act="${act}"]`).onclick=()=>{const key=dim==='source'?'srcSel':'mdlSel';state[key]=act==='all'?null:new Set();persist(dim==='source'?SRC_LS_KEY:MDL_LS_KEY,state[key]);render();};
+  // Retain active inputs and controls across refreshes, including an unfinished IME composition.
+  if(!previous)element.innerHTML=`<div class="ms-head"><input class="ms-search" placeholder="${escapeHtml(t('ms.search',catalogs[dim].total))}" value="${escapeHtml(panel.search)}"><button class="ms-act" data-act="all">${t('ms.all')}</button><button class="ms-act" data-act="none">${t('ms.none')}</button></div><div class="ms-list"></div><div class="ms-error" role="status" style="color:var(--muted);padding:0 8px"></div>`;
+  const input=element.querySelector('.ms-search');input.placeholder=t('ms.search',catalogs[dim].total);
+  if(!previous||element.hidden||document.activeElement!==input)input.value=panel.search;
+  input.oninput=e=>{if(e.isComposing)return;panel.search=e.target.value;element.dataset.q=panel.search;panel.visibleLimit=200;renderFilterList(dim);};
+  for(const act of ['all','none']){const button=element.querySelector(`[data-act="${act}"]`);button.textContent=t('ms.'+act);button.onclick=()=>{const key=dim==='source'?'srcSel':'mdlSel';state[key]=act==='all'?null:new Set();persist(dim==='source'?SRC_LS_KEY:MDL_LS_KEY,state[key]);render();};}
   const list=element.querySelector('.ms-list');
   list.onchange=e=>{const checkbox=e.target.closest('input[data-v]');if(checkbox)(dim==='source'?toggleSrc:toggleMdl)(checkbox.dataset.v);};
-  list.addEventListener('scroll',()=>{if(list.scrollTop+list.clientHeight>=list.scrollHeight-80&&panel.visibleLimit<panel.items.length){panel.visibleLimit+=200;renderFilterList(dim);}});
+  list.onscroll=()=>{if(list.scrollTop+list.clientHeight>=list.scrollHeight-80&&panel.visibleLimit<panel.items.length){panel.visibleLimit+=200;renderFilterList(dim);}};
+  element.querySelector('.ms-error').textContent='';
   renderFilterList(dim);list.scrollTop=scroll;
   // Only compact current-window summaries are read, when a selector is opened.
   (async()=>{await readFilterPage(dim,false);while(panel===filterPanels[dim]&&!panel.controller.signal.aborted&&panel.statsNext)await readFilterPage(dim,true);})();
@@ -461,7 +538,10 @@ async function readFilterPage(dim,append) {
     panel.element.querySelector('.ms-error').textContent='';
   }catch(e){if(panel===filterPanels[dim]&&seq===panel.sequence&&e.name!=='AbortError'){
     panel.statsNext=null;
-    if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){panel.key='';load(true);}else panel.element.querySelector('.ms-error').textContent=e.message;
+    if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){panel.key='';load(true);}else{
+      panel.element.querySelector('.ms-error').textContent=words('用量稍后更新，筛选仍可使用。','Usage will update later; filters remain available.');
+      showLoadFailure(e);
+    }
   }}finally{if(panel===filterPanels[dim]&&seq===panel.sequence){panel.busy=false;renderFilterList(dim);}}
 }
 function renderFilterList(dim) {
@@ -492,20 +572,23 @@ function rescanUntilNew(done) {
   const op={finished:false,timers:new Set(),controller:new AbortController()};manualRefresh=op;
   const active=()=>manualRefresh===op&&!op.finished;
   const later=(fn,ms)=>{const timer=setTimeout(()=>{op.timers.delete(timer);if(active())fn();},ms);op.timers.add(timer);};
-  op.finish=(timedOut=false,failed=false)=>{if(!active())return;op.finished=true;for(const timer of op.timers)clearTimeout(timer);op.controller.abort();manualRefresh=null;rescanBusy=false;if(!failed)rescanTimedOut=timedOut;rescanTimedOutGen=v2Status?.refresh_generation||'0';$('#btn-refresh').disabled=false;$('#btn-refresh').textContent=t('btn.refresh');renderStatus();if(done)done({ok:!timedOut&&!failed,timedOut,failed});};
-  rescanBusy=true;$('#btn-refresh').disabled=true;$('#btn-refresh').textContent=t('btn.rescaning');renderStatus();later(()=>op.finish(true),90000);
-  (async()=>{
+  op.finish=(timedOut=false,failed=false)=>{if(!active())return;op.finished=true;for(const timer of op.timers)clearTimeout(timer);op.controller.abort();manualRefresh=null;rescanBusy=false;if(!failed)rescanTimedOut=timedOut;rescanTimedOutGen=v2Status?.refresh_generation||'0';$('#btn-refresh').disabled=false;$('#btn-refresh').textContent=t('btn.refresh');if(timedOut&&!recoveryUntil){recoveryUntil=Date.now();recoveryBase=v2Status?.refresh_generation??null;}if(timedOut||failed)retryInBackground();if(done)done({ok:!timedOut&&!failed,timedOut,failed});};
+  rescanBusy=true;$('#btn-refresh').disabled=true;$('#btn-refresh').textContent=t('btn.rescaning');renderStatus();later(()=>op.finish(true),RETRY_WAIT_MS);
+  const start=async()=>{
     try{
       const initial=await apiV2('status?arf=',undefined,op.controller.signal);if(!active())return;
       const base=BigInt(initial.refresh_generation||'0');
       await apiV2('refresh',{},op.controller.signal);if(!active())return;
       const poll=async()=>{try{
-        const status=await apiV2('status?arf=',undefined,op.controller.signal);if(!active())return;v2Status=status;renderStatus();
-        if(BigInt(status.refresh_generation||'0')!==base&&!status.refreshing){await load(true);if(active())op.finish(false,!!status.refresh_error);return;}
-      }catch(e){if(active())showLoadFailure(e);}if(active())later(poll,1000);};
+        const status=await apiV2('status?arf=',undefined,op.controller.signal);if(!active())return;v2Status=status;observeScanStatus(status);renderStatus();
+        if(BigInt(status.refresh_generation||'0')!==base&&!status.refreshing){
+          const result=await load(true);if(!active())return;
+          if(result?.ok){op.finish(false,!!result.status.refresh_error);return;}
+        }
+      }catch(e){if(active())showLoadFailure(e);}if(active())later(poll,RETRY_DELAY_MS);};
       later(poll,300);
-    }catch(e){if(active()){showLoadFailure(e);op.finish(false,true);}}
-  })();
+    }catch(e){if(active()){showLoadFailure(e);later(start,RETRY_DELAY_MS);}}
+  };start();
 }
 
 /* ---------------- 启动 ---------------- */

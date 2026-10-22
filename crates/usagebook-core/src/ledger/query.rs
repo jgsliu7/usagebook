@@ -14,11 +14,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
 const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 const GROUP_LIMIT: usize = 20_000;
+const CATALOG_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// One bounded directory shared by HTTP readers. Published facts remain on disk.
+#[derive(Default)]
+pub struct ModelCatalogCache(Mutex<Option<CachedCatalog>>);
+struct CachedCatalog {
+    stamp: Stamp,
+    routing_hash: String,
+    search: String,
+    rows: Arc<Vec<CatalogModel>>,
+}
+struct CatalogModel {
+    id: String,
+    label: String,
+    color_index: usize,
+}
 const FACT_COLUMNS:&str="o.observation_id,o.identity_family,o.namespace_key,e.identity_key,o.fact_kind,o.report_source,o.native_tool,o.model_key,o.model_display,o.session_key,o.occurred_ms,o.native_date,o.native_timezone,o.day_start_ms,o.day_end_ms,o.input_uncached,o.cache_read,o.cache_write,o.output_normal,o.output_reasoning,o.input_total,o.output_total,o.total_tokens,o.cache_write_1h,o.request_count,o.cost_state,o.cost_units,o.cost_scale,o.cost_currency";
 
 pub struct QueryService<'a> {
@@ -26,6 +43,7 @@ pub struct QueryService<'a> {
     legacy: Option<&'a LegacySnapshot>,
     model_labels: std::cell::RefCell<BTreeMap<String, String>>,
     all_labels: std::cell::Cell<Option<bool>>,
+    catalog_cache: Option<&'a ModelCatalogCache>,
 }
 #[derive(Clone)]
 struct Fact {
@@ -394,6 +412,14 @@ impl Cursor {
         Ok(s)
     }
 }
+// Query selectors are sorted by snapshot/load_selectors before execution.
+fn allows_normalized(selector: &Selector, id: &str) -> bool {
+    match selector {
+        Selector::All => true,
+        Selector::Include { ids } => ids.binary_search_by(|v| v.as_str().cmp(id)).is_ok(),
+        Selector::Exclude { ids } => ids.binary_search_by(|v| v.as_str().cmp(id)).is_err(),
+    }
+}
 struct Context {
     stamp: Stamp,
     tz: Tz,
@@ -437,7 +463,12 @@ impl<'a> QueryService<'a> {
             legacy,
             model_labels: std::cell::RefCell::new(BTreeMap::new()),
             all_labels: std::cell::Cell::new(None),
+            catalog_cache: None,
         }
+    }
+    pub fn with_catalog_cache(mut self, cache: &'a ModelCatalogCache) -> Self {
+        self.catalog_cache = Some(cache);
+        self
     }
     pub fn routing_hash(conn: &Connection) -> QueryResult<String> {
         let mut st=conn.prepare("SELECT report_source, MIN(route),MAX(route) FROM source_roots GROUP BY report_source ORDER BY report_source COLLATE BINARY")?;
@@ -636,7 +667,7 @@ impl<'a> QueryService<'a> {
         F: FnMut(Fact, bool) -> QueryResult<()>,
     {
         let (start, end) = bounds(&q.window, ctx.tz)?;
-        let end = end.min(ctx.asof.checked_add(1).unwrap_or(i64::MAX));
+        let end = end.min(ctx.asof.saturating_add(1));
         let sc = Self::condition(&q.sources, "e.report_source", "query_sources");
         let mc = Self::condition(&q.models, "e.model_key", "query_models");
         let filter = format!("({sc}) AND ({mc})");
@@ -753,15 +784,28 @@ impl<'a> QueryService<'a> {
         }
         if let Some(legacy) = self.legacy {
             for e in &legacy.entries {
+                seen += 1;
+                if seen % 512 == 0 {
+                    ctx.budget()?;
+                }
+                let (source, model) = match e {
+                    LegacyEntry::Request { record, .. }
+                    | LegacyEntry::SessionTotal { record, .. } => (
+                        record.source,
+                        std::borrow::Cow::Owned(model_key(&record.model)),
+                    ),
+                    LegacyEntry::Day(day) => (
+                        day.report_source.as_str(),
+                        std::borrow::Cow::Borrowed(day.model_key.as_str()),
+                    ),
+                };
+                if routes.get(source).is_some_and(|r| r == "ledger")
+                    || !allows_normalized(&q.sources, source)
+                    || !allows_normalized(&q.models, &model_id(&model))
+                {
+                    continue;
+                }
                 let f = legacy_fact(e)?;
-                if routes.get(&f.source).is_some_and(|r| r == "ledger") {
-                    continue;
-                }
-                let selected_s = q.sources.allows(&f.source);
-                let selected_m = q.models.allows(&model_id(&f.model));
-                if !(selected_s && selected_m) {
-                    continue;
-                }
                 if f.kind == "request" {
                     if f.time.is_some_and(|t| t >= start && t < end) {
                         callback(f, true)?;
@@ -782,10 +826,6 @@ impl<'a> QueryService<'a> {
                         callback(f, usable)?;
                     }
                 }
-                seen += 1;
-                if seen % 512 == 0 {
-                    ctx.budget()?;
-                }
             }
         }
         Ok(())
@@ -798,7 +838,7 @@ impl<'a> QueryService<'a> {
             || f.timezone.is_none()
             || s < start
             || e > end
-            || ctx.asof.checked_add(1).unwrap_or(i64::MAX) < e
+            || ctx.asof.saturating_add(1) < e
         {
             return Ok(false);
         }
@@ -871,6 +911,14 @@ impl<'a> QueryService<'a> {
         }
         drop(rows);
         drop(st);
+        let mut st=self.conn.prepare("SELECT report_source,COUNT(*) FROM usage_events WHERE state='active' AND has_conflict=1 GROUP BY report_source")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let source: String = r.get(0)?;
+            unresolved.entry(source).or_default().0 += r.get::<_, i64>(1)?;
+        }
+        drop(rows);
+        drop(st);
         for info in crate::SOURCE_CATALOG {
             if routes.get(info.id).is_some_and(|r| r == "ledger") {
                 let(root_count,enabled,root_errors,unenumerated,retry,error):(i64,i64,i64,i64,Option<i64>,Option<String>)=self.conn.query_row("SELECT COUNT(*),COALESCE(SUM(enabled),0),COALESCE(SUM(error_code IS NOT NULL),0),COALESCE(SUM(enumeration_done=0),0),MIN(retry_after_ms),MAX(error_code) FROM source_roots WHERE report_source=?",[info.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
@@ -922,6 +970,17 @@ impl<'a> QueryService<'a> {
             if selection.allows(&id) {
                 ctx.incomplete.insert(id);
                 ctx.warnings.insert("SOURCE_READ_GAP".into());
+            }
+        }
+        drop(rows);
+        drop(st);
+        let mut st=self.conn.prepare("SELECT DISTINCT report_source FROM usage_events WHERE state='active' AND has_conflict=1")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let id: String = r.get(0)?;
+            if selection.allows(&id) {
+                ctx.incomplete.insert(id);
+                ctx.warnings.insert("EVIDENCE_CONFLICT".into());
             }
         }
         drop(rows);
@@ -998,6 +1057,8 @@ impl<'a> QueryService<'a> {
         }
         Ok(())
     }
+    // These arguments map directly to the existing versioned cursor fields.
+    #[allow(clippy::too_many_arguments)]
     fn cursor(
         &self,
         ctx: &Context,
@@ -1261,10 +1322,10 @@ impl QueryService<'_> {
                 if a >= b {
                     return Err(QueryError::invalid("invalid native day range"));
                 }
-                let mut selected = Selector::Include {
+                let selected = Selector::Include {
                     ids: vec![source.clone()],
                 };
-                self.selector_warnings(&mut selected, models, &mut ctx)?;
+                self.selector_warnings(&selected, models, &mut ctx)?;
                 self.coverage(&selected, &mut ctx)?;
                 if let Some(c) = page.cursor.as_deref().map(Cursor::decode).transpose()? {
                     ctx.asof = parse_ms(&c.asof_ms)?;
@@ -1296,8 +1357,7 @@ impl QueryService<'_> {
             &serde_json::to_string(&ctx.stamp).unwrap_or_default(),
             &ctx.asof.to_string(),
         ]);
-        let excluded = payload.to_string().contains("DAY_EVIDENCE_EXCLUDED")
-            || ctx.warnings.contains("DAY_EVIDENCE_EXCLUDED");
+        let excluded = ctx.warnings.contains("DAY_EVIDENCE_EXCLUDED");
         let response = QueryResponse {
             api_version: 2,
             stamp: ctx.stamp,
@@ -1521,10 +1581,14 @@ impl QueryService<'_> {
     ) -> QueryResult<(Option<NaiveDate>, Option<NaiveDate>)> {
         let sc = Self::condition(&q.sources, "e.report_source", "query_sources");
         let mc = Self::condition(&q.models, "e.model_key", "query_models");
-        let sql=format!("SELECT MIN(e.occurred_ms),MAX(e.occurred_ms) FROM usage_events e WHERE state='active' AND fact_kind='request' AND e.occurred_ms<=? AND {sc} AND {mc} AND EXISTS(SELECT 1 FROM source_roots r WHERE r.report_source=e.report_source AND r.route='ledger')");
-        let (mut lo, mut hi): (Option<i64>, Option<i64>) =
-            self.conn
-                .query_row(&sql, [ctx.asof], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let edge = |order: &str| -> QueryResult<Option<i64>> {
+            let sql=format!("SELECT e.occurred_ms FROM usage_events e WHERE state='active' AND fact_kind='request' AND e.occurred_ms<=? AND {sc} AND {mc} AND EXISTS(SELECT 1 FROM source_roots r WHERE r.report_source=e.report_source AND r.route='ledger') ORDER BY e.occurred_ms {order} LIMIT 1");
+            Ok(self
+                .conn
+                .query_row(&sql, [ctx.asof], |r| r.get(0))
+                .optional()?)
+        };
+        let (mut lo, mut hi) = (edge("ASC")?, edge("DESC")?);
         let routes = self.source_routes()?;
         let (start, end) = bounds(&Window::All, ctx.tz)?;
         let day_sql = format!("SELECT {FACT_COLUMNS} FROM usage_events e JOIN usage_observations o ON o.observation_id=e.selected_observation_id WHERE e.state='active' AND e.fact_kind='day' AND {sc} AND {mc} AND EXISTS(SELECT 1 FROM source_roots r WHERE r.report_source=e.report_source AND r.route='ledger')");
@@ -1733,7 +1797,7 @@ impl QueryService<'_> {
         dim: Option<Dimension>,
     ) -> QueryResult<BTreeMap<String, (i64, i64)>> {
         let (start, end) = bounds(&q.window, ctx.tz)?;
-        let end = end.min(ctx.asof.checked_add(1).unwrap_or(i64::MAX));
+        let end = end.min(ctx.asof.saturating_add(1));
         let sc = Self::condition(&q.sources, "e.report_source", "query_sources");
         let mc = Self::condition(&q.models, "e.model_key", "query_models");
         let group = match dim {
@@ -2211,47 +2275,10 @@ impl QueryService<'_> {
                 }
             }
         } else {
-            self.populate_model_labels()?;
-            let mut keys = BTreeMap::<String, String>::new();
-            let mut st=self.conn.prepare("SELECT model_key,label,n FROM temp.query_labels ORDER BY model_key COLLATE BINARY,n DESC,label COLLATE BINARY")?;
-            let mut rows = st.query([])?;
-            while let Some(r) = rows.next()? {
-                let k: String = r.get(0)?;
-                let id = model_id(&k);
-                let label: String = r.get(1)?;
-                if keys.len() >= GROUP_LIMIT && !keys.contains_key(&id) {
-                    return Err(QueryError::limit("catalog model budget exceeded"));
-                }
-                keys.entry(id.clone()).or_insert_with(|| {
-                    if k.is_empty() {
-                        "Unknown".into()
-                    } else if label.is_empty() {
-                        k.strip_prefix("n:").unwrap_or(&k).into()
-                    } else {
-                        label.clone()
-                    }
-                });
-                if label.to_lowercase().contains(&request.search) || k.contains(&request.search) {
-                    if items.len() >= GROUP_LIMIT && !items.contains_key(&id) {
-                        return Err(QueryError::limit("catalog model budget exceeded"));
-                    }
-                    items.entry(id).or_insert_with(|| {
-                        if label.is_empty() {
-                            "Unknown".into()
-                        } else {
-                            label
-                        }
-                    });
-                }
-                ctx.budget()?;
-            }
-            // JS Array.sort() orders strings by UTF-16 code units. Rank the
-            // complete preferred-display-name catalog before search and pagination;
-            // base64 IDs and the loaded page must not change a model's color.
-            let mut ordered: Vec<_> = keys.into_iter().collect();
-            ordered.sort_by(|a, b| a.1.encode_utf16().cmp(b.1.encode_utf16()));
-            for (index, (id, _)) in ordered.into_iter().enumerate() {
-                color_indices.insert(id, index);
+            let models = self.catalog_models(&request.search, &ctx)?;
+            for model in models.iter() {
+                items.insert(model.id.clone(), model.label.clone());
+                color_indices.insert(model.id.clone(), model.color_index);
             }
         }
         let total = items.len();
@@ -2265,11 +2292,6 @@ impl QueryService<'_> {
                 more = true;
                 break;
             }
-            let label = if request.dimension == Dimension::Model {
-                self.preferred_model_label(&id)?
-            } else {
-                label
-            };
             let mut item = json!({"id":id,"label":label,"color_key":id});
             if let Some(index) = color_indices.get(&id) {
                 item["color_index"] = json!(index.to_string());
@@ -2297,6 +2319,107 @@ impl QueryService<'_> {
         Ok(
             json!({"stamp":ctx.stamp,"items":out,"next_cursor":next,"total_count":total.to_string()}),
         )
+    }
+    fn catalog_models(&self, search: &str, ctx: &Context) -> QueryResult<Arc<Vec<CatalogModel>>> {
+        let Some(cache) = self.catalog_cache else {
+            return self.build_catalog_models(search, ctx);
+        };
+        // Never wait behind a different request's directory rebuild.
+        let mut slot = cache
+            .0
+            .try_lock()
+            .map_err(|_| QueryError::new("BUSY", "model catalog is being refreshed"))?;
+        if let Some(cached) = slot.as_ref() {
+            if cached.stamp == ctx.stamp
+                && cached.routing_hash == ctx.routing_hash
+                && cached.search == search
+            {
+                return Ok(Arc::clone(&cached.rows));
+            }
+        }
+        // Evict the previous version before building; failed builds publish nothing.
+        *slot = None;
+        let rows = self.build_catalog_models(search, ctx)?;
+        let bytes: usize = rows
+            .iter()
+            .map(|row| {
+                std::mem::size_of::<CatalogModel>() + row.id.capacity() + row.label.capacity()
+            })
+            .sum();
+        // Oversized directories retain the existing query behavior without being cached.
+        if bytes <= CATALOG_CACHE_BYTES {
+            *slot = Some(CachedCatalog {
+                stamp: ctx.stamp.clone(),
+                routing_hash: ctx.routing_hash.clone(),
+                search: search.into(),
+                rows: Arc::clone(&rows),
+            });
+        }
+        Ok(rows)
+    }
+    fn build_catalog_models(
+        &self,
+        search: &str,
+        ctx: &Context,
+    ) -> QueryResult<Arc<Vec<CatalogModel>>> {
+        self.populate_model_labels()?;
+        let mut items = BTreeMap::<String, String>::new();
+        let mut color_indices = BTreeMap::<String, usize>::new();
+        let mut keys = BTreeMap::<String, String>::new();
+        let mut st=self.conn.prepare("SELECT model_key,label,n FROM temp.query_labels ORDER BY model_key COLLATE BINARY,n DESC,label COLLATE BINARY")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let k: String = r.get(0)?;
+            let id = model_id(&k);
+            let label: String = r.get(1)?;
+            if keys.len() >= GROUP_LIMIT && !keys.contains_key(&id) {
+                return Err(QueryError::limit("catalog model budget exceeded"));
+            }
+            keys.entry(id.clone()).or_insert_with(|| {
+                if k.is_empty() {
+                    "Unknown".into()
+                } else if label.is_empty() {
+                    k.strip_prefix("n:").unwrap_or(&k).into()
+                } else {
+                    label.clone()
+                }
+            });
+            if label.to_lowercase().contains(search) || k.contains(search) {
+                if items.len() >= GROUP_LIMIT && !items.contains_key(&id) {
+                    return Err(QueryError::limit("catalog model budget exceeded"));
+                }
+                items.entry(id).or_insert_with(|| {
+                    if label.is_empty() {
+                        "Unknown".into()
+                    } else {
+                        label
+                    }
+                });
+            }
+            ctx.budget()?;
+        }
+        // JS Array.sort() orders strings by UTF-16 code units. Rank the
+        // complete preferred-display-name catalog before search and pagination;
+        // base64 IDs and the loaded page must not change a model's color.
+        let mut ordered: Vec<_> = keys.into_iter().collect();
+        ordered.sort_by(|a, b| a.1.encode_utf16().cmp(b.1.encode_utf16()));
+        for (index, (id, preferred)) in ordered.into_iter().enumerate() {
+            color_indices.insert(id.clone(), index);
+            if let Some(label) = items.get_mut(&id) {
+                *label = preferred;
+            }
+        }
+        ctx.budget()?;
+        Ok(Arc::new(
+            items
+                .into_iter()
+                .map(|(id, label)| CatalogModel {
+                    color_index: color_indices[&id],
+                    id,
+                    label,
+                })
+                .collect(),
+        ))
     }
     fn catalog_usage_sources(&self, ctx: &Context) -> QueryResult<BTreeSet<String>> {
         let mut sources = BTreeSet::new();
@@ -2622,7 +2745,7 @@ impl QueryService<'_> {
         groups: &mut BTreeMap<String, Aggregate>,
     ) -> QueryResult<()> {
         let (start, end) = bounds(&q.window, ctx.tz)?;
-        let end = end.min(ctx.asof.checked_add(1).unwrap_or(i64::MAX));
+        let end = end.min(ctx.asof.saturating_add(1));
         let sc = Self::condition(&q.sources, "e.report_source", "query_sources");
         let mc = Self::condition(&q.models, "e.model_key", "query_models");
         let group = match dim {
@@ -2664,7 +2787,7 @@ impl QueryService<'_> {
     }
     fn session_costs(&self, q: &Query, ctx: &Context) -> QueryResult<Vec<Value>> {
         let (start, end) = bounds(&q.window, ctx.tz)?;
-        let end = end.min(ctx.asof.checked_add(1).unwrap_or(i64::MAX));
+        let end = end.min(ctx.asof.saturating_add(1));
         let sc = Self::condition(&q.sources, "m.report_source", "query_sources");
         let mc = Self::condition(&q.models, "m.model_key", "query_models");
         let direct = Self::condition(&q.sources, "e.report_source", "query_sources");

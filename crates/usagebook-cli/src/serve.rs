@@ -22,11 +22,11 @@ pub(crate) fn open_dashboard(port: u16) {
     }
 }
 
-pub(crate) fn local_request(req: &tiny_http::Request, port: u16) -> bool {
+pub(crate) fn local_request(headers: &[tiny_http::Header], port: u16) -> bool {
     let authority = format!("127.0.0.1:{port}");
     let localhost = format!("localhost:{port}");
     let mut has_host = false;
-    for h in req.headers() {
+    for h in headers {
         if h.field.equiv("Host") {
             has_host = true;
             let value = h.value.as_str();

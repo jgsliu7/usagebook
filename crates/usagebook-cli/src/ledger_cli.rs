@@ -13,8 +13,9 @@ use usagebook_core::ledger::{
 #[derive(Subcommand)]
 pub enum LedgerCommand {
     Init {
-        #[arg(long, default_value = "Asia/Shanghai")]
-        timezone: String,
+        /// IANA 时区名（如 Asia/Shanghai）；缺省取系统时区，推断失败时须显式指定
+        #[arg(long)]
+        timezone: Option<String>,
     },
     Status,
     Refresh {
@@ -128,8 +129,15 @@ fn execute(command: LedgerCommand) -> usagebook_core::ledger::Result<()> {
     let path = db::default_path();
     let value = match command {
         LedgerCommand::Init { timezone } => {
+            let timezone = timezone.or_else(db::host_timezone_hint);
+            let Some(timezone) = timezone else {
+                return Err(LedgerError::InvalidInput(
+                    "无法确定系统时区；请用 --timezone <IANA 名> 显式指定（如 Asia/Shanghai）"
+                        .into(),
+                ));
+            };
             let l = Ledger::init(&path, &timezone)?;
-            json!({"initialized":true,"path":path,"stamp":l.stamp()?})
+            json!({"initialized":true,"path":path,"timezone":timezone,"stamp":l.stamp()?})
         }
         LedgerCommand::Status => {
             let l = Ledger::open(&path, false)?;
@@ -280,10 +288,11 @@ pub fn load_legacy(conn: &rusqlite::Connection) -> QueryResult<LegacySnapshot> {
             }
             continue;
         }
-        let (records, stats) =
-            usagebook_core::common::scan_source_cached(adapter.as_ref(), &adapter.discover_roots());
+        let _ = usagebook_core::common::take_walk_error();
+        let roots = adapter.discover_roots();
+        let (records, stats) = usagebook_core::common::scan_source_cached(adapter.as_ref(), &roots);
         snapshot.push_records(source, records, now_ms())?;
-        if stats.failed {
+        if stats.failed || stats.lines_bad_json > 0 {
             snapshot.sources.insert(
                 source.into(),
                 LegacySourceStatus {
@@ -356,7 +365,13 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
         None
     };
     let transient = if ledger.is_none() {
-        Some(db::live_connection("Asia/Shanghai").map_err(|e| (e.to_string(), e.exit_code()))?)
+        let tz = db::host_timezone_hint().unwrap_or_else(|| {
+            eprintln!(
+                "LEDGER_TIMEZONE_HINT_FAILED：未能确定系统时区，未初始化报表临时按 UTC 折算日界。"
+            );
+            "UTC".to_string()
+        });
+        Some(db::live_connection(&tz).map_err(|e| (e.to_string(), e.exit_code()))?)
     } else {
         None
     };

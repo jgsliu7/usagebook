@@ -43,7 +43,7 @@ fn stream_rewrite_without_request_id_collapses() {
     )
     .unwrap();
     let src = usagebook_core::sources::claude::ClaudeSource;
-    let (records, _) = src.scan_roots(&[dir.clone()], None);
+    let (records, _) = src.scan_roots(std::slice::from_ref(&dir), None);
     let msgs: Vec<&str> = records.iter().map(|r| r.dedup_key.as_str()).collect();
     assert_eq!(records.len(), 3, "5 行 3 消息,重复快照必须合并: {msgs:?}");
     let c = records
@@ -83,7 +83,7 @@ fn exact_key_and_cross_session_unchanged() {
     )
     .unwrap();
     let src = usagebook_core::sources::claude::ClaudeSource;
-    let (records, _) = src.scan_roots(&[dir.clone()], None);
+    let (records, _) = src.scan_roots(std::slice::from_ref(&dir), None);
     assert_eq!(records.len(), 3, "精确键合并 1 + 跨会话 2: {records:?}");
     assert!(
         records

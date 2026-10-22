@@ -31,6 +31,15 @@ pub struct Preview {
     pub replacement: Option<ReplacementImpact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub released_rule: Option<ReleasedRule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncovered_time: Option<UncoveredTime>,
+}
+/// Usage candidates left outside a dated forget because their time is unknown.
+/// Counts exclude identity-only projections and candidates already in its closure.
+#[derive(Clone, Debug, Serialize)]
+pub struct UncoveredTime {
+    pub request_candidates: String,
+    pub day_candidates: String,
 }
 /// Removing a rule does not itself import records. Its persisted scope is the
 /// useful preview; deleted payloads cannot provide a reliable reimport count.
@@ -64,6 +73,52 @@ struct InstallMarker {
 fn marker_path(p: &Path) -> PathBuf {
     p.with_extension("install.json")
 }
+fn backup_target(path: &Path, output: &Path) -> Result<PathBuf> {
+    let name = output
+        .file_name()
+        .ok_or_else(|| LedgerError::InvalidInput("invalid backup output".into()))?;
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .canonicalize()?;
+    let target = parent.join(name);
+    let (maintenance, writer) = db::lock_paths(path);
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    let mut journal = path.as_os_str().to_os_string();
+    journal.push("-journal");
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let output_name = name.to_string_lossy();
+    let temporary_install = output_name.starts_with(&format!("{stem}."))
+        && [
+            ".init.tmp",
+            ".install.tmp",
+            ".restore.pending.db",
+            ".recovery.db",
+        ]
+        .iter()
+        .any(|suffix| output_name.ends_with(suffix));
+    if target == path
+        || target.as_os_str() == wal.as_os_str()
+        || target.as_os_str() == shm.as_os_str()
+        || target.as_os_str() == journal.as_os_str()
+        || target == maintenance
+        || target == writer
+        || target == marker_path(path)
+        || temporary_install
+    {
+        return Err(LedgerError::InvalidInput(
+            "backup output is reserved for the ledger".into(),
+        ));
+    }
+    if target.symlink_metadata().is_ok() {
+        return Err(LedgerError::InvalidInput("output already exists".into()));
+    }
+    Ok(target)
+}
 fn hash_file(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path)?;
     let mut h = Sha256::new();
@@ -86,12 +141,55 @@ fn sync_file(p: &Path) -> Result<()> {
         .sync_all()?;
     Ok(())
 }
-fn sync_dir(p: &Path) -> Result<()> {
+fn sync_dir(_p: &Path) -> Result<()> {
     #[cfg(unix)]
-    std::fs::File::open(p.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+    std::fs::File::open(_p.parent().unwrap_or(Path::new(".")))?.sync_all()?;
     Ok(())
 }
-fn check_conn(c: &Connection) -> Result<()> {
+fn publish_install_marker(path: &Path, marker: &InstallMarker) -> Result<()> {
+    let bytes = serde_json::to_vec(marker).map_err(|_| LedgerError::CorruptLedger)?;
+    let published = marker_path(path);
+    let temporary = path.with_extension(format!("{}.install.tmp", new_epoch()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| -> Result<()> {
+        let mut file = file;
+        db::private_file(&temporary)?;
+        regression_stop("install_marker_created");
+        // Only regression builds split the write, so a killed process can leave
+        // a genuinely partial temporary marker without exposing it to recovery.
+        #[cfg(feature = "regression-hooks")]
+        {
+            let middle = bytes.len() / 2;
+            file.write_all(&bytes[..middle])?;
+            regression_stop("install_marker_partial");
+            file.write_all(&bytes[middle..])?;
+        }
+        #[cfg(not(feature = "regression-hooks"))]
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        // Close before rename: Windows must not retain an open marker handle.
+        drop(file);
+        regression_stop("install_marker_synced");
+        // The exclusive maintenance lease prevents competing publishers. Keep
+        // unexpected formal markers intact rather than replacing their evidence.
+        if published.exists() {
+            return Err(LedgerError::CorruptLedger);
+        }
+        std::fs::rename(&temporary, &published)?;
+        regression_stop("install_marker_published");
+        sync_dir(&published)
+    })();
+    if result.is_err() {
+        // If publication succeeded, the formal marker must remain for recovery.
+        // Otherwise only this invocation's temporary file may be removed.
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+pub(crate) fn check_conn(c: &Connection) -> Result<()> {
     db::validate(c)?;
     let result: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     if result != "ok" {
@@ -311,24 +409,34 @@ impl Maintenance {
         })
     }
     pub fn check(&self) -> Result<()> {
+        // check is the only read-only maintenance op; a v1 ledger reports
+        // UnsupportedVersion there, so upgrade it once through a writer first.
+        if let Err(LedgerError::UnsupportedVersion) = db::open_connection(&self.path, false) {
+            drop(db::open_connection(&self.path, true)?);
+        }
         let c = db::open_connection(&self.path, false)?;
         check_conn(&c)
     }
     pub fn backup(&self, output: &Path) -> Result<()> {
-        if output.exists() {
-            return Err(LedgerError::InvalidInput("output already exists".into()));
-        }
+        let output = backup_target(&self.path, output)?;
         let c = db::open_connection(&self.path, true)?;
         check_conn(&c)?;
         let temp = output.with_extension(format!("{}.backup.tmp", new_epoch()));
-        copy_database(&c, &temp)?;
-        drop(c);
-        if output.exists() {
-            return Err(LedgerError::InvalidInput("output already exists".into()));
+        if let Err(error) = copy_database(&c, &temp) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
         }
-        std::fs::hard_link(&temp, output)?;
+        drop(c);
+        if let Err(error) = backup_target(&self.path, &output) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::hard_link(&temp, &output) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.into());
+        }
         std::fs::remove_file(&temp)?;
-        sync_dir(output)?;
+        sync_dir(&output)?;
         Ok(())
     }
     pub fn pause(&self, source: &str, paused: bool) -> Result<()> {
@@ -359,7 +467,17 @@ impl Maintenance {
         let op = hash_parts("forget", &[&operation]);
         add_explicit_rules(&c, scope, &op)?;
         expand_rules(&c, &op, false)?;
-        let preview = preview(&c, "forget", &operation)?;
+        let mut preview = preview(&c, "forget", &operation)?;
+        if scope.start_ms.is_some() {
+            let uncovered = uncovered_time(&c, scope)?;
+            if uncovered.request_candidates != "0" || uncovered.day_candidates != "0" {
+                preview.warnings.push(format!(
+                    "Date filtering leaves {} request candidates without a timestamp and {} day candidates without a known interval outside this deletion. Their dates cannot be determined.",
+                    uncovered.request_candidates, uncovered.day_candidates
+                ));
+            }
+            preview.uncovered_time = Some(uncovered);
+        }
         if let Some(token) = apply {
             if token != preview.preview_token {
                 return Err(LedgerError::InvalidInput(
@@ -424,7 +542,7 @@ impl Maintenance {
             "unsuppress",
             &[&stamp.epoch, &stamp.commit_seq, &id.to_string()],
         );
-        let result=Preview{operation:"unsuppress".into(),preview_token:token.clone(),affected_candidates:"0".into(),affected_events:"0".into(),replacement:None,released_rule:Some(rule),warnings:vec![
+        let result=Preview{operation:"unsuppress".into(),preview_token:token.clone(),affected_candidates:"0".into(),affected_events:"0".into(),replacement:None,released_rule:Some(rule),uncovered_time:None,warnings:vec![
             "Only this rule is removed; other identity, session and coverage rules remain. A later refresh may import source records again.".into(),
             "Immediate candidate/event changes are zero. The number of records that may be reimported is unknown; source files are not scanned for this preview.".into()
         ]};
@@ -481,9 +599,27 @@ fn select_scope(c: &Connection, s: &ForgetScope) -> Result<()> {
     c.execute("INSERT INTO delete_ids SELECT observation_id FROM usage_observations WHERE (?1 IS NULL OR report_source=?1) AND (?2 IS NULL OR identity_key=?2) AND (?3 IS NULL OR (occurred_ms>=?3 AND occurred_ms<?4) OR (day_start_ms<?4 AND day_end_ms>?3))",params![s.source,s.identity,s.start_ms,s.end_ms])?;
     Ok(())
 }
+fn uncovered_time(c: &Connection, s: &ForgetScope) -> Result<UncoveredTime> {
+    c.query_row(
+        "SELECT count(CASE WHEN fact_kind='request' AND occurred_ms IS NULL THEN 1 END),
+                count(CASE WHEN fact_kind='day' AND day_start_ms IS NULL THEN 1 END)
+         FROM usage_observations o
+         WHERE (?1 IS NULL OR report_source=?1) AND (?2 IS NULL OR identity_key=?2)
+           AND eligibility<>'identity_only'
+           AND NOT EXISTS(SELECT 1 FROM delete_ids d WHERE d.id=o.observation_id)",
+        params![s.source, s.identity],
+        |r| {
+            Ok(UncoveredTime {
+                request_candidates: r.get::<_, i64>(0)?.to_string(),
+                day_candidates: r.get::<_, i64>(1)?.to_string(),
+            })
+        },
+    )
+    .map_err(LedgerError::from)
+}
 fn add_explicit_rules(c: &Connection, s: &ForgetScope, op: &str) -> Result<()> {
-    if s.identity.is_none() && s.start_ms.is_some() {
-        let (a, b) = (s.start_ms.unwrap(), s.end_ms.unwrap());
+    if let (None, Some(a)) = (s.identity.as_ref(), s.start_ms) {
+        let b = s.end_ms.unwrap();
         c.execute("INSERT INTO suppression_rules(kind,report_source,native_tool,start_ms,end_ms,operation_id,created_ms)VALUES('window',?1,?1,?2,?3,?4,?5)",params![s.source,a,b,op,now_ms()])?;
     } else if let Some(source) = &s.source {
         c.execute("INSERT OR IGNORE INTO suppression_rules(kind,report_source,native_tool,operation_id,created_ms)VALUES('source',?1,?1,?2,?3)",params![source,op,now_ms()])?;
@@ -602,7 +738,20 @@ fn preview(c: &Connection, operation: &str, parameters: &str) -> Result<Preview>
         hash.update(row.get::<_, i64>(0)?.to_be_bytes());
         count = count.checked_add(1).ok_or(LedgerError::NumericOverflow)?;
     }
-    let affected:i64=c.query_row("SELECT count(*) FROM usage_events e WHERE selected_observation_id IN(SELECT id FROM delete_ids) OR EXISTS(SELECT 1 FROM usage_observations o JOIN delete_ids d ON d.id=o.observation_id LEFT JOIN identity_alias a ON a.identity_family=o.identity_family AND a.namespace_key=o.namespace_key AND a.alias_key=o.identity_key WHERE o.identity_family=e.identity_family AND o.namespace_key=e.namespace_key AND (o.identity_key=e.identity_key OR a.canonical_key=e.identity_key))",[],|r|r.get(0))?;
+    // Drive preview from the selected candidates, not every historical event.
+    // The three branches cover a selected observation, its raw identity, and
+    // its already-proven canonical alias; UNION counts an event only once.
+    let affected: i64 = if count == 0 {
+        0
+    } else {
+        c.query_row("SELECT count(*) FROM (
+            SELECT e.rowid FROM delete_ids d CROSS JOIN usage_events e ON e.selected_observation_id=d.id
+            UNION
+            SELECT e.rowid FROM delete_ids d CROSS JOIN usage_observations o ON o.observation_id=d.id CROSS JOIN usage_events e ON e.identity_family=o.identity_family AND e.namespace_key=o.namespace_key AND e.identity_key=o.identity_key
+            UNION
+            SELECT e.rowid FROM delete_ids d CROSS JOIN usage_observations o ON o.observation_id=d.id CROSS JOIN identity_alias a ON a.identity_family=o.identity_family AND a.namespace_key=o.namespace_key AND a.alias_key=o.identity_key CROSS JOIN usage_events e ON e.identity_family=a.identity_family AND e.namespace_key=a.namespace_key AND e.identity_key=a.canonical_key
+        )",[],|r|r.get(0))?
+    };
     let token = hash_parts(
         "maintenance-preview/v1",
         &[
@@ -612,7 +761,7 @@ fn preview(c: &Connection, operation: &str, parameters: &str) -> Result<Preview>
             &format!("{:x}", hash.finalize()),
         ],
     );
-    Ok(Preview{operation:operation.into(),preview_token:token,affected_candidates:count.to_string(),affected_events:affected.to_string(),replacement:None,released_rule:None,warnings:vec!["All revisions of matching identities and related session totals/costs are removed. Source files and independent backups remain.".into()]})
+    Ok(Preview{operation:operation.into(),preview_token:token,affected_candidates:count.to_string(),affected_events:affected.to_string(),replacement:None,released_rule:None,uncovered_time:None,warnings:vec!["All revisions of matching identities and related session totals/costs are removed. Source files and independent backups remain.".into()]})
 }
 fn delete_selected(c: &Connection) -> Result<()> {
     // Persist each unit's pre-maintenance publication horizon in bounded disk TEMP.
@@ -624,20 +773,17 @@ fn delete_selected(c: &Connection) -> Result<()> {
         let ns: String = r.get(1)?;
         let key: Option<String> = r.get(2)?;
         let message: Option<String> = r.get(3)?;
-        let publish = if family == "claude" && message.is_some() {
-            format!(
+        let publish = match (family.as_str(), message, key) {
+            ("claude", Some(message), _) => format!(
                 "m:{}",
                 message
-                    .unwrap()
                     .as_bytes()
                     .iter()
                     .map(|b| format!("{b:02x}"))
                     .collect::<String>()
-            )
-        } else if let Some(key) = key {
-            format!("k:{key}")
-        } else {
-            continue;
+            ),
+            (_, _, Some(key)) => format!("k:{key}"),
+            _ => continue,
         };
         let visible = super::resolve::visible_horizon(c, &family, &ns, &publish)?;
         c.execute(
@@ -673,6 +819,7 @@ fn delete_selected(c: &Connection) -> Result<()> {
             &r.get::<_, String>(1)?,
             &r.get::<_, String>(2)?,
             r.get(3)?,
+            super::resolve::RebuildCause::ExplicitDelete,
         )?;
     }
     drop(rows);
@@ -681,7 +828,13 @@ fn delete_selected(c: &Connection) -> Result<()> {
     Ok(())
 }
 pub(crate) fn suppress_incoming(c: &Connection, o: &Observation) -> Result<()> {
-    add_identity_controls(c, o, "suppressed-revision")?;
+    add_incoming_controls(c, o)?;
+    finish_incoming_suppression(c)
+}
+pub(crate) fn add_incoming_controls(c: &Connection, o: &Observation) -> Result<()> {
+    add_identity_controls(c, o, "suppressed-revision")
+}
+pub(crate) fn finish_incoming_suppression(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TEMP TABLE IF NOT EXISTS delete_ids(id INTEGER PRIMARY KEY); DELETE FROM delete_ids;")?;
     c.execute(&format!("INSERT INTO delete_ids SELECT observation_id FROM usage_observations o WHERE {EXACT_RULES}"),[])?;
     delete_selected(c)?;
@@ -792,15 +945,7 @@ impl Maintenance {
                     epoch,
                 };
                 let p = marker_path(&self.path);
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&p)?;
-                db::private_file(&p)?;
-                f.write_all(&serde_json::to_vec(&marker).map_err(|_| LedgerError::CorruptLedger)?)?;
-                f.sync_all()?;
-                drop(f);
-                sync_dir(&p)?;
+                publish_install_marker(&self.path, &marker)?;
                 regression_stop("install_prepared");
                 std::fs::rename(&self.path, &recovery)?;
                 sync_dir(&self.path)?;

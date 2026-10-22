@@ -34,6 +34,14 @@ pub enum LegacyEntry {
         known_fields: u16,
     },
 }
+impl LegacyEntry {
+    pub fn report_source(&self) -> &str {
+        match self {
+            Self::Request { record, .. } | Self::SessionTotal { record, .. } => record.source,
+            Self::Day(day) => &day.report_source,
+        }
+    }
+}
 #[derive(Debug, Clone, Default)]
 pub struct LegacySourceStatus {
     pub last_scanned_ms: Option<i64>,

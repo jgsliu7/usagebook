@@ -1,8 +1,8 @@
--- Canonical schema v1. Migrations must also preserve suppression rules.
+-- Canonical schema v2. Migrations must also preserve suppression rules.
 PRAGMA foreign_keys=ON;
 CREATE TABLE ledger_meta (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
- schema_version INTEGER NOT NULL CHECK(schema_version=1),
+ schema_version INTEGER NOT NULL CHECK(schema_version=2),
  ledger_uuid TEXT NOT NULL, epoch TEXT NOT NULL,
  commit_seq INTEGER NOT NULL CHECK(commit_seq>=0),
  derived_version INTEGER NOT NULL CHECK(derived_version>0),
@@ -52,6 +52,7 @@ CREATE TABLE source_objects (
  object_key TEXT NOT NULL, locator TEXT NOT NULL,
  content_generation TEXT NOT NULL,
  byte_length INTEGER NOT NULL CHECK(byte_length>=0), mtime_ns INTEGER,
+ -- Full SHA-256 of a completely imported file; NULL means replay on change.
  quick_fingerprint BLOB CHECK(quick_fingerprint IS NULL OR length(quick_fingerprint)=32),
  object_revision INTEGER NOT NULL CHECK(object_revision>=0),
  state TEXT NOT NULL CHECK(state IN('ready','missing','error','replay_required')),
@@ -62,8 +63,6 @@ CREATE TABLE source_objects (
  target_done INTEGER NOT NULL DEFAULT 0 CHECK(target_done IN(0,1)),
  last_observed_ms INTEGER,
  audit_completed_ms INTEGER, audit_due_ms INTEGER NOT NULL,
- audit_generation TEXT, audit_offset INTEGER NOT NULL DEFAULT 0 CHECK(audit_offset>=0),
- audit_digest BLOB CHECK(audit_digest IS NULL OR length(audit_digest)=32),
  error_code TEXT,
  failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count>=0),
  retry_after_ms INTEGER,
@@ -162,12 +161,11 @@ CREATE INDEX events_model_display ON usage_events(model_key,model_display,report
 
 CREATE TABLE usage_rollups (
  derived_version INTEGER NOT NULL CHECK(derived_version>0),
- grain TEXT NOT NULL CHECK(grain IN('day','hour')),
+ grain TEXT NOT NULL CHECK(grain='day'),
  bucket_start_ms INTEGER NOT NULL, bucket_end_ms INTEGER NOT NULL CHECK(bucket_end_ms>bucket_start_ms),
  local_day TEXT NOT NULL, report_source TEXT NOT NULL, model_key TEXT NOT NULL,
  event_count INTEGER NOT NULL CHECK(event_count>=0),
  bucket_revision INTEGER NOT NULL CHECK(bucket_revision>=0),
- hour_cache_revision INTEGER CHECK(hour_cache_revision>=0),
  input_uncached_known_sum INTEGER NOT NULL CHECK(input_uncached_known_sum>=0),
  input_uncached_known_count INTEGER NOT NULL CHECK(input_uncached_known_count>=0), input_uncached_exact_count INTEGER NOT NULL CHECK(input_uncached_exact_count>=0),
  cache_read_known_sum INTEGER NOT NULL CHECK(cache_read_known_sum>=0),
@@ -189,7 +187,6 @@ CREATE TABLE usage_rollups (
  request_count_known_sum INTEGER NOT NULL CHECK(request_count_known_sum>=0),
  request_count_known_count INTEGER NOT NULL CHECK(request_count_known_count>=0), request_count_exact_count INTEGER NOT NULL CHECK(request_count_exact_count>=0),
  PRIMARY KEY(derived_version,grain,bucket_start_ms,report_source,model_key),
- CHECK(grain='day' OR hour_cache_revision IS NULL),
  CHECK(input_uncached_exact_count<=input_uncached_known_count AND input_uncached_known_count<=event_count AND (input_uncached_known_count>0 OR input_uncached_known_sum=0)),
  CHECK(cache_read_exact_count<=cache_read_known_count AND cache_read_known_count<=event_count AND (cache_read_known_count>0 OR cache_read_known_sum=0)),
  CHECK(cache_write_exact_count<=cache_write_known_count AND cache_write_known_count<=event_count AND (cache_write_known_count>0 OR cache_write_known_sum=0)),

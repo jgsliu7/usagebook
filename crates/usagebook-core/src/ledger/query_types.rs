@@ -56,12 +56,17 @@ impl From<rusqlite::Error> for QueryError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Selector {
+    #[default]
     All,
-    Include { ids: Vec<String> },
-    Exclude { ids: Vec<String> },
+    Include {
+        ids: Vec<String>,
+    },
+    Exclude {
+        ids: Vec<String>,
+    },
 }
 impl<'de> Deserialize<'de> for Selector {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -106,11 +111,6 @@ impl<'de> Deserialize<'de> for Selector {
             ("exclude", Some(ids)) => Ok(Self::Exclude { ids }),
             _ => Err(serde::de::Error::custom("invalid selector fields")),
         }
-    }
-}
-impl Default for Selector {
-    fn default() -> Self {
-        Self::All
     }
 }
 impl Selector {

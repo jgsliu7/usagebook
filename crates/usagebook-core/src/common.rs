@@ -7,6 +7,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 // Only serve's snapshot scans opt in. One-shot CLI/fixture scans remain uncached.
 thread_local! { static INCREMENTAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static WALK_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// Directory discovery errors must not look like an empty, complete scan.
+pub fn take_walk_error() -> bool {
+    WALK_FAILED.with(|failed| failed.replace(false))
+}
 
 pub fn with_incremental_cache<T>(f: impl FnOnce() -> T) -> T {
     struct Reset(bool);
@@ -1086,11 +1092,16 @@ pub fn scan_source_cached(
     source: &dyn crate::model::UsageSource,
     roots: &[PathBuf],
 ) -> (Vec<crate::model::UsageRecord>, crate::model::ScanStats) {
+    // A direct scan may follow an unrelated source on the same worker thread.
+    // Only failures from this source's own scan or fingerprint belong to it.
+    let _ = take_walk_error();
     if matches!(
         source.id(),
         "claude" | "codex" | "kimi" | "kimi-work" | "dsh"
     ) {
-        return with_incremental_cache(|| source.scan_roots(roots, None));
+        let (records, mut stats) = with_incremental_cache(|| source.scan_roots(roots, None));
+        stats.failed |= take_walk_error();
+        return (records, stats);
     }
     let before = source_fingerprint(roots);
     if let Some(fingerprint) = &before {
@@ -1101,6 +1112,7 @@ pub fn scan_source_cached(
         if let Some(entry) = cache.get(source.id()) {
             if &entry.fingerprint == fingerprint {
                 let mut stats = entry.stats.clone();
+                stats.failed |= take_walk_error();
                 stats.files_reused = stats.files_parsed;
                 stats.files_read = 0;
                 stats.bytes_read = 0;
@@ -1117,6 +1129,7 @@ pub fn scan_source_cached(
             if let Some(stored) = stored {
                 if stored == *fingerprint {
                     if let Some((records, mut stats)) = crate::store::decode_records(&row.records) {
+                        stats.failed |= take_walk_error();
                         stats.files_reused = stats.files_parsed;
                         stats.files_read = 0;
                         stats.bytes_read = 0;
@@ -1155,6 +1168,7 @@ pub fn scan_source_cached(
         .unwrap_or_else(|e| e.into_inner())
         .remove(source.id());
     let (records, mut stats) = source.scan_roots(roots, None);
+    stats.failed |= take_walk_error();
     stats.files_read = stats.files_parsed;
     let weight = source_cache_weight(&records, &stats, &before);
     // 冻结契约:只认显式标志;notes 文本不参与机器判定(措辞润色不得改变缓存语义)。
@@ -1255,12 +1269,33 @@ fn walk_inner(
             return;
         }
     }
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return;
+    let rd = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(error) => {
+            // Several adapters probe optional directories. Absence is normal;
+            // a discovered source that turns empty is handled by live refresh.
+            if error.kind() != std::io::ErrorKind::NotFound {
+                WALK_FAILED.with(|failed| failed.set(true));
+            }
+            return;
+        }
     };
-    for e in rd.flatten() {
+    for entry in rd {
+        let e = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                WALK_FAILED.with(|failed| failed.set(true));
+                continue;
+            }
+        };
         let p = e.path();
-        let Ok(ft) = e.file_type() else { continue };
+        let ft = match e.file_type() {
+            Ok(ft) => ft,
+            Err(_) => {
+                WALK_FAILED.with(|failed| failed.set(true));
+                continue;
+            }
+        };
         if ft.is_dir() {
             walk_inner(&p, max_files, keep, out);
         } else if keep(&p) {

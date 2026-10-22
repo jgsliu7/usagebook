@@ -339,6 +339,8 @@ pub fn parse_line(line: &[u8]) -> Result<ParsedRecord> {
 
 /// Strict identity projection for deletion proofs. Malformed identifiers are gaps,
 /// never silently absent edges; token payload is intentionally not interpreted.
+// Keep the existing (session, message, request) projection contract together.
+#[allow(clippy::type_complexity)]
 pub(crate) fn identity_projection(
     v: &Value,
 ) -> Result<Option<(Option<String>, Option<String>, Option<String>)>> {

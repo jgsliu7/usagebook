@@ -16,6 +16,8 @@ const DDL: &str = "CREATE TABLE local_runtime_token_usage (
 CREATE TABLE local_runtime_sessions (
   session_id TEXT PRIMARY KEY, record_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);";
 
+// Keep each fixture's SQL column values visible at its call site.
+#[allow(clippy::too_many_arguments)]
 fn insert_usage(
     conn: &rusqlite::Connection,
     id: i64,
@@ -121,8 +123,8 @@ fn model_backfill_turn_ts_session_and_isolation() {
     )
     .unwrap();
 
-    let (records, stats) =
-        usagebook_core::sources::minimax::MinimaxSource.scan_roots(&[root.clone()], None);
+    let (records, stats) = usagebook_core::sources::minimax::MinimaxSource
+        .scan_roots(std::slice::from_ref(&root), None);
     assert!(!stats.failed, "扫描不应失败: {:?}", stats.notes);
     assert_eq!(
         records.len(),

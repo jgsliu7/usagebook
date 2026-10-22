@@ -1,6 +1,6 @@
 //! One checked constraint evaluator for storage, summaries and query output.
 use super::types::*;
-use chrono::{Datelike, Duration, NaiveDate, TimeZone, Timelike};
+use chrono::{Duration, NaiveDate, TimeZone};
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Interval {
     lo: i128,
@@ -186,50 +186,4 @@ pub fn day_bounds(tz: &str, ts_ms: i64) -> Result<(i64, i64, String)> {
         date_boundary(tz, next)?,
         day.to_string(),
     ))
-}
-pub fn hour_bounds(tz: &str, ts_ms: i64) -> Result<(i64, i64, String)> {
-    let zone = timezone(tz)?;
-    let dt = zone
-        .timestamp_millis_opt(ts_ms)
-        .single()
-        .ok_or_else(|| LedgerError::InvalidInput("invalid timestamp".into()))?;
-    let (day_start, day_end, label) = day_bounds(tz, ts_ms)?;
-    let signature = |t: i64| -> Result<_> {
-        let d = zone
-            .timestamp_millis_opt(t)
-            .single()
-            .ok_or(LedgerError::NumericOverflow)?;
-        Ok((d.year(), d.ordinal(), d.hour(), d.offset().to_string()))
-    };
-    let current = signature(ts_ms)?;
-    let second = ts_ms - dt.timestamp_subsec_millis() as i64;
-    let mut start =
-        (second - dt.minute() as i64 * 60_000 - dt.second() as i64 * 1000).max(day_start);
-    if signature(start)? != current {
-        // A partial repeated hour (Lord Howe) starts at its offset transition.
-        let mut lo = start;
-        let mut hi = second;
-        while hi - lo > 1000 {
-            let mid = lo + ((hi - lo) / 2000) * 1000;
-            if signature(mid)? == current {
-                hi = mid
-            } else {
-                lo = mid + 1000
-            }
-        }
-        start = if signature(lo)? == current { lo } else { hi };
-    }
-    let nominal =
-        (second + (60 - dt.minute() as i64) * 60_000 - dt.second() as i64 * 1000).min(day_end);
-    let mut end = nominal;
-    // Physical offset changes can split a wall-clock hour before the next :00.
-    let mut probe = second + 1000;
-    while probe < nominal {
-        if signature(probe)? != current {
-            end = probe;
-            break;
-        }
-        probe += 1000;
-    }
-    Ok((start, end, label))
 }
