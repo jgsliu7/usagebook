@@ -1,27 +1,18 @@
-//! Copilot CLI 适配器 —— 依据 docs/数据源档案/19-copilot.md(二进制取证+实装对账)。
-//!
-//! 根:~/.copilot 或 COPILOT_HOME(CLI 单路径,逗号兼容保留 §7.1)
-//! 三通道(§7.1,优先级):session-store.db 的 assistant_usage_events(逐请求,免差分,
-//!     含官方 total_nano_aiu 成本)存在且非空 → 独占;否则 session-state shutdown 相邻差分
-//!     (§2)+ OTel(默认关闭用户,§7.1)
-//! inputTokens 同时含 cacheRead+cacheWrite → 双减除(§7.3 一手证实,官方 tokenDetails 背书)
-//! outputTokens 已含 reasoningTokens → 落库拆分 output−reasoning(§7.3)
-//! 成本:total_nano_aiu/1e9×0.01(1 AIU=1 credit=$0.01,schema overageEntitlement,§7.3)
-//! OTel:四种记录类型判别 + 同 (session,model) 时间 ≤ 末次 shutdown 的行丢弃防双计;
-//!     同 traceId 优先级 ChatSpan > InferenceLog > AgentTurnLog > AgentSummarySpan(§3/§4)
-//! 成本:requests.cost 口径不明(ccusage 忽略)→ 不取(§6)
+//! Copilot CLI: per-session database authority, with uncovered sessions supplied by
+//! shutdown/OTel. All three channels use the same inclusive-token contract.
+//! See docs/数据源档案/19-copilot.md for protocol evidence and conservative failures.
 
-use crate::common::{env_roots, flex_to_ms, home, json_u64, walk_with, SnapshotDiff};
+use crate::common::{env_roots, flex_to_ms, home, walk_with};
 use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub struct CopilotSource;
 
-/// OTel 行类型(§3;优先级 = 判定难度,数字越小优先级越高)。
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 enum OtelKind {
     AgentSummarySpan,
@@ -30,13 +21,46 @@ enum OtelKind {
     ChatSpan,
 }
 
+/// Gross input/output, cache-read/write, reasoning. Raw counters and exclusive
+/// buckets must BOTH be monotone before cumulative subtraction is justified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Counts([u64; 5]);
+impl Counts {
+    fn exclusive(self) -> Result<[u64; 5], &'static str> {
+        let [input, output, read, write, reasoning] = self.0;
+        let cached = read.checked_add(write).ok_or("TOKEN_RANGE")?;
+        if cached > input || reasoning > output {
+            return Err("TOKEN_SUBSET");
+        }
+        if input
+            .checked_add(output)
+            .is_none_or(|n| n > i64::MAX as u64)
+        {
+            return Err("TOKEN_RANGE");
+        }
+        Ok([input - cached, read, write, output - reasoning, reasoning])
+    }
+    fn shutdown(v: &Value) -> Result<Self, &'static str> {
+        if !v.is_object() {
+            return Err("TOKEN_FIELD");
+        }
+        Ok(Self([
+            token(v.get("inputTokens"))?,
+            token(v.get("outputTokens"))?,
+            token(v.get("cacheReadTokens"))?,
+            token(v.get("cacheWriteTokens"))?,
+            token(v.get("reasoningTokens"))?,
+        ]))
+    }
+}
+
 struct ShutdownSnap {
     ts_ms: i64,
     event_id: String,
-    usage: Value,
+    counts: Counts,
+    buckets: [u64; 5],
 }
 
-/// OTel 行(§3):内容键 + 级别 + 五桶,第二阶段统一做抑制过滤。
 struct OtelRow {
     ts_ms: i64,
     trace: String,
@@ -45,6 +69,29 @@ struct OtelRow {
     content_key: String,
     kind: OtelKind,
     buckets: [u64; 5],
+}
+
+/// Zero-token database rows still establish a session/model's database channel.
+#[derive(Default)]
+struct Coverage {
+    sessions: HashMap<String, HashSet<String>>,
+}
+impl Coverage {
+    fn covers(&self, session: &str) -> bool {
+        self.sessions.contains_key(session)
+    }
+    fn check_overlap(&self, session: &str, model: &str, nonzero: bool) -> Result<(), &'static str> {
+        let Some(models) = self.sessions.get(session) else {
+            return Ok(());
+        };
+        // A positive model absent from every database row proves a gap. Token
+        // totals, timestamps and requests.count do not: failed/retried calls
+        // have no established one-to-one contract with assistant_usage_events.
+        if nonzero && !models.contains(model_identity(model)) {
+            return Err("STORE_COVERAGE_GAP");
+        }
+        Ok(())
+    }
 }
 
 impl UsageSource for CopilotSource {
@@ -65,7 +112,7 @@ impl UsageSource for CopilotSource {
 
     fn scan_roots(
         &self,
-        roots: &[std::path::PathBuf],
+        roots: &[PathBuf],
         max_files: Option<usize>,
     ) -> (Vec<UsageRecord>, ScanStats) {
         let mut stats = ScanStats::default();
@@ -73,162 +120,225 @@ impl UsageSource for CopilotSource {
             stats.notes.push("未发现 ~/.copilot 或 COPILOT_HOME".into());
             return (vec![], stats);
         }
-        let mut records: Vec<UsageRecord> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut records = Vec::new();
+        let mut physical_roots = HashSet::new();
         let mut ss_files = 0usize;
         let mut otel_files = 0usize;
-        // (session, model) → 该组最后一个 shutdown 时间(OTel 双计防御,§4)
-        let mut last_shutdown: HashMap<(String, String), i64> = HashMap::new();
-
-        for r in roots {
-            // ===== 首选通道:session-store.db 逐请求(§7.1)=====
-            let store_db = r.join("session-store.db");
-            if store_db.is_file() {
-                let ledger_rows =
-                    scan_session_store(&store_db, &mut records, &mut seen, &mut stats);
-                if ledger_rows > 0 {
+        for root in roots {
+            let root = match root.canonicalize() {
+                Ok(root) => root,
+                Err(_) => {
+                    fail(&mut stats, "ROOT_READ");
+                    continue;
+                }
+            };
+            if !physical_roots.insert(root.clone()) {
+                continue;
+            }
+            // Debug formatting escapes non-UTF8 paths rather than collapsing
+            // distinct roots through lossy path display. JSON keys delimit fields.
+            let domain = format!("{root:?}");
+            let mut seen = HashMap::<String, [u64; 5]>::new();
+            let store_db = root.join("session-store.db");
+            let coverage = match store_db.try_exists() {
+                Ok(true) => {
                     stats.files_seen += 1;
+                    let result = scan_session_store(&store_db, &domain, &mut records, &mut stats);
                     stats.files_parsed += 1;
-                    stats.notes.push(format!(
-                        "session-store.db 逐请求通道 {} 行(§7.1,免差分)",
-                        ledger_rows
-                    ));
-                    continue; // 该根独占,session-state/otel 让位防双计
+                    result
                 }
-                stats.notes.push(format!(
-                    "{} 空/不可读,回退 events.jsonl(§7.1)",
-                    store_db.display()
-                ));
-            }
-
-            // ===== 通道 1:session-state(§2)=====
-            // (session, model) → 按时间排序的 shutdown 快照序列
-            let mut snaps: BTreeMap<(String, String), Vec<ShutdownSnap>> = BTreeMap::new();
-            if let Ok(rd) = std::fs::read_dir(r.join("session-state")) {
-                for e in rd.flatten() {
-                    let p = e.path().join("events.jsonl");
-                    if !p.is_file() {
+                Ok(false) => Coverage::default(),
+                Err(_) => {
+                    fail(&mut stats, "STORE_READ");
+                    Coverage::default()
+                }
+            };
+            // These maps live inside the physical root: same session/trace text
+            // in two installations cannot suppress each other's records.
+            let mut last_shutdown = HashMap::<(String, String), i64>::new();
+            let mut snaps = BTreeMap::<(String, String), Vec<ShutdownSnap>>::new();
+            let mut event_payloads = HashMap::<(String, String), Vec<u8>>::new();
+            let entries = match std::fs::read_dir(root.join("session-state")) {
+                Ok(rd) => match rd.collect::<Result<Vec<_>, _>>() {
+                    Ok(mut entries) => {
+                        entries.sort_by_key(|e| e.path());
+                        entries
+                    }
+                    Err(_) => {
+                        fail(&mut stats, "SESSION_READ");
+                        Vec::new()
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(_) => {
+                    fail(&mut stats, "SESSION_READ");
+                    Vec::new()
+                }
+            };
+            for entry in entries {
+                match std::fs::metadata(entry.path()) {
+                    Ok(md) if md.is_dir() => {}
+                    Ok(_) => continue, // session-state may also contain bookkeeping files
+                    Err(_) => {
+                        fail(&mut stats, "SESSION_READ");
                         continue;
                     }
-                    let Some(session) = e
-                        .path()
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string)
-                    else {
+                }
+                let p = entry.path().join("events.jsonl");
+                match p.try_exists() {
+                    Ok(false) => continue,
+                    Err(_) => {
+                        fail(&mut stats, "SESSION_READ");
                         continue;
+                    }
+                    Ok(true) => {}
+                }
+                let Some(session) = entry
+                    .file_name()
+                    .to_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned)
+                else {
+                    fail(&mut stats, "SESSION_ID");
+                    continue;
+                };
+                ss_files += 1;
+                stats.files_seen += 1;
+                let outcome = crate::common::for_each_line(&p, |line| {
+                    let Ok(v) = serde_json::from_str::<Value>(line) else {
+                        stats.lines_bad_json += 1;
+                        fail(&mut stats, "SESSION_JSON");
+                        return;
                     };
-                    ss_files += 1;
-                    crate::common::for_each_line(&p, |line| {
-                        stats.lines_total += 1;
-                        let Ok(v) = serde_json::from_str::<Value>(line) else {
-                            stats.lines_bad_json += 1;
-                            return;
-                        };
-                        if v.get("type").and_then(|x| x.as_str()) != Some("session.shutdown") {
-                            if v.get("type")
-                                .and_then(|x| x.as_str())
-                                .is_some_and(|t| t.starts_with("session."))
-                            {
-                                return; // start/resume:已知类型,静默跳过(§2)
+                    let kind = v.get("type").and_then(Value::as_str);
+                    if kind == Some("session.start") {
+                        if let Some(id) = v.pointer("/data/sessionId") {
+                            if id.as_str() != Some(session.as_str()) {
+                                fail(&mut stats, "SESSION_ID_CONFLICT");
                             }
-                            stats.lines_unknown_type += 1;
-                            return;
                         }
-                        let Some(metrics) =
-                            v.pointer("/data/modelMetrics").and_then(|x| x.as_object())
-                        else {
-                            stats.lines_unknown_type += 1;
-                            return;
-                        };
-                        let ts_ms = v
-                            .get("timestamp")
-                            .and_then(|x| x.as_str())
-                            .and_then(crate::common::iso_to_ms)
-                            .unwrap_or(0);
-                        let event_id = v
-                            .get("id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        for (model, _m) in metrics {
-                            let Some(usage) = _m.pointer("/usage") else {
-                                continue;
-                            };
-                            snaps
-                                .entry((session.clone(), model.clone()))
-                                .or_default()
-                                .push(ShutdownSnap {
-                                    ts_ms,
-                                    event_id: event_id.clone(),
-                                    usage: usage.clone(),
-                                });
-                        }
-                    });
-                    stats.files_parsed += 1;
-                    if max_files.is_some_and(|m| ss_files >= m) {
-                        break;
                     }
+                    if kind != Some("session.shutdown") {
+                        if !kind.is_some_and(|t| t.starts_with("session.")) {
+                            stats.lines_unknown_type += 1;
+                        }
+                        return;
+                    }
+                    let Some(metrics) = v.pointer("/data/modelMetrics").and_then(Value::as_object)
+                    else {
+                        fail(&mut stats, "SHUTDOWN_METRICS");
+                        return;
+                    };
+                    let event_id = match optional_id(v.get("id")) {
+                        Ok(id) => id.unwrap_or_default(),
+                        Err(code) => {
+                            fail(&mut stats, code);
+                            return;
+                        }
+                    };
+                    if !event_id.is_empty() {
+                        // Hash the entire event only in scan memory; raw context,
+                        // tokenDetails and message content never enter a cache.
+                        let payload =
+                            Sha256::digest(serde_json::to_vec(&v).unwrap_or_default()).to_vec();
+                        let key = (session.clone(), event_id.clone());
+                        if let Some(old) = event_payloads.get(&key) {
+                            if old != &payload {
+                                fail(&mut stats, "SHUTDOWN_ID_CONFLICT");
+                            }
+                            return;
+                        }
+                        event_payloads.insert(key, payload);
+                    }
+                    let ts_ms = v
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .and_then(crate::common::iso_to_ms)
+                        .unwrap_or(0);
+                    for (model, metric) in metrics {
+                        if model.trim().is_empty() {
+                            fail(&mut stats, "MODEL_ID");
+                            continue;
+                        }
+                        let Some(usage) = metric.get("usage") else {
+                            fail(&mut stats, "SHUTDOWN_USAGE");
+                            continue;
+                        };
+                        let parsed = (|| {
+                            let counts = Counts::shutdown(usage)?;
+                            let buckets = counts.exclusive()?;
+                            coverage.check_overlap(
+                                &session,
+                                model,
+                                buckets.iter().any(|n| *n > 0),
+                            )?;
+                            Ok((counts, buckets))
+                        })();
+                        match parsed {
+                            Err(code) => fail(&mut stats, code),
+                            Ok((counts, buckets)) if !coverage.covers(&session) => {
+                                snaps
+                                    .entry((session.clone(), model.clone()))
+                                    .or_default()
+                                    .push(ShutdownSnap {
+                                        ts_ms,
+                                        event_id: event_id.clone(),
+                                        counts,
+                                        buckets,
+                                    });
+                            }
+                            Ok(_) => {} // ordinary overlap: database owns this session
+                        }
+                    }
+                });
+                outcome.apply_to_stats(&mut stats);
+                stats.files_parsed += 1;
+                if max_files.is_some_and(|m| ss_files >= m) {
+                    break;
                 }
             }
-            // 累计快照 → 相邻差分拆区间增量(§2;SnapshotDiff 首见/下降取全量)
-            for ((session, model), mut seq) in snaps {
-                seq.sort_by_key(|s| s.ts_ms);
-                let mut diff = SnapshotDiff::default();
-                for s in &seq {
-                    last_shutdown.insert((session.clone(), model.clone()), s.ts_ms);
-                    let g = |k: &str| json_u64(s.usage.get(k));
-                    let (i_raw, o, rs) =
-                        (g("inputTokens"), g("outputTokens"), g("reasoningTokens"));
-                    let (cr, cw) = (g("cacheReadTokens"), g("cacheWriteTokens"));
-                    let cur = [
-                        i_raw.saturating_sub(cr.saturating_add(cw)), // 双减除(§2)
-                        cr,
-                        cw,
-                        o,
-                        rs,
-                    ];
-                    let d = diff.push(cur);
-                    if d.iter().all(|&x| x == 0) {
-                        continue; // 全零增量不入账
-                    }
-                    let key = if s.event_id.is_empty() {
-                        format!("copilot:s:{}:{}:{}:{}", session, model, s.ts_ms, d[0])
+            for ((session, model), seq) in snaps {
+                let mut previous: Option<(Counts, [u64; 5])> = None;
+                for (ordinal, s) in seq.iter().enumerate() {
+                    let delta = if let Some((raw, exclusive)) = previous {
+                        if s.counts.0.iter().zip(raw.0).any(|(a, b)| *a < b)
+                            || s.buckets.iter().zip(exclusive).any(|(a, b)| *a < b)
+                        {
+                            // Neither resume, timestamp, nor sessionStartTime
+                            // proves a new accumulation segment. Fail closed.
+                            fail(&mut stats, "SHUTDOWN_NON_MONOTONE");
+                            break;
+                        }
+                        std::array::from_fn(|i| s.buckets[i] - exclusive[i])
                     } else {
-                        format!("copilot:s:{}:{}:{}:{}", session, model, s.event_id, model)
+                        s.buckets
                     };
-                    if !seen.insert(key.clone()) {
+                    previous = Some((s.counts, s.buckets));
+                    last_shutdown
+                        .entry((session.clone(), model_identity(&model).to_owned()))
+                        .and_modify(|cut| *cut = (*cut).max(s.ts_ms))
+                        .or_insert(s.ts_ms);
+                    if delta.iter().all(|n| *n == 0) {
                         continue;
                     }
-                    records.push(UsageRecord {
-                        source: "copilot",
-                        session_id: session.clone(),
-                        agent: None,
-                        model: model.clone(),
-                        ts_ms: s.ts_ms,
-                        caliber: Caliber::RequestDelta,
-                        request_count: 1,
-                        input_uncached: d[0],
-                        cache_read: d[1],
-                        cache_write: d[2],
-                        cache_write_1h: 0,
-                        output: d[3],
-                        reasoning_output: d[4],
-                        cost_usd: None, // requests.cost 口径不明,不取(§6)
-                        dedup_key: key,
-                    });
+                    let identity = if s.event_id.is_empty() {
+                        format!("line:{ordinal}")
+                    } else {
+                        s.event_id.clone()
+                    };
+                    let key = key(&[&domain, "shutdown", &session, &model, &identity]);
+                    records.push(record(&session, &model, s.ts_ms, delta, key));
                 }
             }
 
-            // ===== 通道 2:OTel(§3/§4)=====
-            let otel_files_list = walk_with(&r.join("otel"), None, &|p| {
+            let files = walk_with(&root.join("otel"), None, &|p| {
                 p.extension().is_some_and(|x| x == "jsonl")
             });
-            // traceId → 最高级别(§4):低级别行整组抑制,最高级别的行全部保留
-            let mut trace_best: HashMap<String, OtelKind> = HashMap::new();
-            let mut otel_rows: Vec<OtelRow> = Vec::new();
-            for p in &otel_files_list {
+            let mut trace_best = HashMap::<(String, String), OtelKind>::new();
+            let mut otel_rows = Vec::new();
+            for p in files {
                 otel_files += 1;
+                stats.files_seen += 1;
                 let mtime_ms = p
                     .metadata()
                     .ok()
@@ -236,341 +346,385 @@ impl UsageSource for CopilotSource {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                crate::common::for_each_line(p, |line| {
-                    stats.lines_total += 1;
+                let outcome = crate::common::for_each_line(&p, |line| {
                     let Ok(v) = serde_json::from_str::<Value>(line) else {
                         stats.lines_bad_json += 1;
+                        fail(&mut stats, "OTEL_JSON");
                         return;
                     };
-                    let attrs = v.get("attributes").unwrap_or(&Value::Null);
-                    let a = |k: &str| attrs.get(k);
-                    let is_span = v.get("type").and_then(|x| x.as_str()) == Some("span");
-                    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
-                    let event_name = v
-                        .pointer("/event.name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("");
-                    let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
-                    // 类型判别(§3)
-                    let kind = if is_span
-                        && (a("gen_ai.operation.name").and_then(|x| x.as_str()) == Some("chat")
-                            || name.starts_with("chat "))
-                    {
-                        Some(OtelKind::ChatSpan)
-                    } else if !is_span
-                        && (event_name == "gen_ai.client.inference.operation.details"
-                            || body.starts_with("GenAI inference:"))
-                    {
-                        Some(OtelKind::InferenceLog)
-                    } else if !is_span && event_name == "copilot_chat.agent.turn" {
-                        Some(OtelKind::AgentTurnLog)
-                    } else if is_span
-                        && a("gen_ai.operation.name").and_then(|x| x.as_str())
-                            == Some("invoke_agent")
-                    {
-                        Some(OtelKind::AgentSummarySpan)
-                    } else {
-                        None
-                    };
-                    let Some(kind) = kind else {
-                        stats.lines_unknown_type += 1;
-                        return;
-                    };
-                    // 用量(§3;数值可为数字或字符串)
-                    let input = json_u64(a("gen_ai.usage.input_tokens"));
-                    let cr = json_u64(a("gen_ai.usage.cache_read.input_tokens"));
-                    let o = json_u64(a("gen_ai.usage.output_tokens"));
-                    let cw = json_u64(a("gen_ai.usage.cache_write.input_tokens"))
-                        .max(json_u64(a("gen_ai.usage.cache_creation.input_tokens")));
-                    let rs = json_u64(a("gen_ai.usage.reasoning.output_tokens"))
-                        .max(json_u64(a("gen_ai.usage.reasoning_tokens")));
-                    if input == 0 && o == 0 && cr == 0 && cw == 0 && rs == 0 {
-                        return;
-                    }
-                    let input_uncached = input.saturating_sub(cr.min(input)); // input 含 cache_read(§3)
-                                                                              // 会话(§5)
-                    let session = [
-                        "gen_ai.conversation.id",
-                        "copilot_chat.session_id",
-                        "copilot_chat.chat_session_id",
-                        "session.id",
-                        "github.copilot.interaction_id",
-                        "gen_ai.response.id",
-                    ]
-                    .iter()
-                    .find_map(|k| a(k).and_then(|x| x.as_str()))
-                    .map(str::to_string);
-                    let trace = v
-                        .get("traceId")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    // 模型(§5):response.model > request.model,剥 -1m 后缀
-                    let model = ["gen_ai.response.model", "gen_ai.request.model"]
-                        .iter()
-                        .find_map(|k| a(k).and_then(|x| x.as_str()))
-                        .map(|m| {
-                            m.strip_suffix("-1m-internal")
-                                .or_else(|| m.strip_suffix("-1m"))
-                                .unwrap_or(m)
-                                .to_string()
-                        })
-                        .unwrap_or_else(|| "unknown".into());
-                    // 时间戳(§3):数组 > 标量 > timeUnixNano > mtime
-                    let ts_ms = ["endTime", "startTime", "hrTime", "_hrTime", "time"]
-                        .iter()
-                        .find_map(|k| flex_to_ms(v.get(*k)))
-                        .or_else(|| {
-                            v.get("timeUnixNano")
-                                .and_then(|x| x.as_f64())
-                                .map(|n| (n / 1e6) as i64)
-                        })
-                        .unwrap_or(mtime_ms);
-                    let content_key = format!(
-                        "copilot:o:{}:{}:{}:{}:{}",
-                        v.get("spanId")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or(trace.as_str()),
-                        ts_ms,
-                        model,
-                        input_uncached,
-                        o
-                    );
-                    // 同 traceId 优先级登记(§4):记录该 trace 出现过的最高级别
-                    if !trace.is_empty() {
-                        let e = trace_best.entry(trace.clone()).or_insert(kind);
-                        if kind > *e {
-                            *e = kind;
+                    match parse_otel(&v, &domain, mtime_ms) {
+                        Err(code) => fail(&mut stats, code),
+                        Ok(None) => {
+                            stats.lines_unknown_type += 1;
+                        }
+                        Ok(Some(row)) => {
+                            if row.buckets.iter().all(|n| *n == 0) {
+                                return;
+                            }
+                            if let Err(code) =
+                                coverage.check_overlap(&row.session, &row.model, true)
+                            {
+                                fail(&mut stats, code);
+                                return;
+                            }
+                            if coverage.covers(&row.session) {
+                                return;
+                            }
+                            if !row.trace.is_empty() {
+                                let k = (row.session.clone(), row.trace.clone());
+                                trace_best
+                                    .entry(k)
+                                    .and_modify(|best| *best = (*best).max(row.kind))
+                                    .or_insert(row.kind);
+                            }
+                            otel_rows.push(row);
                         }
                     }
-                    let sess = session.unwrap_or_else(|| trace.clone());
-                    otel_rows.push(OtelRow {
-                        ts_ms,
-                        trace,
-                        session: sess,
-                        model,
-                        content_key,
-                        kind,
-                        buckets: [input_uncached, cr, cw, o, rs],
-                    });
                 });
+                outcome.apply_to_stats(&mut stats);
                 stats.files_parsed += 1;
                 if max_files.is_some_and(|m| otel_files >= m) {
                     break;
                 }
             }
             for row in otel_rows {
-                // 双计防御(§4):≤ 同 (session,model) 末次 shutdown 的 OTel 行丢弃
-                if let Some(&cut) = last_shutdown.get(&(row.session.clone(), row.model.clone())) {
-                    if cut > 0 && row.ts_ms <= cut {
-                        continue;
-                    }
-                }
-                // 同 traceId 优先级抑制(§4):该 trace 存在更高级别 → 低级别行丢弃
-                if !row.trace.is_empty() {
-                    if let Some(&best) = trace_best.get(&row.trace) {
-                        if best > row.kind {
-                            continue;
-                        }
-                    }
-                }
-                if !seen.insert(row.content_key.clone()) {
+                if last_shutdown
+                    .get(&(row.session.clone(), model_identity(&row.model).to_owned()))
+                    .is_some_and(|cut| *cut > 0 && row.ts_ms <= *cut)
+                {
                     continue;
                 }
-                records.push(UsageRecord {
-                    source: "copilot",
-                    session_id: row.session,
-                    agent: None,
-                    model: row.model,
-                    ts_ms: row.ts_ms,
-                    caliber: Caliber::RequestDelta,
-                    request_count: 1,
-                    input_uncached: row.buckets[0],
-                    cache_read: row.buckets[1],
-                    cache_write: row.buckets[2],
-                    cache_write_1h: 0,
-                    output: row.buckets[3],
-                    reasoning_output: row.buckets[4],
-                    cost_usd: None,
-                    dedup_key: row.content_key,
-                });
+                if trace_best
+                    .get(&(row.session.clone(), row.trace.clone()))
+                    .is_some_and(|best| *best > row.kind)
+                {
+                    continue;
+                }
+                if let Some(old) = seen.get(&row.content_key) {
+                    if old != &row.buckets {
+                        fail(&mut stats, "OTEL_ID_CONFLICT");
+                    }
+                    continue;
+                }
+                seen.insert(row.content_key.clone(), row.buckets);
+                records.push(record(
+                    &row.session,
+                    &row.model,
+                    row.ts_ms,
+                    row.buckets,
+                    row.content_key,
+                ));
             }
         }
-
         stats.notes.push(format!(
             "session-state 文件 {ss_files} · otel 文件 {otel_files}"
         ));
-        if !last_shutdown.is_empty() {
-            stats
-                .notes
-                .push(format!("shutdown 快照组 {}(相邻差分)", last_shutdown.len()));
-        }
         (records, stats)
     }
 }
 
-/// session-store.db 的 assistant_usage_events 逐请求通道(§7.1)。
-/// 列防御:total_nano_aiu 等为后期迁移列,缺失按 NULL 读。
+fn parse_otel(v: &Value, domain: &str, mtime_ms: i64) -> Result<Option<OtelRow>, &'static str> {
+    let attrs = v.get("attributes").unwrap_or(&Value::Null);
+    let a = |k: &str| attrs.get(k);
+    let is_span = v.get("type").and_then(Value::as_str) == Some("span");
+    let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+    let event_name = v.get("event.name").and_then(Value::as_str).unwrap_or("");
+    let body = v.get("body").and_then(Value::as_str).unwrap_or("");
+    let kind = if is_span
+        && (a("gen_ai.operation.name").and_then(Value::as_str) == Some("chat")
+            || name.starts_with("chat "))
+    {
+        OtelKind::ChatSpan
+    } else if !is_span
+        && (event_name == "gen_ai.client.inference.operation.details"
+            || body.starts_with("GenAI inference:"))
+    {
+        OtelKind::InferenceLog
+    } else if !is_span && event_name == "copilot_chat.agent.turn" {
+        OtelKind::AgentTurnLog
+    } else if is_span && a("gen_ai.operation.name").and_then(Value::as_str) == Some("invoke_agent")
+    {
+        OtelKind::AgentSummarySpan
+    } else {
+        return Ok(None);
+    };
+    let counts = Counts([
+        token(a("gen_ai.usage.input_tokens"))?,
+        token(a("gen_ai.usage.output_tokens"))?,
+        token(a("gen_ai.usage.cache_read.input_tokens"))?,
+        aliased_token(
+            a("gen_ai.usage.cache_write.input_tokens"),
+            a("gen_ai.usage.cache_creation.input_tokens"),
+        )?,
+        aliased_token(
+            a("gen_ai.usage.reasoning.output_tokens"),
+            a("gen_ai.usage.reasoning_tokens"),
+        )?,
+    ]);
+    let buckets = counts.exclusive()?;
+    if buckets.iter().all(|n| *n == 0) {
+        return Ok(None);
+    }
+    let mut session = None;
+    for field in [
+        "gen_ai.conversation.id",
+        "copilot_chat.session_id",
+        "copilot_chat.chat_session_id",
+        "session.id",
+    ] {
+        if let Some(id) = optional_id(a(field))? {
+            if session.as_ref().is_some_and(|old| old != &id) {
+                return Err("SESSION_ID_CONFLICT");
+            }
+            session = Some(id);
+        }
+    }
+    // trace/response/interaction IDs identify operations, not a proven session.
+    let session = session.ok_or("OTEL_SESSION_ID")?;
+    let trace = optional_id(v.get("traceId"))?.unwrap_or_default();
+    let model = ["gen_ai.response.model", "gen_ai.request.model"]
+        .iter()
+        .find_map(|k| a(k).and_then(Value::as_str))
+        .map(model_identity)
+        .unwrap_or("unknown")
+        .to_owned();
+    let ts_ms = ["endTime", "startTime", "hrTime", "_hrTime", "time"]
+        .iter()
+        .find_map(|k| flex_to_ms(v.get(*k)))
+        .or_else(|| {
+            v.get("timeUnixNano")
+                .and_then(Value::as_f64)
+                .map(|n| (n / 1e6) as i64)
+        })
+        .unwrap_or(mtime_ms);
+    let operation = optional_id(v.get("spanId"))?
+        .or(optional_id(a("gen_ai.response.id"))?)
+        .unwrap_or_else(|| trace.clone());
+    let content_key = key(&[
+        domain,
+        "otel",
+        &session,
+        &operation,
+        &ts_ms.to_string(),
+        &model,
+    ]);
+    Ok(Some(OtelRow {
+        ts_ms,
+        trace,
+        session,
+        model,
+        content_key,
+        kind,
+        buckets,
+    }))
+}
+
+fn record(session: &str, model: &str, ts_ms: i64, b: [u64; 5], dedup_key: String) -> UsageRecord {
+    UsageRecord {
+        source: "copilot",
+        session_id: session.to_owned(),
+        agent: None,
+        model: model.to_owned(),
+        ts_ms,
+        caliber: Caliber::RequestDelta,
+        request_count: 1,
+        input_uncached: b[0],
+        cache_read: b[1],
+        cache_write: b[2],
+        cache_write_1h: 0,
+        output: b[3],
+        reasoning_output: b[4],
+        cost_usd: None,
+        dedup_key,
+    }
+}
+
 fn scan_session_store(
     db: &Path,
+    domain: &str,
     records: &mut Vec<UsageRecord>,
-    seen: &mut HashSet<String>,
     stats: &mut ScanStats,
-) -> usize {
-    let Some(conn) = open_ro(db) else {
-        return 0;
-    };
-    if !has_table(&conn, "assistant_usage_events") {
-        return 0;
-    }
-    let has_nano = has_column(&conn, "assistant_usage_events", "total_nano_aiu");
-    let has_reason = has_column(&conn, "assistant_usage_events", "reasoning_tokens");
-    let nano_sel = if has_nano { "total_nano_aiu" } else { "NULL" };
-    let reason_sel = if has_reason { "reasoning_tokens" } else { "0" };
-    let sql = format!(
-        "SELECT id, session_id, agent_id, model, input_tokens, output_tokens, \
-                cache_read_tokens, cache_write_tokens, {reason_sel}, {nano_sel}, created_at \
-                FROM assistant_usage_events ORDER BY id"
-    );
-    let Ok(mut stmt) = conn.prepare(&sql) else {
-        stats.notes.push(format!(
-            "{} assistant_usage_events 查询构建失败",
-            db.display()
-        ));
-        stats.failed = true;
-        return 0;
-    };
-    let Ok(mut rows) = stmt.query([]) else {
-        stats.notes.push(format!(
-            "{} assistant_usage_events 查询执行失败",
-            db.display()
-        ));
-        stats.failed = true;
-        return 0;
-    };
-    let mut n = 0usize;
-    while let Ok(Some(row)) = rows.next() {
-        let vals: Vec<SqlValue> = (0..11)
-            .filter_map(|i| row.get::<_, SqlValue>(i).ok())
-            .collect();
-        if vals.len() < 11 {
-            stats.lines_bad_json += 1;
-            continue;
+) -> Coverage {
+    let mut coverage = Coverage::default();
+    let result = (|| -> rusqlite::Result<()> {
+        let conn = crate::common::open_sqlite_readonly(db)?;
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='assistant_usage_events')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(());
         }
-        let Some(lid) = v_text(&vals[0]) else {
-            stats.lines_bad_json += 1;
-            continue;
-        };
-        stats.lines_total += 1;
-        let session_id = v_text(&vals[1]).unwrap_or_default();
-        let agent_raw = v_text(&vals[2]).unwrap_or_default();
-        let model = v_text(&vals[3]).unwrap_or_default();
-        let model = if model.trim().is_empty() {
-            "unknown".into()
+        let columns = columns(&conn)?;
+        let nano = if columns.contains("total_nano_aiu") {
+            "total_nano_aiu"
         } else {
-            model
+            "NULL"
         };
-        let input = v_u64(&vals[4]); // 已含 cacheRead+cacheWrite(§7.3)
-        let output_gross = v_u64(&vals[5]); // 已含 reasoning(§7.3)
-        let cr = v_u64(&vals[6]);
-        let cw = v_u64(&vals[7]);
-        let reasoning = v_u64(&vals[8]);
-        let nano = match &vals[9] {
-            SqlValue::Integer(i) if *i > 0 => *i as u64,
-            SqlValue::Real(f) if *f > 0.0 => *f as u64,
-            _ => 0,
+        let reason = if columns.contains("reasoning_tokens") {
+            "reasoning_tokens"
+        } else {
+            "0"
         };
-        if input == 0 && output_gross == 0 && cr == 0 && cw == 0 {
-            continue; // 全零跳过(三跳过)
-        }
-        // created_at:SQLite datetime('now') naive UTC "YYYY-MM-DD HH:MM:SS"(§7)
-        let ts_ms = v_text(&vals[10])
-            .and_then(|s| {
-                chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S")
-                    .ok()
+        let sql = format!("SELECT id, session_id, agent_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, {reason}, {nano}, created_at FROM assistant_usage_events ORDER BY id");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut ids = HashMap::<String, Vec<SqlValue>>::new();
+        while let Some(row) = rows.next()? {
+            stats.lines_total += 1;
+            let vals: Vec<SqlValue> = (0..11).map(|i| row.get(i)).collect::<Result<_, _>>()?;
+            let parsed = (|| {
+                let id = db_id(&vals[0])?;
+                if let Some(old) = ids.get(&id) {
+                    return if old == &vals {
+                        Ok(None)
+                    } else {
+                        Err("STORE_ID_CONFLICT")
+                    };
+                }
+                ids.insert(id.clone(), vals.clone());
+                let session = sql_text(&vals[1])
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("SESSION_ID")?;
+                let model = sql_text(&vals[3])
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("unknown");
+                let raw = Counts([
+                    sql_token(&vals[4])?,
+                    sql_token(&vals[5])?,
+                    sql_token(&vals[6])?,
+                    sql_token(&vals[7])?,
+                    sql_token(&vals[8])?,
+                ]);
+                let buckets = raw.exclusive()?;
+                let nano = match &vals[9] {
+                    SqlValue::Null => 0,
+                    v => sql_token(v)?,
+                };
+                let ts_ms = sql_text(&vals[10])
+                    .and_then(|s| {
+                        chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S").ok()
+                    })
                     .map(|t| t.and_utc().timestamp_millis())
-            })
-            .unwrap_or(0);
-        // 成本(§7.3):美元 ≈ total_nano_aiu/1e9 × 0.01(1 AIU=1 credit=$0.01)
-        let cost = if nano > 0 {
-            Some(nano as f64 / 1e9 * 0.01)
-        } else {
-            None
-        };
-        let agent = match agent_raw.trim() {
-            "" | "main" => None,
-            a => Some(a.to_string()),
-        };
-        let key = format!("copilot:store:{}:{}", db.display(), lid);
-        if seen.insert(key.clone()) {
-            records.push(UsageRecord {
-                source: "copilot",
-                session_id,
-                agent,
-                model,
-                ts_ms,
-                caliber: Caliber::RequestDelta, // 逐请求,免差分(§7.1)
-                request_count: 1,
-                input_uncached: input.saturating_sub(cr).saturating_sub(cw),
-                cache_read: cr,
-                cache_write: cw,
-                cache_write_1h: 0,
-                output: output_gross.saturating_sub(reasoning),
-                reasoning_output: reasoning,
-                cost_usd: cost,
-                dedup_key: key,
-            });
-            n += 1;
-        }
-    }
-    n
-}
-
-fn open_ro(db: &Path) -> Option<Connection> {
-    let conn = crate::common::open_sqlite_readonly(db).ok()?;
-    Some(conn)
-}
-
-fn has_table(conn: &Connection, name: &str) -> bool {
-    conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
-        [name],
-        |r| r.get::<_, i64>(0),
-    )
-    .unwrap_or(0)
-        > 0
-}
-
-fn has_column(conn: &Connection, table: &str, col: &str) -> bool {
-    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
-        return false;
-    };
-    let Ok(mut rows) = stmt.query([]) else {
-        return false;
-    };
-    while let Ok(Some(r)) = rows.next() {
-        if let Ok(name) = r.get::<_, String>(1) {
-            if name == col {
-                return true;
+                    .unwrap_or(0);
+                coverage
+                    .sessions
+                    .entry(session.to_owned())
+                    .or_default()
+                    .insert(model_identity(model).to_owned());
+                if buckets.iter().all(|n| *n == 0) {
+                    return Ok(None);
+                }
+                let mut row = record(session, model, ts_ms, buckets, key(&[domain, "store", &id]));
+                row.agent = sql_text(&vals[2])
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty() && *a != "main")
+                    .map(str::to_owned);
+                row.cost_usd = (nano > 0).then(|| nano as f64 / 1e9 * 0.01);
+                Ok(Some(row))
+            })();
+            match parsed {
+                Ok(Some(row)) => records.push(row),
+                Ok(None) => {}
+                Err(code) => fail(stats, code),
             }
         }
+        Ok(())
+    })();
+    if result.is_err() {
+        fail(stats, "STORE_READ");
     }
-    false
+    coverage
 }
 
-fn v_text(v: &SqlValue) -> Option<String> {
-    match v {
-        SqlValue::Text(s) => Some(s.clone()),
-        SqlValue::Integer(i) => Some(i.to_string()),
-        _ => None,
+fn columns(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(assistant_usage_events)")?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?.collect();
+    names
+}
+fn key(parts: &[&str]) -> String {
+    format!(
+        "copilot:{}",
+        serde_json::to_string(parts).expect("string array")
+    )
+}
+fn model_identity(model: &str) -> &str {
+    model
+        .strip_suffix("-1m-internal")
+        .or_else(|| model.strip_suffix("-1m"))
+        .unwrap_or(model)
+}
+fn fail(stats: &mut ScanStats, code: &str) {
+    stats.failed = true;
+    let note = format!("Copilot {code}：来源读取不完整");
+    if !stats.notes.contains(&note) {
+        stats.notes.push(note);
     }
 }
-
-fn v_u64(v: &SqlValue) -> u64 {
+fn optional_id(v: Option<&Value>) -> Result<Option<String>, &'static str> {
     match v {
-        SqlValue::Integer(i) => (*i).max(0) as u64,
-        SqlValue::Real(f) if *f > 0.0 => *f as u64,
-        SqlValue::Text(s) => s.trim().parse().unwrap_or(0),
-        _ => 0,
+        None => Ok(None),
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.clone())),
+        _ => Err("IDENTITY_FIELD"),
+    }
+}
+fn token(v: Option<&Value>) -> Result<u64, &'static str> {
+    let n = match v {
+        None => 0,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(n) => n,
+            None => return n.as_f64().ok_or("TOKEN_FIELD").and_then(float_token),
+        },
+        Some(Value::String(s))
+            if !s.trim().is_empty() && s.trim().bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            s.trim().parse().map_err(|_| "TOKEN_RANGE")?
+        }
+        _ => return Err("TOKEN_FIELD"),
+    };
+    if n > i64::MAX as u64 {
+        Err("TOKEN_RANGE")
+    } else {
+        Ok(n)
+    }
+}
+fn float_token(n: f64) -> Result<u64, &'static str> {
+    // Beyond 2^53, a floating-point number cannot prove an exact integer count.
+    if n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n <= 9_007_199_254_740_991.0 {
+        Ok(n as u64)
+    } else {
+        Err("TOKEN_FIELD")
+    }
+}
+fn aliased_token(a: Option<&Value>, b: Option<&Value>) -> Result<u64, &'static str> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let a = token(Some(a))?;
+            if a != token(Some(b))? {
+                Err("TOKEN_ALIAS_CONFLICT")
+            } else {
+                Ok(a)
+            }
+        }
+        (a, b) => token(a.or(b)),
+    }
+}
+fn sql_token(v: &SqlValue) -> Result<u64, &'static str> {
+    match v {
+        SqlValue::Integer(n) if *n >= 0 => Ok(*n as u64),
+        SqlValue::Real(n) => float_token(*n),
+        SqlValue::Text(s) => token(Some(&Value::String(s.clone()))),
+        _ => Err("TOKEN_FIELD"),
+    }
+}
+fn sql_text(v: &SqlValue) -> Option<&str> {
+    if let SqlValue::Text(s) = v {
+        Some(s)
+    } else {
+        None
+    }
+}
+fn db_id(v: &SqlValue) -> Result<String, &'static str> {
+    match v {
+        SqlValue::Integer(n) if *n >= 0 => Ok(n.to_string()),
+        SqlValue::Text(s) if !s.trim().is_empty() => Ok(s.clone()),
+        _ => Err("STORE_ID"),
     }
 }

@@ -34,6 +34,15 @@ pub struct FileStamp {
 }
 
 impl FileStamp {
+    /// Presence of a discovery member, independent of directory mtime. Input
+    /// files themselves always carry real stamps, including symlink targets.
+    pub(crate) fn membership() -> Self {
+        Self {
+            len: 0,
+            modified: std::time::UNIX_EPOCH,
+            identity: None,
+        }
+    }
     pub fn size(&self) -> u64 {
         self.len
     }
@@ -1009,7 +1018,7 @@ pub fn usage_projection(value: &Value, paths: &[&str]) -> Value {
     out
 }
 
-type SourceFingerprint = Vec<(PathBuf, FileStamp)>;
+pub type SourceFingerprint = Vec<(PathBuf, FileStamp)>;
 struct SourceEntry {
     fingerprint: SourceFingerprint,
     records: Vec<crate::model::UsageRecord>,
@@ -1103,7 +1112,11 @@ pub fn scan_source_cached(
         stats.failed |= take_walk_error();
         return (records, stats);
     }
-    let before = source_fingerprint(roots);
+    let prepared = source.prepare_scan(roots);
+    let before = match &prepared {
+        Some(inputs) => inputs.fingerprint(),
+        None => source_fingerprint(roots),
+    };
     if let Some(fingerprint) = &before {
         let cache = SOURCE_CACHE
             .get_or_init(Default::default)
@@ -1167,14 +1180,40 @@ pub fn scan_source_cached(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(source.id());
-    let (records, mut stats) = source.scan_roots(roots, None);
+    let (records, mut stats) = match &prepared {
+        Some(inputs) => inputs.scan(),
+        None => source.scan_roots(roots, None),
+    };
     stats.failed |= take_walk_error();
     stats.files_read = stats.files_parsed;
+    let after = if prepared.is_some() {
+        // Re-discover members and backend choices, not just the old paths.
+        let after = source
+            .prepare_scan(roots)
+            .and_then(|inputs| inputs.fingerprint());
+        if before.is_none() || after.is_none() {
+            stats.failed = true;
+            stats.notes.push("用量输入发现不完整，下轮重试".into());
+        } else if before != after {
+            // A read-only SQLite connection may itself create/remove sidecars.
+            // A complete read remains usable, but never freeze a moving input
+            // set as a stable cache. Actual discovery/read failures stay failed.
+            stats
+                .notes
+                .push("扫描期间用量输入发生变化，本轮不缓存".into());
+        }
+        after
+    } else if before.is_some() && !records.is_empty() && !stats.failed && stats.lines_bad_json == 0
+    {
+        source_fingerprint(roots)
+    } else {
+        None
+    };
     let weight = source_cache_weight(&records, &stats, &before);
     // 冻结契约:只认显式标志;notes 文本不参与机器判定(措辞润色不得改变缓存语义)。
     let failed = stats.failed || stats.lines_bad_json > 0;
     let stable = before.as_ref().is_some_and(|fingerprint| {
-        !records.is_empty() && !failed && Some(fingerprint) == source_fingerprint(roots).as_ref()
+        !records.is_empty() && !failed && Some(fingerprint) == after.as_ref()
     });
     if let Some(fingerprint) = before.filter(|_| stable) {
         let mut cache = SOURCE_CACHE
@@ -1338,6 +1377,27 @@ pub fn open_sqlite_readonly(db: &std::path::Path) -> rusqlite::Result<rusqlite::
     Ok(conn)
 }
 
+/// Advance a usage query without mistaking a mid-read failure for normal EOF.
+/// Partial rows remain available for diagnostics, but `failed` prevents caching
+/// them as a complete source snapshot and makes the HTTP/CLI coverage explicit.
+pub fn next_sqlite_row<'a, 'stmt>(
+    rows: &'a mut rusqlite::Rows<'stmt>,
+    source: &str,
+    stats: &mut crate::model::ScanStats,
+) -> Option<&'a rusqlite::Row<'stmt>> {
+    match rows.next() {
+        Ok(Some(row)) => Some(row),
+        Ok(None) => None,
+        Err(error) => {
+            stats.failed = true;
+            stats
+                .notes
+                .push(format!("{source} SQLite 读取中断: {error}"));
+            None
+        }
+    }
+}
+
 /// epoch 秒/毫秒自适应(<TS_MS_FLOOR 视为秒 ×1000;juejin 惯例,时间戳漂移防护)。
 pub fn secs_or_ms(n: i64) -> i64 {
     if n.abs() < TS_MS_FLOOR {
@@ -1442,48 +1502,109 @@ pub fn ms_to_local_hour(ms: i64) -> String {
     }
 }
 
-/// 流式逐行读 jsonl,对每行调用 f(&str);返回(总行数,坏行数)。
-/// 尾行不完整(append-only 崩溃残留)按坏行计数跳过——档案纪律。
-pub fn for_each_line<P: AsRef<Path>, F: FnMut(&str)>(path: P, f: F) -> (u64, u64) {
+/// Failures owned by the byte reader, distinct from JSON syntax errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineReadError {
+    Open(std::io::ErrorKind),
+    Read(std::io::ErrorKind),
+}
+
+/// A complete EOF can still contain invalid UTF-8 lines. Callers must account
+/// for both, rather than treating a nonempty partial projection as success.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[must_use = "apply the read outcome to ScanStats so partial input cannot be cached as complete"]
+pub struct LineReadOutcome {
+    pub lines_delivered: u64,
+    /// Bytes consumed from BufRead, including blank, invalid and partial lines.
+    pub bytes_read: u64,
+    pub invalid_utf8_lines: u64,
+    pub error: Option<LineReadError>,
+    pub reached_eof: bool,
+}
+
+impl LineReadOutcome {
+    /// The reader owns delivered-line totals and encoding/I/O failures. JSON
+    /// callbacks own syntax/unknown-type counts; encoding is not a JSON error.
+    pub fn apply_to_stats(self, stats: &mut crate::model::ScanStats) {
+        stats.lines_total += self.lines_delivered;
+        stats.bytes_read += self.bytes_read;
+        if self.invalid_utf8_lines > 0 {
+            stats.failed = true;
+            stats.notes.push(format!(
+                "JSONL 编码错误：{} 行不是有效 UTF-8，来源读取不完整",
+                self.invalid_utf8_lines
+            ));
+        }
+        if let Some(error) = self.error {
+            stats.failed = true;
+            let (operation, kind) = match error {
+                LineReadError::Open(kind) => ("打开", kind),
+                LineReadError::Read(kind) => ("读取", kind),
+            };
+            stats
+                .notes
+                .push(format!("JSONL {operation}失败 ({kind:?})，来源读取不完整"));
+        } else if !self.reached_eof {
+            stats.failed = true;
+            stats
+                .notes
+                .push("JSONL 未完整读至 EOF，来源读取不完整".into());
+        }
+    }
+}
+
+/// Stream nonempty, trimmed UTF-8 lines into the callback. A final line without
+/// a newline is delivered normally; JSON syntax and tail policy belong to the
+/// adapter. Invalid UTF-8 is skipped but recorded, and later valid lines survive.
+pub fn for_each_line<P: AsRef<Path>, F: FnMut(&str)>(path: P, f: F) -> LineReadOutcome {
     use std::io::BufReader;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return (0, 1),
+        Err(error) => {
+            return LineReadOutcome {
+                error: Some(LineReadError::Open(error.kind())),
+                ..LineReadOutcome::default()
+            };
+        }
     };
     for_each_line_reader(&mut BufReader::new(file), f)
 }
 
 /// Byte-level reading distinguishes consumed invalid UTF-8 from a permanent
-/// I/O error with no progress. The tuple contract for legacy adapters is unchanged.
+/// I/O error with no progress. The latter exits without delivering a partial line.
 #[doc(hidden)]
 pub fn for_each_line_reader(
     reader: &mut impl std::io::BufRead,
     mut f: impl FnMut(&str),
-) -> (u64, u64) {
-    let (mut total, mut bad) = (0, 0);
+) -> LineReadOutcome {
+    let mut outcome = LineReadOutcome::default();
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
+        let read = reader.read_until(b'\n', &mut buf);
+        outcome.bytes_read += buf.len() as u64;
+        match read {
+            Ok(0) => {
+                outcome.reached_eof = true;
+                break;
+            }
             Ok(_) => match std::str::from_utf8(&buf) {
                 Ok(line) => {
                     let line = line.trim();
                     if !line.is_empty() {
-                        total += 1;
+                        outcome.lines_delivered += 1;
                         f(line);
                     }
                 }
-                Err(_) => bad += 1,
+                Err(_) => outcome.invalid_utf8_lines += 1,
             },
-            // A partial line consumed before Err is not a complete record.
-            Err(_) => {
-                bad += 1;
+            Err(error) => {
+                outcome.error = Some(LineReadError::Read(error.kind()));
                 break;
             }
         }
     }
-    (total, bad)
+    outcome
 }
 
 /// 清空进程内 L1a/L1b 缓存(仅测试;配合 store::reset_for_tests 模拟"新进程")。

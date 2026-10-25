@@ -8,7 +8,9 @@
 usagebook parses the on-disk data of 27 AI coding tools — read-only, zero config — and answers "where did my tokens go" under a unified methodology. Everything runs locally on your machine; data never leaves it.
 
 - **27 scannable sources** (20 verified on real machines + 7 per upstream implementation), 1 suspended. macOS first; Linux builds from source; Windows is not usable yet (automated tests failing, no prebuilt archive).
-- **Dashboard**: `usagebook serve` starts a local-only web dashboard at `http://127.0.0.1:7878` — daily/hourly trends, calendar week/month windows, per-source and per-model breakdowns, 10K/100M (万/亿) or K/M/B number scales. The auto-refresh selector (10s/30s/1min/off) directly drives the server's rescan cadence while the page keeps polling; `--refresh-secs` is the fallback when no dashboard is polling.
+- **Dashboard**: `usagebook serve` starts a local-only dashboard at `http://127.0.0.1:7878` with daily/hourly trends and source/model breakdowns. Collection runs continuously by default while the process is running. `--refresh-secs` sets the wait after each round (default 60, range 5–86400); page update settings never change it. Use `--collection-mode on-demand` to require new status views for periodic collection after a successful round. Before any round succeeds, whole-round failures retry without views; after a success, later failures still follow the new-view requirement. Individual source errors remain visible. Sleep and process exit stop this guarantee; no system service is installed.
+
+The page selector (10s/30s/1min/off) controls ordinary page reads. Turning it off does not change collection settings; initial loading, recovery, returning to the page and user actions can still fetch data. Manual refresh queues a merged collection request.
 - **Interface language**: the dashboard supports **English and 简体中文** — toggle `中文 / EN` in the header; your choice is remembered per browser. Non-zh/en browsers default to English.
 
 ## Supported sources
@@ -76,13 +78,23 @@ usagebook ledger status
 usagebook serve
 ```
 
-Saved Claude usage survives source cleanup. Unchanged files skip body reads; damaged files are isolated, and the dashboard marks incomplete coverage. The ledger stores usage metadata, never conversation text. Request facts are retained; daily rollups can be recomputed from facts.
+Saved Claude usage survives source cleanup. Unchanged files skip body reads; damaged files and unreadable subdirectories are isolated while healthy directories continue to ingest. Incomplete discovery preserves existing history and marks incomplete coverage; only a complete scan can mark unseen files missing. The ledger stores usage metadata, never conversation text. Request facts are retained; daily rollups can be recomputed from facts.
+
+`ledger init` creates an empty ledger without collecting data. Restart an already running server to validate and use it. The dashboard shows temporary mode, pending restart/validation, and per-source storage protection. A detected file is not proof of a valid ledger. During a connection failure, the panel labels cached information as the last confirmed state.
+
+CC Switch daily evidence is currently excluded from formal totals because ownership, historical time boundaries and overlap are unverified. The dashboard explains this separately from read success. A later empty or failed read retains previous evidence, its successful read time and a stale notice. Daily-only values are never fabricated into hourly requests. Charts use the occurrence time and the displayed result's report timezone; late records update their original date.
+
+After stopping the server, `ledger pause --source claude` pauses new collection, including subsequently discovered roots; saved history remains readable. Mixed enabled/paused roots make new roots paused conservatively. `ledger resume --source claude` enables existing roots and future discoveries inherit that state. This does not add pause or durable support to live sources, and an unregistered source cannot be paused in advance.
 
 The default `usage-ledger.db` lives in `~/Library/Application Support/usagebook/` on macOS, `$XDG_DATA_HOME/usagebook/` (default `~/.local/share/usagebook/`) on Linux, and `%LOCALAPPDATA%\usagebook\` on Windows. Override the complete filename with `USAGEBOOK_LEDGER_PATH`. The legacy scan-cache settings do not disable or delete this ledger.
 
 Stop the server before maintenance. Use `ledger backup --output FILE`, `ledger check`, and `ledger restore --input FILE --dry-run`. `ledger forget --source claude --from DATE --to DATE --dry-run` previews deletion. Apply a reviewed preview with `--apply --preview-token TOKEN`. Restoring an old backup preserves current deletion controls. A corrupt ledger produces an error; it is never silently replaced with an empty database.
 
 API changes: `/api/data` returns 410. The dashboard uses `/api/v2/status`, `/api/v2/query`, and `/api/v2/catalog`; integer values are decimal strings. `report --json` streams NDJSON pages; `report --query-file FILE` accepts the query DTO. Exit code 5 means readable results were emitted with incomplete source coverage.
+
+The default report uses one cutoff for day/source/model tables and checks the complete ledger stamp before emitting every page, including session totals. A concurrent update stops output with `CURSOR_STALE` and exit code 3; rerun from the beginning, as an emitted prefix is not a complete report. Session totals retain their independent, unwindowed meaning. Read transactions end before writing output, so a slow consumer does not hold a reader transaction across pages.
+
+Status adds `collection`, `storage`, and per-source `history_protection`, `durable_supported`, and `last_scanned_at_ms`. CC `accounting.unaccounted_rows` counts excluded daily evidence rows, not requests. The legacy live `last_saved_at_ms` remains a scan-time compatibility alias; new clients must not interpret it as durable storage time.
 
 This version has been tested on macOS. Linux/Windows application-level validation and large-scale release benchmarks remain release gates. Use local disks; blocking operations on mounted source directories are not yet fully isolated.
 

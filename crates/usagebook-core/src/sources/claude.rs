@@ -146,6 +146,10 @@ impl UsageSource for ClaudeSource {
         self.roots()
     }
 
+    fn input_containers(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        roots.iter().map(|root| root.join("projects")).collect()
+    }
+
     fn scan_roots(
         &self,
         roots: &[std::path::PathBuf],

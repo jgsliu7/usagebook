@@ -4,7 +4,10 @@ use super::query_types::{QueryError, QueryResult};
 use crate::model::{Caliber, UsageRecord};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LegacyDay {
@@ -47,6 +50,8 @@ pub struct LegacySourceStatus {
     pub last_scanned_ms: Option<i64>,
     pub stale: bool,
     pub error: Option<String>,
+    /// Diagnostic day rows only; never a request count or an amount to add.
+    pub unaccounted_rows: usize,
 }
 #[derive(Debug, Clone)]
 pub struct LegacySnapshot {
@@ -54,6 +59,14 @@ pub struct LegacySnapshot {
     pub routing_hash: String,
     pub entries: Vec<LegacyEntry>,
     pub sources: BTreeMap<String, LegacySourceStatus>,
+    // Process-local availability evidence only: not query content, persisted
+    // state, or public status. An empty complete scan still remembers its inputs.
+    input_containers: BTreeMap<String, Vec<InputContainer>>,
+}
+#[derive(Debug, Clone)]
+struct InputContainer {
+    path: PathBuf,
+    directory: bool,
 }
 impl LegacySnapshot {
     pub fn new(generation: String, routing_hash: String) -> Self {
@@ -62,6 +75,51 @@ impl LegacySnapshot {
             routing_hash,
             entries: Vec::new(),
             sources: BTreeMap::new(),
+            input_containers: BTreeMap::new(),
+        }
+    }
+    /// Capture before scanning, so disappearance during a read cannot erase the
+    /// fact that this scan used a container. Uninstalled optional inputs are absent.
+    pub fn observe_input_containers(&mut self, source: &str, paths: Vec<PathBuf>) {
+        let inputs = paths
+            .into_iter()
+            .filter_map(|path| {
+                let metadata = std::fs::metadata(&path).ok()?;
+                (metadata.is_dir() || metadata.is_file()).then_some(InputContainer {
+                    path,
+                    directory: metadata.is_dir(),
+                })
+            })
+            .collect();
+        self.input_containers.insert(source.into(), inputs);
+    }
+    /// Only a previous complete success establishes an input availability promise.
+    pub fn has_missing_input_containers(&self, source: &str) -> bool {
+        self.sources
+            .get(source)
+            .is_some_and(|status| status.last_scanned_ms.is_some())
+            && self.input_containers.get(source).is_some_and(|inputs| {
+                inputs.iter().any(|input| {
+                    std::fs::metadata(&input.path).map_or(true, |metadata| {
+                        if input.directory {
+                            !metadata.is_dir()
+                        } else {
+                            !metadata.is_file()
+                        }
+                    })
+                })
+            })
+    }
+    /// A failed attempt must not replace the last complete input list with an
+    /// empty discovery result; otherwise a second failure could look successful.
+    pub fn retain_input_containers(&mut self, source: &str, previous: &Self) {
+        match previous.input_containers.get(source) {
+            Some(inputs) => {
+                self.input_containers.insert(source.into(), inputs.clone());
+            }
+            None => {
+                self.input_containers.remove(source);
+            }
         }
     }
     /// Query content, independent of scan time and adapter iteration order.
@@ -91,7 +149,15 @@ impl LegacySnapshot {
         let sources: Vec<_> = self
             .sources
             .iter()
-            .map(|(id, s)| (id, s.stale, &s.error, s.last_scanned_ms.is_some()))
+            .map(|(id, s)| {
+                (
+                    id,
+                    s.stale,
+                    &s.error,
+                    s.last_scanned_ms.is_some(),
+                    s.unaccounted_rows,
+                )
+            })
             .collect();
         let mut hash = Sha256::new();
         hash.update(b"usagebook/legacy-content/v1");
@@ -120,14 +186,9 @@ impl LegacySnapshot {
         records: Vec<UsageRecord>,
         scanned_ms: i64,
     ) -> QueryResult<()> {
-        self.sources.insert(
-            source.into(),
-            LegacySourceStatus {
-                last_scanned_ms: Some(scanned_ms),
-                stale: false,
-                error: None,
-            },
-        );
+        // A source is a single publication unit. A valid prefix must not survive
+        // a later normalization failure, nor may failure advance its success time.
+        let mut accepted = Vec::with_capacity(records.len());
         for record in records {
             if record.source == "ccswitch-rollup" {
                 return Err(QueryError::invalid(
@@ -137,8 +198,12 @@ impl LegacySnapshot {
             if record.model.len() > 1024 {
                 return Err(QueryError::limit("legacy model exceeds 1024 bytes"));
             }
-            legacy_metrics(&record)?;
-            self.entries.push(match record.caliber {
+            let fields = legacy_metrics(&record)?;
+            // Checking each supplied bucket alone misses an overflowing derived
+            // total (or an impossible subset). Query output uses this evaluator too.
+            super::metrics::evaluate(&fields)
+                .map_err(|e| QueryError::new(e.code(), e.to_string()))?;
+            accepted.push(match record.caliber {
                 Caliber::RequestDelta => LegacyEntry::Request {
                     native_tool: source.into(),
                     namespace: None,
@@ -151,6 +216,16 @@ impl LegacySnapshot {
                 },
             });
         }
+        self.entries.extend(accepted);
+        self.sources.insert(
+            source.into(),
+            LegacySourceStatus {
+                last_scanned_ms: Some(scanned_ms),
+                stale: false,
+                error: None,
+                unaccounted_rows: 0,
+            },
+        );
         Ok(())
     }
     /// Reads only native rollup columns. The upstream schema supplies no trustworthy account or
@@ -162,10 +237,15 @@ impl LegacySnapshot {
         )?;
         let mut st=conn.prepare("SELECT date, app_type, model, SUM(input_tokens), SUM(cache_read_tokens), SUM(cache_creation_tokens), SUM(output_tokens), SUM(request_count) FROM usage_daily_rollups GROUP BY date,app_type,model ORDER BY date,app_type,model")?;
         let mut rows = st.query([])?;
+        // Publish a complete read only. A later invalid row must not leak a
+        // partial replacement or a success count into the caller's snapshot.
+        let mut accepted = Vec::new();
         while let Some(r) = rows.next()? {
             let date: String = r.get(0)?;
             let app: String = r.get(1)?;
-            let model: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let raw_model: Option<String> = r.get(2)?;
+            let model_kind = if raw_model.is_some() { "text" } else { "null" };
+            let model = raw_model.unwrap_or_default();
             if !matches!(app.as_str(), "claude" | "codex" | "opencode" | "pi") {
                 continue;
             }
@@ -180,15 +260,21 @@ impl LegacySnapshot {
                 }
                 p[index] = v;
             }
+            // Query output uses the same constraints, including derived totals.
+            // Reject the entire read before replacing any usable old evidence.
+            super::metrics::evaluate(&p).map_err(|e| QueryError::new(e.code(), e.to_string()))?;
             let key = tuple_hash(&[
                 "usagebook/legacy-day/v1",
                 "ccswitch-rollup",
                 "unknown",
                 &date,
                 &app,
-                &model_key(&model),
+                // Match the raw SQL grouping, including NULL versus empty text.
+                // model_key remains a normalized filter, not evidence identity.
+                model_kind,
+                &model,
             ]);
-            self.entries.push(LegacyEntry::Day(LegacyDay {
+            accepted.push(LegacyEntry::Day(LegacyDay {
                 row_key: key,
                 report_source: "ccswitch-rollup".into(),
                 native_tool: app,
@@ -202,12 +288,15 @@ impl LegacySnapshot {
                 projection: p,
             }));
         }
+        let unaccounted_rows = accepted.len();
+        self.entries.extend(accepted);
         self.sources.insert(
             "ccswitch-rollup".into(),
             LegacySourceStatus {
                 last_scanned_ms: Some(chrono::Utc::now().timestamp_millis()),
                 stale: false,
                 error: None,
+                unaccounted_rows,
             },
         );
         Ok(())

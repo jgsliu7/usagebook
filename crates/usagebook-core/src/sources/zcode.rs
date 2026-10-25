@@ -94,6 +94,13 @@ impl UsageSource for ZcodeSource {
         roots
     }
 
+    fn input_containers(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        roots
+            .iter()
+            .map(|root| root.join("cli/db/db.sqlite"))
+            .collect()
+    }
+
     fn scan_roots(
         &self,
         roots: &[std::path::PathBuf],
@@ -239,7 +246,7 @@ impl UsageSource for ZcodeSource {
                 stats.failed = true;
                 continue;
             };
-            while let Ok(Some(row)) = rows.next() {
+            while let Some(row) = crate::common::next_sqlite_row(&mut rows, "zcode", &mut stats) {
                 // 0 id, 1 session_id, 2 model_id, 3 started_at, 4 input, 5 output,
                 // 6 reasoning, 7 cache_read, 8 cache_write, 9 completed_at, 10 duration_ms, 11 status
                 let vals: Vec<SqlValue> = (0..12)

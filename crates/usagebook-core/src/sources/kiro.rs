@@ -150,7 +150,7 @@ impl UsageSource for KiroSource {
                 continue;
             };
             stats.files_parsed += 1;
-            while let Ok(Some(row)) = rows.next() {
+            while let Some(row) = crate::common::next_sqlite_row(&mut rows, "kiro", &mut stats) {
                 let vals: Vec<SqlValue> = (0..2)
                     .filter_map(|i| row.get::<_, SqlValue>(i).ok())
                     .collect();

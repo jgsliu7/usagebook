@@ -117,6 +117,17 @@ pub trait UsageSource: Send + Sync {
     fn id(&self) -> &'static str;
     /// 探测数据根(环境变量多根 + 默认根,档案 §2)。
     fn discover_roots(&self) -> Vec<std::path::PathBuf>;
+    /// Present input containers used by this scan. The live publisher remembers
+    /// their type and detects disappearance independently of the number of rows.
+    /// Override when a discovered configuration root is broader than its inputs.
+    fn input_containers(&self, roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+        roots.to_vec()
+    }
+    /// Optional adapter-owned discovery snapshot. Cache checks and parsing must
+    /// consume the same manifest; adapters without one retain the legacy walk.
+    fn prepare_scan(&self, _roots: &[std::path::PathBuf]) -> Option<Box<dyn PreparedSourceScan>> {
+        None
+    }
     /// 扫描并产出用量记录(已去重)。max_files 仅用于抽样调试。
     fn scan(&self, max_files: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
         self.scan_roots(&self.discover_roots(), max_files)
@@ -127,4 +138,11 @@ pub trait UsageSource: Send + Sync {
         roots: &[std::path::PathBuf],
         max_files: Option<usize>,
     ) -> (Vec<UsageRecord>, ScanStats);
+}
+
+/// A fixed input manifest, including logical ownership and discovery failures.
+/// A fresh manifest is discovered after parsing before any cache is published.
+pub trait PreparedSourceScan {
+    fn fingerprint(&self) -> Option<crate::common::SourceFingerprint>;
+    fn scan(&self) -> (Vec<UsageRecord>, ScanStats);
 }

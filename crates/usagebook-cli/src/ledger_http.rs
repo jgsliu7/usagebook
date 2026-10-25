@@ -1,7 +1,6 @@
 //! Bounded loopback query server. Only live adapters retain a process-local history snapshot.
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
     net::TcpListener,
     sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
@@ -25,12 +24,24 @@ struct State {
     pending_force: bool,
     error: Option<String>,
     refresh_secs: u64,
-    desired_ms: u64,
-    lease_until_ms: i64,
+    collection_mode: CollectionMode,
     last_request_ms: i64,
     last_scan_started_ms: i64,
     last_scan_completed_ms: Option<i64>,
     refresh_generation: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CollectionMode {
+    Continuous,
+    OnDemand,
+}
+impl CollectionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Continuous => "continuous",
+            Self::OnDemand => "on-demand",
+        }
+    }
 }
 impl State {
     // A queued manual request is already busy. Requests waiting before the next
@@ -42,9 +53,7 @@ impl State {
     }
     fn begin_scan(&mut self, now: i64, first: bool, due: bool) -> Option<bool> {
         let forced = self.pending_force;
-        let viewed = self.last_request_ms >= self.last_scan_started_ms;
-        let empty = self.last_scan_completed_ms.is_none();
-        if !(first || forced || (due && (empty || viewed))) {
+        if !(first || forced || (due && self.periodic_allowed())) {
             return None;
         }
         self.pending_force = false;
@@ -69,36 +78,28 @@ impl State {
         self.snapshot = Arc::new(snapshot);
         self.snapshot_fingerprint = fingerprint;
     }
-    fn effective_refresh_ms(&self, now: i64) -> u64 {
-        if self.desired_ms > 0 && now < self.lease_until_ms {
-            self.desired_ms
+    fn periodic_allowed(&self) -> bool {
+        self.collection_mode == CollectionMode::Continuous
+            || self.last_scan_completed_ms.is_none()
+            || self.last_request_ms >= self.last_scan_started_ms
+    }
+    fn collection_state(&self) -> &'static str {
+        if self.refreshing || self.pending_force {
+            "scanning"
+        } else if self.periodic_allowed() {
+            "waiting"
         } else {
-            self.refresh_secs.saturating_mul(1000)
+            "idle"
         }
     }
-    fn viewed(&mut self, url: &str) {
-        let now = now_ms();
-        self.last_request_ms = now;
-        if let Some(seconds) = parse_arf(url) {
-            if seconds == 0 {
-                self.desired_ms = 0;
-                self.lease_until_ms = 0;
-            } else {
-                self.desired_ms = seconds.clamp(5, 86400) * 1000;
-                self.lease_until_ms = now.saturating_add(3 * self.desired_ms as i64);
-            }
-        }
+    fn effective_refresh_ms(&self, _now: i64) -> u64 {
+        self.refresh_secs * 1000
     }
-}
-// Match the original dashboard cadence contract: an absent/empty declaration
-// only records a view; the first explicit arf controls the short-lived lease.
-fn parse_arf(url: &str) -> Option<u64> {
-    for segment in url.split_once('?')?.1.split('&') {
-        if let Some(("arf", value)) = segment.split_once('=') {
-            return value.parse().ok();
-        }
+    // Old clients may still send arf. It records a view but never changes the
+    // configured interval or queues a manual scan, including arf=0.
+    fn viewed(&mut self, _url: &str) {
+        self.last_request_ms = now_ms();
     }
-    None
 }
 struct Assets {
     index_html: String,
@@ -123,6 +124,14 @@ impl Assets {
         }
     }
 }
+struct ServerContext<'a> {
+    shared: &'a Arc<Mutex<State>>,
+    assets: &'a Assets,
+    catalog_cache: &'a ModelCatalogCache,
+    port: u16,
+    durable_at_start: bool,
+    ledger_path: &'a std::path::Path,
+}
 fn response(req: Request, body: String, ctype: &str, code: u16) {
     let resp=Response::from_string(body).with_status_code(code).with_header(Header::from_bytes("Content-Type",ctype).unwrap()).with_header(Header::from_bytes("Cache-Control","no-store").unwrap()).with_header(Header::from_bytes("X-Content-Type-Options","nosniff").unwrap()).with_header(Header::from_bytes("Content-Security-Policy","default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'").unwrap());
     let _ = req.respond(resp);
@@ -136,9 +145,12 @@ fn error(req: Request, code: u16, message: &str) {
         code,
     )
 }
-pub fn run(port: u16, refresh_secs: u64, open: bool) {
-    if port == 0 || refresh_secs < 5 {
-        crate::ledger_cli::fail("port must be positive; refresh interval >= 5 seconds", 2)
+pub fn run(port: u16, refresh_secs: u64, collection_mode: CollectionMode, open: bool) {
+    if port == 0 || !(5..=86400).contains(&refresh_secs) {
+        crate::ledger_cli::fail(
+            "port must be positive; refresh interval must be 5..=86400 seconds",
+            2,
+        )
     }
     let server =
         TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| crate::ledger_cli::fail(e, 3));
@@ -153,6 +165,9 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
     } else {
         None
     };
+    // Freeze this once for both the writer and query workers. An init during
+    // startup must not connect readers to a different database from the writer.
+    let durable_at_start = writer.is_some();
     let transient = if writer.is_none() {
         let tz = db::host_timezone_hint().unwrap_or_else(|| {
             eprintln!(
@@ -179,6 +194,7 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
                 last_scanned_ms: None,
                 stale: true,
                 error: Some("LOADING".into()),
+                unaccounted_rows: 0,
             },
         );
     }
@@ -189,8 +205,7 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
         pending_force: false,
         error: None,
         refresh_secs,
-        desired_ms: 0,
-        lease_until_ms: 0,
+        collection_mode,
         last_request_ms: 0,
         last_scan_started_ms: 0,
         last_scan_completed_ms: None,
@@ -262,40 +277,49 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
                             // The interim LOADING snapshot may carry a new route hash while
                             // still containing old live rows. Merge only against the snapshot
                             // captured before that transition, and only for sources still live.
-                            let current_sources: BTreeSet<String> = snapshot
-                                .entries
-                                .iter()
-                                .map(|row| row.report_source().to_owned())
-                                .collect();
-                            let old_sources: BTreeSet<String> = previous_for_merge
-                                .entries
-                                .iter()
-                                .map(|row| row.report_source().to_owned())
-                                .collect();
+                            for (source, status) in &mut snapshot.sources {
+                                if previous_for_merge.has_missing_input_containers(source) {
+                                    status.stale = true;
+                                    status.error = Some("SOURCE_READ_FAILED".into());
+                                }
+                            }
                             let failed: Vec<String> = snapshot
                                 .sources
                                 .iter()
-                                .filter(|(source, status)| {
-                                    status.stale
-                                        || status.error.is_some()
-                                        || (!current_sources.contains(source.as_str())
-                                            && old_sources.contains(source.as_str()))
-                                })
+                                // A successful empty read replaces old rows. Only
+                                // an explicit source failure may retain prior data.
+                                .filter(|(_, status)| status.stale || status.error.is_some())
                                 .map(|(source, _)| source.clone())
                                 .collect();
                             for source in failed {
-                                if !previous_for_merge.sources.contains_key(&source) {
-                                    continue;
-                                }
+                                // Only a complete read supplies a successful timestamp.
+                                // LOADING and first-failure placeholders are not retained
+                                // data; a successful empty read is still a complete result.
+                                let previous_complete = previous_for_merge
+                                    .sources
+                                    .get(&source)
+                                    .filter(|status| status.last_scanned_ms.is_some());
                                 snapshot.entries.retain(|row| row.report_source() != source);
-                                snapshot.entries.extend(
-                                    previous_for_merge
-                                        .entries
-                                        .iter()
-                                        .filter(|row| row.report_source() == source)
-                                        .cloned(),
-                                );
+                                if previous_complete.is_some() {
+                                    snapshot.retain_input_containers(&source, &previous_for_merge);
+                                    snapshot.entries.extend(
+                                        previous_for_merge
+                                            .entries
+                                            .iter()
+                                            .filter(|row| row.report_source() == source)
+                                            .cloned(),
+                                    );
+                                }
                                 if let Some(status) = snapshot.sources.get_mut(&source) {
+                                    // These rows still belong to the previous successful read.
+                                    // A failed attempt must not make retained data look current.
+                                    status.last_scanned_ms = previous_complete
+                                        .and_then(|previous| previous.last_scanned_ms);
+                                    if source == "ccswitch-rollup" {
+                                        if let Some(previous) = previous_complete {
+                                            status.unaccounted_rows = previous.unaccounted_rows;
+                                        }
+                                    }
                                     status.stale = true;
                                     status.error = Some("SOURCE_READ_FAILED".into());
                                 }
@@ -351,7 +375,7 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
         let assets = assets.clone();
         let catalog_cache = catalog_cache.clone();
         std::thread::spawn(move || {
-            let ledger = if db::exists_or_recoverable(&path) {
+            let ledger = if durable_at_start {
                 Some(
                     Ledger::open(&path, false)
                         .unwrap_or_else(|e| crate::ledger_cli::fail(&e, e.exit_code())),
@@ -380,7 +404,15 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
                     Err(_) => break,
                 };
                 if let Some(req) = Request::receive(req) {
-                    handle(req, conn, &shared, &assets, &catalog_cache, port);
+                    let context = ServerContext {
+                        shared: &shared,
+                        assets: &assets,
+                        catalog_cache: &catalog_cache,
+                        port,
+                        durable_at_start,
+                        ledger_path: &path,
+                    };
+                    handle(req, conn, &context);
                 }
             }
         });
@@ -407,14 +439,15 @@ pub fn run(port: u16, refresh_secs: u64, open: bool) {
         }
     }
 }
-fn handle(
-    mut req: Request,
-    conn: &rusqlite::Connection,
-    shared: &Arc<Mutex<State>>,
-    assets: &Assets,
-    catalog_cache: &ModelCatalogCache,
-    port: u16,
-) {
+fn handle(mut req: Request, conn: &rusqlite::Connection, ctx: &ServerContext) {
+    let ServerContext {
+        shared,
+        assets,
+        catalog_cache,
+        port,
+        durable_at_start,
+        ledger_path,
+    } = *ctx;
     if !crate::serve::local_request(req.headers(), port) {
         return error(req, 403, "FORBIDDEN");
     }
@@ -480,7 +513,8 @@ fn handle(
                 "refresh_generation": s.refresh_generation.to_string(),
                 "generated_at_ms": s.last_scan_completed_ms.map(|n|n.to_string()),
                 "refresh_secs": s.refresh_secs,
-                "eff_refresh_secs": s.effective_refresh_ms(now_ms()) / 1000
+                "eff_refresh_secs": s.effective_refresh_ms(now_ms()) / 1000,
+                "collection": {"mode":s.collection_mode.as_str(),"interval_secs":s.refresh_secs,"state":s.collection_state()}
             }),
         )
     };
@@ -488,6 +522,11 @@ fn handle(
     let result: std::result::Result<Value, usagebook_core::ledger::query_types::QueryError> =
         if path == "/api/v2/status" && req.method() == &Method::Get {
             service.status().map(|mut s| {
+                s["storage"] = json!({
+                    "mode":if durable_at_start {"durable"} else {"temporary"},
+                    "restart_required":!durable_at_start && db::exists_or_recoverable(ledger_path),
+                    "durable_supported_sources":usagebook_core::ledger::DURABLE_SUPPORTED_SOURCES
+                });
                 s["refreshing"] = json!(refreshing);
                 for (key, value) in refresh_status.as_object().unwrap() {
                     s[key] = value.clone();

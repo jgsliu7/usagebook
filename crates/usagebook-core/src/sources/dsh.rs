@@ -292,6 +292,10 @@ impl UsageSource for DshSource {
         roots
     }
 
+    fn input_containers(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        roots.iter().map(|root| root.join("sessions")).collect()
+    }
+
     fn scan_roots(
         &self,
         roots: &[std::path::PathBuf],

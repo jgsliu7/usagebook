@@ -5,11 +5,17 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-const RESOLVER_VERSION: &str = "ledger-resolver-v2";
+const RESOLVER_VERSION: &str = "ledger-resolver-v3";
+const LEGACY_RESOLVER_VERSION: &str = "ledger-resolver-v2";
+
+// Shared by status and coverage. A compatibility replay can have the same
+// upper bound as an old completed run, so the ordinary new-evidence test misses it.
+pub(crate) const COMPAT_PENDING_SQL: &str = "SELECT EXISTS(SELECT 1 FROM source_roots r WHERE r.report_source=?1 AND r.identity_family='claude' AND r.route='ledger' AND (EXISTS(SELECT 1 FROM ingest_runs u WHERE u.identity_family=r.identity_family AND u.namespace_key=r.namespace_key AND u.state='publishing') OR (EXISTS(SELECT 1 FROM usage_observations o WHERE o.identity_family=r.identity_family AND o.namespace_key=r.namespace_key) AND NOT EXISTS(SELECT 1 FROM ingest_runs u WHERE u.identity_family=r.identity_family AND u.namespace_key=r.namespace_key AND u.state='done' AND u.resolver_version='ledger-resolver-v3'))))";
 
 #[derive(Clone, Copy)]
 pub(crate) enum RebuildCause {
     Automatic,
+    LegacyAutomatic,
     ExplicitDelete,
 }
 
@@ -105,7 +111,8 @@ fn decode_message(key: &str) -> Result<String> {
 }
 
 fn create_work_tables(c: &Connection) -> Result<()> {
-    c.execute_batch("CREATE TEMP TABLE IF NOT EXISTS ledger_run_units(run_id INTEGER NOT NULL,publish_key TEXT COLLATE BINARY NOT NULL,raw_key TEXT,message_id TEXT,PRIMARY KEY(run_id,publish_key),CHECK((raw_key IS NULL)<>(message_id IS NULL))) WITHOUT ROWID;
+    c.execute_batch("CREATE TEMP TABLE IF NOT EXISTS ledger_run_cache(run_id INTEGER PRIMARY KEY, data_version INTEGER NOT NULL);
+        CREATE TEMP TABLE IF NOT EXISTS ledger_run_units(run_id INTEGER NOT NULL,publish_key TEXT COLLATE BINARY NOT NULL,raw_key TEXT,message_id TEXT,PRIMARY KEY(run_id,publish_key),CHECK((raw_key IS NULL)<>(message_id IS NULL))) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS ledger_unit_evidence(id INTEGER PRIMARY KEY,raw_key TEXT);
         CREATE INDEX IF NOT EXISTS temp.ledger_unit_evidence_raw ON ledger_unit_evidence(raw_key,id);
         CREATE TEMP TABLE IF NOT EXISTS ledger_unit_pairs(session_id TEXT NOT NULL,request_id TEXT NOT NULL,PRIMARY KEY(session_id,request_id)) WITHOUT ROWID;
@@ -126,11 +133,25 @@ struct FrozenRun {
     lower: i64,
     upper: i64,
     last: Option<String>,
+    version: String,
 }
 
-/// Freeze every scope with new persisted evidence; failed or unread files are irrelevant.
+/// A committed keyset boundary may outlive its observations after forget.
+fn valid_publish_cursor(family: &str, key: &str) -> bool {
+    if key.starts_with("m:") {
+        family == "claude"
+            && decode_message(key).is_ok_and(|m| !m.is_empty() && message_publish_key(&m) == key)
+    } else {
+        key.strip_prefix("k:").is_some_and(|h| {
+            h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
+}
+
+/// Freeze new evidence, or one complete v3 replay of a legacy Claude namespace.
 fn next_run(c: &Connection) -> Result<Option<FrozenRun>> {
-    // This tuple mirrors the fixed SQL projection and is destructured immediately.
     #[allow(clippy::type_complexity)]
     let active:Option<(i64,String,String,i64,i64,Option<String>,String,String,i64)>=c.query_row(
         "SELECT run_id,identity_family,namespace_key,lower_observation_id,upper_observation_id,last_publish_key,epoch,resolver_version,identity_version FROM ingest_runs WHERE state='publishing' ORDER BY run_id LIMIT 1",[],
@@ -140,30 +161,28 @@ fn next_run(c: &Connection) -> Result<Option<FrozenRun>> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if let Some((id, family, namespace, lower, upper, last, re, rv, ri)) = active {
+    if let Some((id, family, namespace, lower, upper, last, re, mut rv, ri)) = active {
         if re != epoch
             || ri != iv
             || lower < 0
-            || upper < lower
-            || !matches!(rv.as_str(), "ledger-resolver-v1" | RESOLVER_VERSION)
+            || upper <= lower
+            || !matches!(
+                rv.as_str(),
+                "ledger-resolver-v1" | LEGACY_RESOLVER_VERSION | RESOLVER_VERSION
+            )
+            || last
+                .as_deref()
+                .is_some_and(|key| !valid_publish_cursor(&family, key))
         {
             return Err(LedgerError::UpgradeRequiresDrain);
         }
-        if rv != RESOLVER_VERSION {
-            if let Some(last) = &last {
-                let exists: bool = c.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM usage_observations o WHERE o.identity_family=?1 AND o.namespace_key=?2 AND o.observation_id>?3 AND o.observation_id<=?4 AND (o.identity_key IS NOT NULL OR (o.identity_family='claude' AND o.fact_kind='request' AND o.native_message_id IS NOT NULL)) AND (CASE WHEN o.identity_family='claude' AND o.fact_kind='request' AND o.native_message_id IS NOT NULL THEN 'm:'||lower(hex(o.native_message_id)) ELSE 'k:'||o.identity_key END)=?5)",
-                    params![family,namespace,lower,upper,last], |r| r.get(0),
-                )?;
-                if !exists {
-                    return Err(LedgerError::UpgradeRequiresDrain);
-                }
-            }
-            // publish_key and its binary ordering are unchanged. This update is
-            // in the writer's IMMEDIATE transaction, before any remaining unit.
+        if rv == "ledger-resolver-v1" {
+            // Drain the original window under v2 rules. Its old prefix has not
+            // been reviewed by v3, so this task must not become a v3 completion.
+            rv = LEGACY_RESOLVER_VERSION.into();
             c.execute(
                 "UPDATE ingest_runs SET resolver_version=?1 WHERE run_id=?2 AND state='publishing'",
-                params![RESOLVER_VERSION, id],
+                params![rv, id],
             )?;
         }
         return Ok(Some(FrozenRun {
@@ -173,11 +192,19 @@ fn next_run(c: &Connection) -> Result<Option<FrozenRun>> {
             lower,
             upper,
             last,
+            version: rv,
         }));
     }
-    let next:Option<(String,String,i64,i64)>=c.query_row(
-        "SELECT o.identity_family,o.namespace_key,COALESCE((SELECT MAX(r.upper_observation_id) FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done'),0) AS lower,MAX(o.observation_id) AS upper FROM usage_observations o GROUP BY o.identity_family,o.namespace_key HAVING upper>lower ORDER BY o.identity_family,o.namespace_key LIMIT 1",[],
+    let repair:Option<(String,String,i64,i64)>=c.query_row(
+        "SELECT o.identity_family,o.namespace_key,0,MAX(MAX(o.observation_id),COALESCE((SELECT MAX(r.upper_observation_id) FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done'),0)) FROM usage_observations o WHERE o.identity_family='claude' AND NOT EXISTS(SELECT 1 FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done' AND r.resolver_version=?1) GROUP BY o.identity_family,o.namespace_key ORDER BY o.namespace_key LIMIT 1", [RESOLVER_VERSION],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    let next = if repair.is_some() {
+        repair
+    } else {
+        c.query_row(
+        "SELECT o.identity_family,o.namespace_key,COALESCE((SELECT MAX(r.upper_observation_id) FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done'),0) AS lower,MAX(o.observation_id) AS upper FROM usage_observations o GROUP BY o.identity_family,o.namespace_key HAVING upper>lower ORDER BY o.identity_family,o.namespace_key LIMIT 1",[],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?
+    };
     if let Some((family, namespace, lower, upper)) = next {
         c.execute("INSERT INTO ingest_runs(identity_family,namespace_key,epoch,resolver_version,identity_version,state,lower_observation_id,upper_observation_id,created_ms) VALUES(?1,?2,?3,?4,?5,'publishing',?6,?7,?8)",params![family,namespace,epoch,RESOLVER_VERSION,iv,lower,upper,now_ms()])?;
         let id = c.last_insert_rowid();
@@ -189,10 +216,25 @@ fn next_run(c: &Connection) -> Result<Option<FrozenRun>> {
             lower,
             upper,
             last: None,
+            version: RESOLVER_VERSION.into(),
         }))
     } else {
         Ok(None)
     }
+}
+
+/// Maintenance can run on another connection. data_version invalidates its
+/// writer's cached keyset on the next slice; this clears same-connection caches.
+pub(crate) fn invalidate_run_units(c: &Connection) -> Result<()> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name='ledger_run_cache')",
+        [],
+        |r| r.get(0),
+    )?;
+    if exists {
+        c.execute("DELETE FROM ledger_run_cache", [])?;
+    }
+    Ok(())
 }
 
 fn make_run_units(c: &Connection, r: &FrozenRun) -> Result<()> {
@@ -232,25 +274,21 @@ impl Ledger {
                 regression_stop("t3_after_commit");
             }
             let Some(mut run) = r else { break };
-            // A bounded refresh calls publish_some repeatedly on this writer.
-            // The frozen run and TEMP keys have not changed between slices.
-            // A new process has an empty TEMP table and rebuilds it normally.
+            let data_version: i64 = self
+                .conn
+                .pragma_query_value(None, "data_version", |row| row.get(0))?;
             let cached: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM ledger_run_units WHERE run_id=?1)",
-                [run.id],
+                "SELECT EXISTS(SELECT 1 FROM ledger_run_cache WHERE run_id=?1 AND data_version=?2)",
+                params![run.id, data_version],
                 |row| row.get(0),
             )?;
             if !cached {
                 make_run_units(&self.conn, &run)?;
-            }
-            if let Some(last) = &run.last {
-                let valid: bool = self.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM ledger_run_units WHERE run_id=?1 AND publish_key=?2)",
-                    params![run.id,last], |row| row.get(0),
+                self.conn.execute("DELETE FROM ledger_run_cache", [])?;
+                self.conn.execute(
+                    "INSERT INTO ledger_run_cache VALUES(?1,?2)",
+                    params![run.id, data_version],
                 )?;
-                if !valid {
-                    return Err(LedgerError::UpgradeRequiresDrain);
-                }
             }
             loop {
                 // Separate first-page and resumed SQL so the composite key is a range seek.
@@ -262,7 +300,7 @@ impl Ledger {
                 let tx = self
                     .conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ingest_runs r JOIN ledger_meta m ON m.singleton=1 WHERE r.run_id=?1 AND r.state='publishing' AND r.epoch=m.epoch AND r.resolver_version=?2 AND r.identity_version=m.identity_version AND r.last_publish_key IS ?3)",params![run.id,RESOLVER_VERSION,run.last],|r|r.get(0))?;
+                let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ingest_runs r JOIN ledger_meta m ON m.singleton=1 WHERE r.run_id=?1 AND r.state='publishing' AND r.epoch=m.epoch AND r.resolver_version=?2 AND r.identity_version=m.identity_version AND r.last_publish_key IS ?3)",params![run.id,run.version,run.last],|r|r.get(0))?;
                 if !valid {
                     return Err(LedgerError::StaleObservation);
                 }
@@ -272,7 +310,11 @@ impl Ledger {
                     &run.namespace,
                     &key,
                     run.upper,
-                    RebuildCause::Automatic,
+                    if run.version == RESOLVER_VERSION {
+                        RebuildCause::Automatic
+                    } else {
+                        RebuildCause::LegacyAutomatic
+                    },
                 )?;
                 if !changed {
                     super::db::bump(&tx)?;
@@ -317,14 +359,15 @@ pub(crate) fn visible_upper(
     key: &str,
 ) -> Result<i64> {
     let run:Option<(i64,i64,Option<String>)>=c.query_row("SELECT lower_observation_id,upper_observation_id,last_publish_key FROM ingest_runs WHERE identity_family=?1 AND namespace_key=?2 AND state='publishing'",params![family,namespace],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let published: i64 = c.query_row("SELECT COALESCE(MAX(upper_observation_id),0) FROM ingest_runs WHERE identity_family=?1 AND namespace_key=?2 AND state='done'",params![family,namespace],|r|r.get(0))?;
     if let Some((lower, upper, last)) = run {
         return Ok(if last.as_deref().is_some_and(|l| key <= l) {
             upper
         } else {
-            lower
+            lower.max(published)
         });
     }
-    Ok(c.query_row("SELECT COALESCE(MAX(upper_observation_id),0) FROM ingest_runs WHERE identity_family=?1 AND namespace_key=?2 AND state='done'",params![family,namespace],|r|r.get(0))?)
+    Ok(published)
 }
 
 fn prepare_unit(
@@ -541,12 +584,82 @@ fn covers<T: Eq>(a: &Option<T>, b: &Option<T>) -> bool {
     b.is_none() || a == b
 }
 
+/// Only representation time and collection metadata may differ. Canonical
+/// request membership was proved by prepare_unit, including fallback aliases.
+fn equivalent_claude_blocks(a: &Observation, b: &Observation) -> bool {
+    a.identity_family == "claude"
+        && b.identity_family == "claude"
+        && a.fact_kind == "request"
+        && b.fact_kind == "request"
+        && a.eligibility == "eligible"
+        && b.eligibility == "eligible"
+        && a.action == "upsert"
+        && b.action == "upsert"
+        && a.revision_authority.is_none()
+        && b.revision_authority.is_none()
+        && a.revision_no.is_none()
+        && b.revision_no.is_none()
+        && a.occurred_ms.is_some()
+        && b.occurred_ms.is_some()
+        && a.namespace_key == b.namespace_key
+        && a.report_source == b.report_source
+        && a.native_tool == b.native_tool
+        && a.model_key == b.model_key
+        && a.session_key == b.session_key
+        && a.native_session_id == b.native_session_id
+        && a.native_message_id == b.native_message_id
+        && a.metrics == b.metrics
+        && a.cost_state == b.cost_state
+        && a.cost_units == b.cost_units
+        && a.cost_scale == b.cost_scale
+        && a.cost_currency == b.cost_currency
+        && a.native_date == b.native_date
+        && a.native_timezone == b.native_timezone
+        && a.day_start_ms == b.day_start_ms
+        && a.day_end_ms == b.day_end_ms
+        && a.identity_version == b.identity_version
+        && a.semantics_version == b.semantics_version
+}
+
+fn repeated_claude_block(c: &Connection, canonical: &str) -> Result<Option<Observation>> {
+    let mut q = c.prepare("SELECT o.* FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility<>'identity_only' ORDER BY o.occurred_ms,o.normalized_hash,o.identity_key,o.observation_id")?;
+    let mut rows = q.query([canonical])?;
+    let mut first: Option<Observation> = None;
+    let mut different_time = false;
+    while let Some(row) = rows.next()? {
+        let o = load_observation(row)?;
+        if let Some(first) = &first {
+            if !equivalent_claude_blocks(first, &o) {
+                return Ok(None);
+            }
+            different_time |= first.occurred_ms != o.occurred_ms;
+        } else {
+            if !equivalent_claude_blocks(&o, &o) {
+                return Ok(None);
+            }
+            first = Some(o);
+        }
+    }
+    Ok(if different_time { first } else { None })
+}
+
 struct Decision {
     selected: Option<Observation>,
     conflict: bool,
     fact_kind: String,
+    equivalent_blocks: bool,
 }
-fn decide(c: &Connection, canonical: &str) -> Result<Decision> {
+fn decide(c: &Connection, canonical: &str, allow_blocks: bool) -> Result<Decision> {
+    if allow_blocks {
+        if let Some(selected) = repeated_claude_block(c, canonical)? {
+            return Ok(Decision {
+                selected: Some(selected),
+                conflict: false,
+                fact_kind: "request".into(),
+                equivalent_blocks: true,
+            });
+        }
+    }
     let sql="SELECT o.* FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility<>'identity_only' ORDER BY o.normalized_hash,o.identity_key,o.observation_id";
     // Authorities are adapter-owned. No current Claude request adapter has one.
     let authority_count:i64=c.query_row("SELECT COUNT(DISTINCT o.revision_authority) FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility<>'identity_only'",[canonical],|r|r.get(0))?;
@@ -598,6 +711,7 @@ fn decide(c: &Connection, canonical: &str) -> Result<Decision> {
             selected: None,
             conflict: true,
             fact_kind,
+            equivalent_blocks: false,
         });
     }
     let Some(union) = union else {
@@ -605,6 +719,7 @@ fn decide(c: &Connection, canonical: &str) -> Result<Decision> {
             selected: None,
             conflict: false,
             fact_kind,
+            equivalent_blocks: false,
         });
     };
     let mut rows = q.query([canonical])?;
@@ -615,6 +730,7 @@ fn decide(c: &Connection, canonical: &str) -> Result<Decision> {
                 selected: Some(o),
                 conflict: false,
                 fact_kind,
+                equivalent_blocks: false,
             });
         }
     }
@@ -622,6 +738,7 @@ fn decide(c: &Connection, canonical: &str) -> Result<Decision> {
         selected: None,
         conflict: cumulative,
         fact_kind,
+        equivalent_blocks: false,
     })
 }
 
@@ -752,6 +869,7 @@ fn automatic_decisions(
     family: &str,
     namespace: &str,
     ambiguity: Option<bool>,
+    allow_blocks: bool,
 ) -> Result<()> {
     let mut old = Vec::<OldSelection>::new();
     let mut q = c.prepare("SELECT e.identity_key,e.selected_observation_id,e.state,e.has_conflict,e.fact_kind FROM ledger_unit_old_keys k CROSS JOIN usage_events e WHERE e.identity_family=?1 AND e.namespace_key=?2 AND e.identity_key=k.identity_key AND e.state<>'unresolved' ORDER BY e.identity_key")?;
@@ -821,7 +939,7 @@ fn automatic_decisions(
             if exists {
                 continue;
             }
-            let decision = decide(c, &canonical)?;
+            let decision = decide(c, &canonical, false)?;
             let state = match decision.selected.as_ref() {
                 None => "unresolved",
                 Some(o) if o.action == "retract" => "retracted",
@@ -899,7 +1017,7 @@ fn automatic_decisions(
         if blocked.contains(&canonical) {
             continue;
         }
-        let decision = decide(c, &canonical)?;
+        let decision = decide(c, &canonical, allow_blocks)?;
         if let Some(previous) = prior.get(&canonical) {
             let old_observation = c.query_row(
                 "SELECT o.* FROM usage_observations o WHERE o.observation_id=?1",
@@ -913,16 +1031,23 @@ fn automatic_decisions(
             };
             let next = cumulative.as_ref();
             let selected_id = next.map_or(previous.selected_id, |o| o.observation_id);
-            let conflict = previous.conflict
-                || if let Some(selected) = next {
-                    cumulative_conflict(c, &canonical, selected)?
-                } else {
-                    decision.conflict
-                        || decision.selected.as_ref().is_none_or(|candidate| {
-                            let mut projection = Projection::from(&old_observation);
-                            !projection.merge(&Projection::from(candidate), false)
-                        })
-                };
+            let proven_duplicate = previous.state == "active"
+                && decision.equivalent_blocks
+                && decision
+                    .selected
+                    .as_ref()
+                    .is_some_and(|candidate| equivalent_claude_blocks(&old_observation, candidate));
+            let conflict = !proven_duplicate
+                && (previous.conflict
+                    || if let Some(selected) = next {
+                        cumulative_conflict(c, &canonical, selected)?
+                    } else {
+                        decision.conflict
+                            || decision.selected.as_ref().is_none_or(|candidate| {
+                                let mut projection = Projection::from(&old_observation);
+                                !projection.merge(&Projection::from(candidate), false)
+                            })
+                    });
             insert_decision(
                 c,
                 &canonical,
@@ -1013,8 +1138,17 @@ pub(crate) fn rebuild_unit(
 ) -> Result<bool> {
     create_work_tables(c)?;
     let ambiguous = prepare_unit(c, family, namespace, key, upper)?;
-    if matches!(cause, RebuildCause::Automatic) {
-        automatic_decisions(c, family, namespace, ambiguous)?;
+    if matches!(
+        cause,
+        RebuildCause::Automatic | RebuildCause::LegacyAutomatic
+    ) {
+        automatic_decisions(
+            c,
+            family,
+            namespace,
+            ambiguous,
+            matches!(cause, RebuildCause::Automatic),
+        )?;
     } else if let Some(identity_conflict) = ambiguous {
         c.execute("UPDATE ledger_unit_members SET canonical_key=raw_key", [])?;
         c.execute("INSERT INTO ledger_unit_decisions SELECT m.raw_key,NULL,'unresolved',?1,MIN(o.fact_kind) FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE o.eligibility<>'identity_only' GROUP BY m.raw_key",[i64::from(identity_conflict)])?;
@@ -1025,7 +1159,7 @@ pub(crate) fn rebuild_unit(
         let mut rows = q.query([])?;
         while let Some(r) = rows.next()? {
             let canonical: String = r.get(0)?;
-            let d = decide(c, &canonical)?;
+            let d = decide(c, &canonical, true)?;
             let state = match d.selected.as_ref() {
                 None => "unresolved",
                 Some(o) if o.action == "retract" => "retracted",

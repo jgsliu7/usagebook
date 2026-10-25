@@ -164,7 +164,7 @@ impl UsageSource for OmpSource {
             let mut session_id = fallback_session(root, path);
             let mut line_no = 0u64;
             let mut parsed_any = false;
-            let (total, bad) = for_each_line(path, |line| {
+            let read_outcome = for_each_line(path, |line| {
                 line_no += 1;
                 let Ok(v) = serde_json::from_str::<Value>(line) else {
                     stats.lines_bad_json += 1;
@@ -306,8 +306,8 @@ impl UsageSource for OmpSource {
                 }
                 parsed_any = true;
             });
-            stats.lines_total += total;
-            stats.lines_bad_json += bad;
+            let total = read_outcome.lines_delivered;
+            read_outcome.apply_to_stats(&mut stats);
             if parsed_any || total > 0 {
                 stats.files_parsed += 1;
             }

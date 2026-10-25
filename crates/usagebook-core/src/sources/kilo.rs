@@ -43,6 +43,10 @@ impl UsageSource for KiloSource {
         roots
     }
 
+    fn input_containers(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        roots.iter().map(|root| root.join("kilo.db")).collect()
+    }
+
     fn scan_roots(
         &self,
         roots: &[std::path::PathBuf],
@@ -105,7 +109,7 @@ impl UsageSource for KiloSource {
                 continue;
             };
             stats.files_parsed += 1;
-            while let Ok(Some(row)) = rows.next() {
+            while let Some(row) = crate::common::next_sqlite_row(&mut rows, "kilo", &mut stats) {
                 let vals: Vec<SqlValue> = (0..3)
                     .filter_map(|i| row.get::<_, SqlValue>(i).ok())
                     .collect();

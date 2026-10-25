@@ -54,6 +54,10 @@ impl UsageSource for GrokSource {
         roots
     }
 
+    fn input_containers(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        roots.iter().map(|root| root.join("sessions")).collect()
+    }
+
     fn scan_roots(
         &self,
         roots: &[std::path::PathBuf],
@@ -94,8 +98,7 @@ impl UsageSource for GrokSource {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            crate::common::for_each_line(path, |line| {
-                stats.lines_total += 1;
+            let read_outcome = crate::common::for_each_line(path, |line| {
                 let Ok(v) = serde_json::from_str::<Value>(line) else {
                     stats.lines_bad_json += 1;
                     return;
@@ -175,6 +178,7 @@ impl UsageSource for GrokSource {
                     });
                 }
             });
+            read_outcome.apply_to_stats(&mut stats);
             stats.files_parsed += 1;
         }
 

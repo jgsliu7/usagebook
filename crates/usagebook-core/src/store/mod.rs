@@ -14,8 +14,11 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// 10:minimax 源 model 回填 + 模型名去 provider 前缀(裸名与其他源对齐;8/9 为未发布中间版本)。
-pub const PARSER_VERSION: &str = "10";
+/// 13:Gemini 自定义 home 根与 Qwen 协议桶映射修正，旧解析结果不得复用。
+/// 12:JSONL 读取/编码故障传播；旧 source_state 部分成功缓存必须失效。
+/// 11:OpenCode v2 fork 按边界剔除复制前缀，旧缓存不得继续贡献重复用量。
+/// 10:minimax 源 model 回填 + 模型名去 provider 前缀(8/9 为未发布中间版本)。
+pub const PARSER_VERSION: &str = "16";
 const SCHEMA_VERSION: i32 = 2;
 const LOCK_PROTOCOL_VERSION: u32 = 1;
 

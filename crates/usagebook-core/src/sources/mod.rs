@@ -11,6 +11,7 @@ pub mod codex;
 pub mod copilot;
 pub mod droid;
 pub mod dsh;
+mod fork_lineage;
 pub mod gemini;
 pub mod goose;
 pub mod grok;

@@ -162,3 +162,14 @@
 - **拆两个源 id**:`kimi`(CLI,双根 ~/.kimi-code + ~/.kimi + KIMI_CODE_HOME)与 `kimi-work`(桌面根 + KIMI_WORK_HOME)。理由:产品口径分开呈现;引擎/格式/计费同源,无需第二套解析。
 - **共用扫描核**:kimi.rs 抽出 `scan_kimi_wire(source_id, empty_note, roots, max_files)`;source_id 同时用作记录 source、增量缓存命名空间、去重键前缀(`kimi-work:{session}:{agent}:{line}:{ordinal}`),两源互不串扰;报表"按工具"维度天然分行。
 - **PARSER_VERSION 6→7**:收编 `tools.register_user_tool` 改变投影白名单行为(未知→已知,L1 缓存内容变化),按不变式 8 bump,触发一次全量重建(~12s,语义不变)。
+
+## 11. R5 分叉会话计量归属（2026-10-25，v1.1）
+
+本节补充 **Kimi Code** 已发布 `@moonshot-ai/kimi-code@2.3.1`（固定 commit `684bae9ea6a437f3bae98bba1dcb797a917d500b`）的分叉协议；不自动推断 Kimi Work 桌面端支持相同协议。
+
+- [sessionLifecycleService](https://github.com/MoonshotAI/kimi-code/blob/684bae9ea6a437f3bae98bba1dcb797a917d500b/packages/agent-core-v2/src/workspace/sessionLifecycle/sessionLifecycleService.ts#L589-L680)：目标 `state.json.forkedFrom` 指向父会话；复制的每个 agent wire 追加 `forked`。按 turn 分叉可能裁剪/flatten，不能仅按用量金额或消息文本推断。
+- 已授权发现集合先按物理文件去重，再按同工作区的会话身份解析父边；不会根据 `forkedFrom` 构造新路径扫描。每轮重新读取相邻 `state.json`，检查读取前后文件身份，并拒绝越出会话目录的 metadata 符号链接。
+- 只有父 wire 完整可读、最后一个 `forked` 的 agent/time 合法，并且其前面的最小计量/控制事件投影与父 wire 顺序一一对应，复制用量才归原记录；`forked` 后新增用量正常累计。相同值的重复请求仍按出现序号保留。可证明的 turn 前缀支持；无法恢复唯一映射的 flatten/重排走 partial。
+- 多层关系、声明的祖先 agent 文件、循环、重复身份和全部复制投影一起验证。父缺失、损坏、冲突、未知关系会隔离相关连通谱系，并将来源标为 partial；无关正常会话仍产生 CLI 已知前缀。HTTP 使用既有整源 last-good 规则。父恢复后重新验证，不把临时缺父永久解释为零消费。
+- 新 agent 的协议补证：[agentLifecycleService create/fork](https://github.com/MoonshotAI/kimi-code/blob/684bae9ea6a437f3bae98bba1dcb797a917d500b/packages/agent-core-v2/src/session/agentLifecycle/agentLifecycleService.ts#L324-L334) 注册 `type=sub`、主代理关系及 `forkedFrom`；该文件 agent fork 必写后者。[WireService.seal](https://github.com/MoonshotAI/kimi-code/blob/684bae9ea6a437f3bae98bba1dcb797a917d500b/packages/agent-core-v2/src/wire/wireService.ts#L90-L97) 只为空 wire 创建 metadata。因此仅在新子代理声明完整、无 `forkedFrom`/`forked`、新 wire 创建边界晚于已验证主 fork 标记且其事件都不早于创建边界时计入独立新用量；证据不足仍 partial。独立父子会话后来分配同名 agent 不合并。
+- 缓存只保留身份、计量、模型及最小控制字段，不保存正文。文件去重域使用物理文件路径，避免无关工作区同名会话碰撞；缓存解析代次同步升级。历史旧根、真实模型覆盖、桶映射和 Kimi Work 用量口径保持原规则。

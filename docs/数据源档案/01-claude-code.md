@@ -38,8 +38,10 @@
 | `assistant` | 166 | 模型回复;**用量在这** |
 | `user` | 75 | 用户输入(prompt/工具结果回传;工具结果行 `message.content[0].type=="tool_result"` + 顶层 `toolUseResult`) |
 | `attachment` | 28 | 附件 |
-| `last-prompt` / `atis-latch` / `queue-operation` / `system` / `cost-state` | 33/33/2/1/1 | 新类型持续出现 → **格式漂移实证**,未知 type 必须跳过并计数 |
+| `last-prompt` / `atis-latch` / `queue-operation` / `system` / `cost-state` | 33/33/2/1/1 | 新类型持续出现 → **格式漂移实证**。持久账本仅跳过已核实的非用量类型；未知类型显式失败并保留安全游标 |
 | `mode` / `ai-title` / `file-history-delta` / `started` / `result` | 477/470/98/20/17 | **v1.0 实现时跨 60 文件补全的类型全集**(此前被计入"未知";均为元数据行跳过)。⚠️ `result` 行(`-p`/SDK 模式)可能携带成本/错误标记字段 ❓ 待专项取证 |
+
+2026-10-24 补充：官方 Claude Code 2.1.308 的发行代码还会写入 `pr-link`、`worktree-state`、`frame-link`、`bridge-session`。它们是关联 PR、工作树、界面或桥接会话的非用量元数据；持久采集与删除身份补证共用同一已知类型分类，跳过并计 `ignored`，不保存 URL、工作树对象或正文。只补认非事实记录，持久解析标识继续为 `claude-ledger-v1`，旧错误游标可在重试时继续。未知类型、坏 JSON、非法 usage/身份结构仍显式失败，不以宽松跳过掩盖新用量格式。
 
 **assistant 行字段**(本机实证 keys):
 `type, uuid, parentUuid, sessionId, timestamp(ISO8601Z), cwd, gitBranch, version, isSidechain, requestId(部分行), userType, entrypoint, effort, perTurnEffort, apiBlockIndex, thinkingDurationMs, message{…}`
@@ -130,7 +132,7 @@
 | 风险 | 对策 |
 |---|---|
 | 30 天硬删除 | v1 统计前先全量收编扫描;后续 F2 劫镖(hooks 通道) |
-| 行类型持续新增(atis-latch/cost-state/…) | 未知 type 跳过+计数上报;格式签名=已知 type 集合指纹 |
+| 行类型持续新增(atis-latch/cost-state/…) | 持久账本只跳过已核实非用量类型并计 ignored；未知 type 保留错误与安全游标，取证后再扩已知分类 |
 | 多根/环境变量 | `CLAUDE_CONFIG_DIR` 逗号分隔多根 + `~/.claude` + `$XDG_CONFIG_HOME/claude`;根须含 projects/ |
 | 模型枚举开放(本机 GLM-5.3) | model 字段原样保留,不做白名单;`<synthetic>` 跳过 |
 | 首行类型不定 | 流式逐行,不假设头部结构 |
@@ -141,3 +143,12 @@
 ## 9. v1 支持结论
 
 **✅ 支持,首发第一梯队。** 三方证据闭环:本机字段级(含 subagents 38 目录、isCompactSummary、30 天清理空窗实证)、开源五项目带行号(ccusage 三层键/tokscale max 合并为实现蓝本)、官方文档+issue 链接齐备。**档案冻结 v1.0,可写适配器。**
+
+
+## 10. 持久账本同值分块与旧库兼容（2026-10-25）
+
+持久账本的 Claude request 在既有 canonical 身份证明成立后，对整组可见候选严格比较模型、会话、动作、原始指标及存在性、成本状态和原生日字段；仅记录时间不同的等价块计一次。首次发布选择冻结上界内最早合法块的实际 Observation；已 active 的选择和日期保持原样，只在整组严格证明通过时清除错误冲突。identity_only 只作身份证据；真实数值/模型差异和未知/零值差异仍沿用冲突处理，不把 100→150 解释为本次授权的请求修订。
+
+resolver v3 复用 ingest_runs 分批重裁决。旧 v1/v2 publishing 先按 v2 规则排空；没有 v3 done 的 Claude namespace 即使没有新输入，也从0到 max(现存观察上界,历史done水位)完成一次重放。完成前保留旧水位，覆盖状态显示处理中；既有可查询事实不消失。持久游标是二进制排序边界，forget 后对应记录消失仍可续跑；维护删除会使临时键集失效。每单元发布、汇总和游标原子提交，原有 suppression、备份恢复与 epoch 约束继续生效。无需重建账本，也不重读消息正文。
+
+首次时间归属是本项目明确的裁决规则，非上游时间语义保证。正常 live 聚合的既有规则保持；本节只规定持久账本裁决与升级。

@@ -311,23 +311,7 @@ pub fn parse_line(line: &[u8]) -> Result<ParsedRecord> {
                 ignored: 0,
             })
         }
-        "user"
-        | "attachment"
-        | "summary"
-        | "file-history-snapshot"
-        | "file-history-delta"
-        | "permission-mode"
-        | "mode"
-        | "custom-title"
-        | "agent-name"
-        | "system"
-        | "queue-operation"
-        | "last-prompt"
-        | "atis-latch"
-        | "ai-title"
-        | "started"
-        | "result"
-        | "progress" => Ok(ParsedRecord {
+        kind if known_non_usage_type(kind) => Ok(ParsedRecord {
             ignored: 1,
             ..Default::default()
         }),
@@ -335,6 +319,36 @@ pub fn parse_line(line: &[u8]) -> Result<ParsedRecord> {
             "UnknownRecordType: unrecognized source record type".into(),
         )),
     }
+}
+
+/// These official transcript records carry no usage or request-identity facts.
+/// Share the classification with deletion proofs so a harmless metadata line
+/// cannot create an artificial gap in an otherwise complete identity scan.
+fn known_non_usage_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "user"
+            | "attachment"
+            | "summary"
+            | "file-history-snapshot"
+            | "file-history-delta"
+            | "permission-mode"
+            | "mode"
+            | "custom-title"
+            | "agent-name"
+            | "system"
+            | "queue-operation"
+            | "last-prompt"
+            | "atis-latch"
+            | "ai-title"
+            | "started"
+            | "result"
+            | "progress"
+            | "pr-link"
+            | "worktree-state"
+            | "frame-link"
+            | "bridge-session"
+    )
 }
 
 /// Strict identity projection for deletion proofs. Malformed identifiers are gaps,
@@ -354,26 +368,8 @@ pub(crate) fn identity_projection(
             let r = native_string(v, "/requestId").map_err(|_| LedgerError::IncompleteEvidence)?;
             Ok(Some((s, m, r)))
         }
-        Some(
-            "cost-state"
-            | "user"
-            | "attachment"
-            | "summary"
-            | "file-history-snapshot"
-            | "file-history-delta"
-            | "permission-mode"
-            | "mode"
-            | "custom-title"
-            | "agent-name"
-            | "system"
-            | "queue-operation"
-            | "last-prompt"
-            | "atis-latch"
-            | "ai-title"
-            | "started"
-            | "result"
-            | "progress",
-        ) => Ok(None),
+        Some("cost-state") => Ok(None),
+        Some(kind) if known_non_usage_type(kind) => Ok(None),
         _ => Err(LedgerError::IncompleteEvidence),
     }
 }

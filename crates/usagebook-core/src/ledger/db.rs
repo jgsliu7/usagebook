@@ -152,7 +152,7 @@ fn sync_parent(_path: &Path) -> Result<()> {
     std::fs::File::open(_path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
     Ok(())
 }
-pub(crate) fn open_connection(path: &Path, write: bool) -> Result<Connection> {
+fn configured_connection(path: &Path, write: bool) -> Result<Connection> {
     let flags = if write {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
@@ -164,6 +164,17 @@ pub(crate) fn open_connection(path: &Path, write: bool) -> Result<Connection> {
     // There is only one writer. Give its repeated identity lookups more cache
     // while leaving reader connections at 8 MiB and within the 64 MiB budget.
     c.pragma_update(None, "cache_size", if write { -32768 } else { -8192 })?;
+    Ok(c)
+}
+/// Restore is the only read-only entry point that accepts a known older schema.
+/// Its caller copies this handle into a private staging file before upgrading.
+pub(crate) fn open_restore_source(path: &Path) -> Result<Connection> {
+    let c = configured_connection(path, false)?;
+    validate_versions(&c, &[1, 2])?;
+    Ok(c)
+}
+pub(crate) fn open_connection(path: &Path, write: bool) -> Result<Connection> {
+    let c = configured_connection(path, write)?;
     if write {
         // A v1 ledger upgrades in place before validation; read-only opens of
         // v1 stay UnsupportedVersion until any writer (serve/refresh) passes.
@@ -315,11 +326,14 @@ PRAGMA foreign_keys=ON;
     Ok(())
 }
 pub(crate) fn validate(c: &Connection) -> Result<()> {
+    validate_versions(c, &[2])
+}
+fn validate_versions(c: &Connection, supported_schemas: &[i64]) -> Result<()> {
     let (schema,identity,normalization):(i64,i64,i64)=c.query_row("SELECT schema_version,identity_version,normalization_version FROM ledger_meta WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|LedgerError::CorruptLedger)?;
-    if schema != 2 || identity != 1 || normalization != 1 {
+    if !supported_schemas.contains(&schema) || identity != 1 || normalization != 1 {
         return Err(LedgerError::UnsupportedVersion);
     }
-    let bad:i64=c.query_row("SELECT count(*) FROM ingest_runs WHERE state='publishing' AND (resolver_version NOT IN ('ledger-resolver-v1','ledger-resolver-v2') OR identity_version<>1 OR epoch<>(SELECT epoch FROM ledger_meta))",[],|r|r.get(0))?;
+    let bad:i64=c.query_row("SELECT count(*) FROM ingest_runs WHERE state='publishing' AND (resolver_version NOT IN ('ledger-resolver-v1','ledger-resolver-v2','ledger-resolver-v3') OR identity_version<>1 OR epoch<>(SELECT epoch FROM ledger_meta))",[],|r|r.get(0))?;
     if bad != 0 {
         return Err(LedgerError::UpgradeRequiresDrain);
     }

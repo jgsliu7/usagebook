@@ -1,19 +1,15 @@
-//! Qwen Code 适配器 —— 依据 docs/数据源档案/14-qwen.md(源码一手取证+实装对账)。
+//! Qwen Code 适配器 —— 依据 docs/数据源档案/14-qwen.md。
 //!
-//! 双通道(§7.2,月度文件首选):<runtimeBase>/usage/token-usage-YYYY-MM.jsonl
-//!     (每 API 响应一条,含后台辅助 source 字段)存在则独占;否则回退
-//!     projects/<sanitizeCwd>/chats/*.jsonl(tmp 布局已证伪,不扫,§7.1)
-//! 根(§7.1):QWEN_RUNTIME_DIR > QWEN_HOME > ~/.qwen(⚠️ QWEN_DATA_DIR/QWEN_TMP_DIR 不存在,已删)
-//! 月度语义(§7.3):input ⊇ cached → input_uncached=in−cached;authType ∈ {openai,qwen-oauth}
-//!     时 candidates 含 thoughts → output=out−thoughts;其余协议 output 直取
-//! chats 语义(§3):inclusive 减除 + 形状守卫(协议不可判,按 openai 兼容处理并计数)
-//! 去重:月度 qwen:monthly:{id};chats qwen:{uuid},内容键兜底(§4)
+//! 同时读取 usage/token-usage-*.jsonl 与 projects/**/*.jsonl。月度日志不回填
+//! 历史；只有可信 sessionId 不相交时才合并聊天。相同会话双通道出现正用量
+//! 无法证明逐请求覆盖，返回月度及不相交聊天的已知前缀并标记 partial。
+//! 月度 authType 五桶矩阵及聊天同文件 uuid fragment last-wins 保持不变。
 
-use crate::common::{env_roots, home, iso_to_ms, walk_with};
-use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
+use crate::common::{env_roots, home, iso_to_ms, walk_with, FileStamp, SourceFingerprint};
+use crate::model::{Caliber, PreparedSourceScan, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 pub struct QwenSource;
 
@@ -23,9 +19,7 @@ impl UsageSource for QwenSource {
     }
 
     fn discover_roots(&self) -> Vec<PathBuf> {
-        // §7.1:双根探测并集(QWEN_RUNTIME_DIR 运行时根 + QWEN_HOME 全局根 + ~/.qwen)——
-        // 官方 rebuildFromSessionJsonl 硬编码全局根,设了 RUNTIME_DIR 的用户旧数据会留在
-        // 全局根,单根探测会漏;两根都存在时都扫,canonicalize 去重。
+        // Runtime roots can move while old chats remain in the global home.
         let mut roots = env_roots("QWEN_RUNTIME_DIR");
         roots.extend(env_roots("QWEN_HOME"));
         roots.push(home().join(".qwen"));
@@ -34,292 +28,440 @@ impl UsageSource for QwenSource {
         roots
     }
 
+    fn prepare_scan(&self, roots: &[PathBuf]) -> Option<Box<dyn PreparedSourceScan>> {
+        Some(Box::new(QwenInputs::discover(roots, None)))
+    }
+
     fn scan_roots(
         &self,
-        roots: &[std::path::PathBuf],
+        roots: &[PathBuf],
         max_files: Option<usize>,
     ) -> (Vec<UsageRecord>, ScanStats) {
-        let mut stats = ScanStats::default();
-        let mut records: Vec<UsageRecord> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut no_ts = 0u64;
-        if roots.is_empty() {
-            stats
-                .notes
-                .push("未发现 ~/.qwen 或 QWEN_RUNTIME_DIR/QWEN_HOME".into());
-            return (records, stats);
-        }
-        // —— 首选通道:usage/token-usage-*.jsonl 月度文件(§7.2,含后台辅助调用)——
-        let mut monthly: Vec<PathBuf> = Vec::new();
-        for r in roots {
-            monthly.extend(walk_with(&r.join("usage"), None, &|p| {
-                p.file_name().is_some_and(|n| {
-                    n.to_string_lossy().starts_with("token-usage-")
-                        && p.extension().is_some_and(|x| x == "jsonl")
-                })
-            }));
-        }
-        monthly.sort();
-        if !monthly.is_empty() {
-            stats.files_seen = monthly.len();
-            for path in &monthly {
-                scan_monthly_file(path, &mut records, &mut seen, &mut stats, &mut no_ts);
-                stats.files_parsed += 1;
-            }
-            stats.notes.push(format!(
-                "月度 token-usage 通道 {} 文件(§7.2,chats 通道让位防双计)",
-                monthly.len()
-            ));
-            return (records, stats);
-        }
+        QwenInputs::discover(roots, max_files).scan()
+    }
+}
 
-        // —— 兜底通道:projects/**/*.jsonl(tmp 布局已证伪不扫,§7.1)——
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut per_root = Vec::new();
-        for r in roots {
-            let mut got = walk_with(&r.join("projects"), None, &|p| {
-                p.extension().is_some_and(|x| x == "jsonl")
-            });
-            got.sort();
-            per_root.push((r.display().to_string(), got.len()));
-            files.extend(got);
-            if max_files.is_some_and(|m| files.len() >= m) {
-                files.truncate(max_files.unwrap());
-                break;
+struct QwenInputs {
+    monthly: Vec<PathBuf>,
+    chats: Vec<PathBuf>,
+    fingerprint: SourceFingerprint,
+    stats: ScanStats,
+}
+
+impl QwenInputs {
+    fn discover(roots: &[PathBuf], max_files: Option<usize>) -> Self {
+        let mut input = Self {
+            monthly: Vec::new(),
+            chats: Vec::new(),
+            fingerprint: Vec::new(),
+            stats: ScanStats::default(),
+        };
+        let mut canonical_roots = Vec::new();
+        for root in roots {
+            match root.canonicalize() {
+                Ok(root) if root.is_dir() => canonical_roots.push(root),
+                _ => fail(&mut input.stats, "ROOT_READ"),
             }
         }
-        stats.files_seen = files.len();
-
-        let mut shape_guard = 0u64;
-        let mut all_zero = 0u64;
-        let mut dup_dropped = 0u64;
-        // §7.4:同 uuid 多行 fragment 聚合 last-wins —— 用 map 后写覆盖,循环结束统一出账
-        let mut pending: std::collections::HashMap<String, UsageRecord> =
-            std::collections::HashMap::new();
-
-        for path in &files {
-            // 文件 mtime 兜底时间戳(§2)
-            let mtime_ms = path
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            crate::common::for_each_line(path, |line| {
-                stats.lines_total += 1;
-                let Ok(v) = serde_json::from_str::<Value>(line) else {
-                    stats.lines_bad_json += 1;
-                    return;
-                };
-                // 用量行判据(§2)
-                if v.get("type").and_then(|x| x.as_str()) != Some("assistant") {
-                    stats.lines_unknown_type += 1;
-                    return;
+        canonical_roots.sort();
+        canonical_roots.dedup();
+        let mut candidates = Vec::new();
+        for root in canonical_roots {
+            input
+                .fingerprint
+                .push((root.clone(), FileStamp::membership()));
+            for (monthly, directory) in [(true, "usage"), (false, "projects")] {
+                let container = root.join(directory);
+                // Optional absent containers are empty. A present dangling link
+                // is an unreadable input, not proof of a successful empty scan.
+                match std::fs::symlink_metadata(&container) {
+                    Ok(_) if !container.is_dir() => {
+                        fail(&mut input.stats, "INPUT_CONTAINER");
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        fail(&mut input.stats, "INPUT_DISCOVERY");
+                        continue;
+                    }
                 }
-                let Some(um) = v.get("usageMetadata") else {
-                    stats.lines_unknown_type += 1;
-                    return;
-                };
-                let g = |k: &str| crate::common::json_u64(um.get(k));
-                let (prompt, cand, thoughts, cached) = (
-                    g("promptTokenCount"),
-                    g("candidatesTokenCount"),
-                    g("thoughtsTokenCount"),
-                    g("cachedContentTokenCount"),
-                );
-                if prompt == 0 && cand == 0 {
-                    all_zero += 1;
-                    return;
+                let _ = crate::common::take_walk_error();
+                let paths = walk_with(&container, None, &|p| {
+                    p.extension().is_some_and(|e| e == "jsonl")
+                        && (!monthly
+                            || p.file_name()
+                                .is_some_and(|n| n.to_string_lossy().starts_with("token-usage-")))
+                });
+                if crate::common::take_walk_error() {
+                    fail(&mut input.stats, "INPUT_DISCOVERY");
                 }
-                // inclusive 减除 + 形状守卫(§3/§6)
-                let input_uncached = if cached > prompt {
-                    shape_guard += 1;
-                    prompt
+                candidates.extend(paths.into_iter().map(|p| (monthly, p)));
+            }
+        }
+        // Stable ordering and real filesystem identities prevent aliases from
+        // being interpreted as separate requests. Content equality is not proof.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut seen = HashSet::new();
+        for (monthly, alias) in candidates {
+            let (Some(stamp), Ok(path)) = (crate::common::file_stamp(&alias), alias.canonicalize())
+            else {
+                fail(&mut input.stats, "INPUT_METADATA");
+                continue;
+            };
+            if !path.is_file() {
+                fail(&mut input.stats, "INPUT_NOT_FILE");
+                continue;
+            }
+            input.fingerprint.push((alias, stamp.clone()));
+            input.fingerprint.push((path.clone(), stamp.clone()));
+            let identity = stamp.identity_key();
+            let pieces = identity.split('/').take(2).collect::<Vec<_>>();
+            let physical = if pieces.len() == 2 && pieces.iter().all(|p| !p.is_empty()) {
+                format!("file:{}:{}", pieces[0], pieces[1])
+            } else {
+                format!("path:{path:?}")
+            };
+            if seen.insert(physical) {
+                if monthly {
+                    input.monthly.push(path)
                 } else {
-                    prompt - cached
-                };
-                let output = cand.saturating_sub(thoughts);
-                let thoughts = thoughts.min(cand); // 估算值可能超过 output,同月度通道钳制(2026-10-17)
-                let ts_ms = v
-                    .get("timestamp")
-                    .and_then(|x| x.as_str())
-                    .and_then(iso_to_ms)
-                    .unwrap_or(mtime_ms);
-                if ts_ms == 0 {
-                    no_ts += 1;
+                    input.chats.push(path)
                 }
-                let session_id = v
-                    .get("sessionId")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or(&stem)
-                    .to_string();
-                let model = v
-                    .get("model")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                // 去重键(§4):uuid 优先,内容键兜底
-                let key = match v.get("uuid").and_then(|x| x.as_str()) {
-                    Some(u) => format!("qwen:{u}"),
-                    None => format!("qwen:{}:{}:{model}", session_id, ts_ms),
-                };
-                let record = UsageRecord {
-                    source: "qwen",
-                    session_id,
-                    agent: None,
-                    model,
-                    ts_ms,
-                    caliber: Caliber::RequestDelta,
-                    request_count: 1,
-                    input_uncached,
-                    cache_read: cached,
-                    cache_write: 0,
-                    cache_write_1h: 0,
-                    output,
-                    reasoning_output: thoughts,
-                    cost_usd: None,
-                    dedup_key: key.clone(),
-                };
-                // last-wins(§7.4):后写覆盖前写
-                if pending.insert(key, record).is_some() {
-                    dup_dropped += 1;
-                }
-            });
+            }
+        }
+        input.fingerprint.sort_by(|a, b| a.0.cmp(&b.0));
+        input.fingerprint.dedup_by(|a, b| a.0 == b.0);
+        if let Some(max) = max_files {
+            if input.monthly.len() + input.chats.len() > max {
+                fail(&mut input.stats, "INPUT_LIMIT");
+                input.monthly.truncate(max);
+                input
+                    .chats
+                    .truncate(max.saturating_sub(input.monthly.len()));
+            }
+        }
+        input
+    }
+}
+
+impl PreparedSourceScan for QwenInputs {
+    fn fingerprint(&self) -> Option<SourceFingerprint> {
+        (!self.stats.failed).then(|| self.fingerprint.clone())
+    }
+
+    fn scan(&self) -> (Vec<UsageRecord>, ScanStats) {
+        let mut stats = self.stats.clone();
+        stats.files_seen = self.monthly.len() + self.chats.len();
+        if stats.files_seen == 0 && !stats.failed {
+            stats.notes.push("未发现 Qwen 用量文件".into());
+        }
+        let mut monthly = Rows::default();
+        let mut covered = HashSet::new();
+        // A missing/unreadable monthly identity might belong to any chat. Such
+        // chats cannot be labelled disjoint; valid monthly rows remain known.
+        let mut unknown_coverage = self.stats.failed;
+        for path in &self.monthly {
+            scan_monthly_file(
+                path,
+                &mut monthly,
+                &mut covered,
+                &mut unknown_coverage,
+                &mut stats,
+            );
             stats.files_parsed += 1;
         }
-
-        // §7.4:fragment 聚合完成,统一出账(保持发现顺序已不可考,按 key 稳定序)
-        let mut keys: Vec<String> = pending.keys().cloned().collect();
-        keys.sort();
-        for k in keys {
-            if let Some(r) = pending.remove(&k) {
-                records.push(r);
+        let mut chats = Rows::default();
+        for path in &self.chats {
+            scan_chat_file(path, &mut chats, &mut stats);
+            stats.files_parsed += 1;
+        }
+        let mut records = monthly.records.into_values().collect::<Vec<_>>();
+        let mut overlap = HashSet::new();
+        for row in chats.records.into_values() {
+            if covered.contains(&row.session_id) {
+                overlap.insert(row.session_id);
+            } else if !unknown_coverage {
+                records.push(row);
             }
         }
-
-        for (root, n) in per_root {
-            stats.notes.push(format!("根 {}:{n} 个 jsonl", root));
+        if !overlap.is_empty() {
+            fail(&mut stats, "CHANNEL_OVERLAP");
         }
-        if all_zero > 0 {
-            stats
-                .notes
-                .push(format!("全零 usageMetadata 跳过 {all_zero} 行(§2)"));
+        if unknown_coverage && !self.chats.is_empty() {
+            fail(&mut stats, "MONTHLY_COVERAGE_UNKNOWN");
         }
-        if shape_guard > 0 {
-            stats.notes.push(format!(
-                "cached>prompt 改判 exclusive {shape_guard} 行(形状守卫,§6)"
-            ));
-        }
-        if no_ts > 0 {
-            stats
-                .notes
-                .push(format!("无时间戳回退文件 mtime {no_ts} 行(§2)"));
-        }
-        if dup_dropped > 0 {
-            stats
-                .notes
-                .push(format!("去重键命中丢弃 {dup_dropped} 行(§4)"));
-        }
+        records.sort_by(|a, b| a.dedup_key.cmp(&b.dedup_key));
+        stats.notes.push(format!(
+            "Qwen 双通道: 月度 {} 文件，聊天 {} 文件，重叠 {} 会话",
+            self.monthly.len(),
+            self.chats.len(),
+            overlap.len()
+        ));
         (records, stats)
     }
 }
 
-/// 月度 token-usage 文件解析(§7.2):每行 = 一次 API 响应(含后台辅助 source)。
-fn scan_monthly_file(
-    path: &std::path::Path,
-    records: &mut Vec<UsageRecord>,
-    seen: &mut HashSet<String>,
-    stats: &mut ScanStats,
-    no_ts: &mut u64,
-) {
-    let mtime_ms = path
-        .metadata()
+fn fail(stats: &mut ScanStats, reason: &str) {
+    stats.failed = true;
+    let note = format!("qwen {reason}");
+    if !stats.notes.contains(&note) {
+        stats.notes.push(note);
+    }
+}
+
+fn identity<'a>(v: &'a Value, field: &str) -> Option<&'a str> {
+    v.get(field)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && s.trim() == *s)
+}
+
+fn same_projection(a: &UsageRecord, b: &UsageRecord) -> bool {
+    a.session_id == b.session_id
+        && a.model == b.model
+        && a.agent == b.agent
+        && a.ts_ms == b.ts_ms
+        && a.token_buckets() == b.token_buckets()
+        && a.request_count == b.request_count
+}
+
+#[derive(Default)]
+struct Rows {
+    records: BTreeMap<String, UsageRecord>,
+    conflicts: HashSet<String>,
+}
+impl Rows {
+    fn insert(&mut self, row: UsageRecord, stats: &mut ScanStats) {
+        let key = row.dedup_key.clone();
+        if self.conflicts.contains(&key) {
+            return;
+        }
+        if let Some(previous) = self.records.get(&key) {
+            if !same_projection(previous, &row) {
+                self.records.remove(&key);
+                self.conflicts.insert(key);
+                stats.key_clash += 1;
+                fail(stats, "REQUEST_ID_CONFLICT");
+            }
+        } else {
+            self.records.insert(key, row);
+        }
+    }
+}
+
+fn file_time(path: &Path) -> i64 {
+    path.metadata()
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    crate::common::for_each_line(path, |line| {
-        stats.lines_total += 1;
+        .unwrap_or(0)
+}
+
+fn timestamp(v: &Value, fallback: i64) -> i64 {
+    v.get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(iso_to_ms)
+        .unwrap_or(fallback)
+}
+
+// Missing request IDs are not compared by timestamp or token amount. Retain a
+// uniquely located diagnostic row, mark partial, and never cache it as complete.
+fn request_key(
+    v: &Value,
+    field: &str,
+    prefix: &str,
+    path: &Path,
+    line: u64,
+    stats: &mut ScanStats,
+) -> String {
+    if let Some(id) = identity(v, field) {
+        return format!("{prefix}{id}");
+    }
+    fail(stats, "REQUEST_ID_MISSING");
+    format!("{prefix}unidentified:{path:?}:{line}")
+}
+
+fn scan_chat_file(path: &Path, rows: &mut Rows, stats: &mut ScanStats) {
+    let mtime = file_time(path);
+    let mut pending: HashMap<String, UsageRecord> = HashMap::new();
+    let mut conflicts = HashSet::new();
+    let mut line_number = 0;
+    let read = crate::common::for_each_line(path, |line| {
+        line_number += 1;
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             stats.lines_bad_json += 1;
             return;
         };
-        let g = |k: &str| crate::common::json_u64(v.get(k));
-        let input = g("inputTokens");
-        let output = g("outputTokens");
-        let cached = g("cachedTokens");
-        let thoughts = g("thoughtsTokens");
-        if input == 0 && output == 0 && cached == 0 {
-            return; // 全零跳过(三跳过)
-        }
-        // 五桶(§7.3):input ⊇ cached(inclusive);output 按 authType 分协议
-        let input_uncached = input.saturating_sub(cached);
-        let auth = v.get("authType").and_then(|x| x.as_str()).unwrap_or("");
-        let (out_net, reasoning) = if auth.is_empty() || auth == "openai" || auth == "qwen-oauth" {
-            // candidates 含 thoughts;thoughts 是估算值,可能超过 output——钳到 o 防虚增(与 pi 同族防御,2026-10-17)
-            (output.saturating_sub(thoughts), thoughts.min(output))
-        } else {
-            (output, thoughts.min(output)) // Gemini 原生等:output 不含 thoughts,同样钳制
-        };
-        let ts_ms = v
-            .get("timestamp")
-            .and_then(|x| x.as_str())
-            .and_then(iso_to_ms)
-            .unwrap_or(mtime_ms);
-        if ts_ms == 0 {
-            *no_ts += 1;
-        }
-        let session_id = v
-            .get("sessionId")
-            .and_then(|x| x.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let model = v
-            .get("model")
-            .and_then(|x| x.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        // 后台辅助调用归因(实装发现,§7.2):source != main 记入 agent
-        let source_tag = v.get("source").and_then(|x| x.as_str()).unwrap_or("main");
-        let agent = if source_tag.is_empty() || source_tag == "main" {
-            None
-        } else {
-            Some(source_tag.to_string())
-        };
-        // 去重(§7.2):月度行自带 uuid id
-        let key = match v.get("id").and_then(|x| x.as_str()) {
-            Some(id) => format!("qwen:monthly:{id}"),
-            None => format!(
-                "qwen:monthly:{}:{}:{model}:{ts_ms}:{input}:{output}",
-                session_id, cached
-            ),
-        };
-        if !seen.insert(key.clone()) {
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            stats.lines_unknown_type += 1;
             return;
         }
-        records.push(UsageRecord {
+        let Some(um) = v.get("usageMetadata") else {
+            stats.lines_unknown_type += 1;
+            return;
+        };
+        let g = |k: &str| crate::common::json_u64(um.get(k));
+        let (prompt, cand, thoughts, cached) = (
+            g("promptTokenCount"),
+            g("candidatesTokenCount"),
+            g("thoughtsTokenCount"),
+            g("cachedContentTokenCount"),
+        );
+        if prompt == 0 && cand == 0 {
+            return;
+        }
+        let Some(session) = identity(&v, "sessionId") else {
+            fail(stats, "SESSION_ID_MISSING");
+            return;
+        };
+        let input_uncached = if cached > prompt {
+            if !stats
+                .notes
+                .iter()
+                .any(|n| n == "Qwen cached>prompt: 使用既有 exclusive 形状守卫")
+            {
+                stats
+                    .notes
+                    .push("Qwen cached>prompt: 使用既有 exclusive 形状守卫".into());
+            }
+            prompt
+        } else {
+            prompt - cached
+        };
+        let key = request_key(&v, "uuid", "qwen:", path, line_number, stats);
+        let row = UsageRecord {
             source: "qwen",
-            session_id,
-            agent,
-            model,
-            ts_ms,
+            session_id: session.to_owned(),
+            agent: None,
+            model: v
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            ts_ms: timestamp(&v, mtime),
             caliber: Caliber::RequestDelta,
             request_count: 1,
             input_uncached,
             cache_read: cached,
             cache_write: 0,
             cache_write_1h: 0,
-            output: out_net,
-            reasoning_output: reasoning,
-            cost_usd: None, // 无成本字段(§6)
-            dedup_key: key,
-        });
+            output: cand.saturating_sub(thoughts),
+            reasoning_output: thoughts.min(cand),
+            cost_usd: None,
+            dedup_key: key.clone(),
+        };
+        if conflicts.contains(&key) {
+            return;
+        }
+        if pending
+            .get(&key)
+            .is_some_and(|prev| prev.session_id != row.session_id || prev.model != row.model)
+        {
+            pending.remove(&key);
+            conflicts.insert(key);
+            stats.key_clash += 1;
+            fail(stats, "REQUEST_ID_CONFLICT");
+        } else {
+            // Upstream supports fragments within a transcript. Last nonzero
+            // usage wins only inside that file; competing files need agreement.
+            pending.insert(key, row);
+        }
     });
+    read.apply_to_stats(stats);
+    for key in conflicts {
+        rows.records.remove(&key);
+        rows.conflicts.insert(key);
+    }
+    for row in pending.into_values() {
+        rows.insert(row, stats);
+    }
+}
+
+fn scan_monthly_file(
+    path: &Path,
+    rows: &mut Rows,
+    sessions: &mut HashSet<String>,
+    unknown: &mut bool,
+    stats: &mut ScanStats,
+) {
+    let mtime = file_time(path);
+    let previous_bad = stats.lines_bad_json;
+    let mut line_number = 0;
+    let read = crate::common::for_each_line(path, |line| {
+        line_number += 1;
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            stats.lines_bad_json += 1;
+            return;
+        };
+        let g = |k: &str| crate::common::json_u64(v.get(k));
+        let (input, output, cached, thoughts) = (
+            g("inputTokens"),
+            g("outputTokens"),
+            g("cachedTokens"),
+            g("thoughtsTokens"),
+        );
+        if input == 0 && output == 0 && cached == 0 && thoughts == 0 {
+            return;
+        }
+        let Some(session) = identity(&v, "sessionId") else {
+            *unknown = true;
+            fail(stats, "SESSION_ID_MISSING");
+            return;
+        };
+        sessions.insert(session.to_owned());
+        let auth = v.get("authType").and_then(Value::as_str).unwrap_or("");
+        let (out_net, reasoning) = match auth {
+            "" | "openai" | "openai-responses" | "qwen-oauth" => {
+                (output.saturating_sub(thoughts), thoughts.min(output))
+            }
+            "gemini" | "vertex-ai" => (output, thoughts),
+            "anthropic" if thoughts == 0 => (output, 0),
+            _ if thoughts == 0 => {
+                if !stats
+                    .notes
+                    .iter()
+                    .any(|n| n == "月度协议未识别但 thoughts=0，使用无歧义输出拆分")
+                {
+                    stats
+                        .notes
+                        .push("月度协议未识别但 thoughts=0，使用无歧义输出拆分".into());
+                }
+                (output, 0)
+            }
+            _ => {
+                fail(stats, "UNSUPPORTED_REASONING_PROTOCOL");
+                return;
+            }
+        };
+        let source = v.get("source").and_then(Value::as_str).unwrap_or("main");
+        let key = request_key(&v, "id", "qwen:monthly:", path, line_number, stats);
+        rows.insert(
+            UsageRecord {
+                source: "qwen",
+                session_id: session.to_owned(),
+                agent: (!source.is_empty() && source != "main").then(|| source.to_owned()),
+                model: v
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                ts_ms: timestamp(&v, mtime),
+                caliber: Caliber::RequestDelta,
+                request_count: 1,
+                input_uncached: input.saturating_sub(cached),
+                cache_read: cached,
+                cache_write: 0,
+                cache_write_1h: 0,
+                output: out_net,
+                reasoning_output: reasoning,
+                cost_usd: None,
+                dedup_key: key,
+            },
+            stats,
+        );
+    });
+    let incomplete = !read.reached_eof || read.error.is_some() || read.invalid_utf8_lines > 0;
+    read.apply_to_stats(stats);
+    *unknown |= incomplete || stats.lines_bad_json > previous_bad;
 }

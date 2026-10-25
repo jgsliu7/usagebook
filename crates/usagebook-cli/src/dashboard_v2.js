@@ -1,6 +1,7 @@
 'use strict';
 /* 原看板的数据适配：服务端完成统计；浏览器保存轻量实体目录、当前视图和用户已展开的汇总页。 */
 let v2Status = null, v2View = null, v2Controller = null, coldRetryTimer = null;
+let statusReachable = null, statusRequestSeq = 0;
 let viewGeneration = 0, restoringSelection = true, manualRefresh = null, pendingQueryKey = null;
 let globalTotalsCache = null;
 const RETRY_WAIT_MS=180000, RETRY_DELAY_MS=5000, NOTICE_DELAY_MS=60000;
@@ -117,6 +118,61 @@ async function apiV2(path,body,signal) {
     ]);
   } finally {clearTimeout(timeout);signal?.removeEventListener('abort',abort);}
 }
+// The inputs hold a draft; only a complete real calendar range reaches queries.
+let customCommittedRange = null, customDateDraft = null, customDateEditing = false;
+function validCalendarDate(day) {
+  if(typeof day!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(day))return false;
+  const date=new Date(day+'T12:00:00Z');
+  return Number.isFinite(date.getTime())&&date.toISOString().slice(0,10)===day;
+}
+function validCustomRange(start,end) {
+  return validCalendarDate(start)&&validCalendarDate(end)&&validCalendarDate(addDay(start>end?start:end,1));
+}
+function ensureCustomRange() {
+  if(!reportTimezone()){const error=new Error('Report timezone is not ready');error.code='INVALID_CUSTOM_RANGE';throw error;}
+  if(validCustomRange(state.rs,state.re))customCommittedRange=[state.rs,state.re].sort();
+  if(!customCommittedRange){
+    const extent=v2View?.response.payload.data.date_extent,end=validCalendarDate(extent?.last)?extent.last:localDayStr();
+    const first=validCalendarDate(extent?.first)?extent.first:null,start=addDay(end,-6);
+    customCommittedRange=[first&&first>start&&first<=end?first:start,end];
+  }
+  [state.rs,state.re]=customCommittedRange;
+  if(!customDateEditing){customDateDraft={rs:state.rs,re:state.re};syncCustomDateValidity();}
+  return [...customCommittedRange];
+}
+function syncCustomDateValidity() {
+  const valid=validCustomRange(customDateDraft.rs,customDateDraft.re);
+  for(const key of ['rs','re']){
+    const input=$('#'+key+'-pick'),bad=!validCalendarDate(customDateDraft[key])||(!valid&&validCalendarDate(customDateDraft.rs)&&validCalendarDate(customDateDraft.re));
+    input.setAttribute('aria-invalid',String(bad));input.title=bad?words('请输入有效日期','Enter a valid date'):'';
+    input.setCustomValidity?.(bad?input.title:'');
+  }
+  return valid;
+}
+function editCustomDate(key,value,commit) {
+  ensureCustomRange();customDateEditing=true;customDateDraft[key]=value;
+  const valid=syncCustomDateValidity();
+  if(!commit||!valid)return;
+  const [start,end]=[customDateDraft.rs,customDateDraft.re].sort();
+  const changed=state.rs!==start||state.re!==end;
+  changeQueryIntent(()=>{state.rs=start;state.re=end;});
+  customCommittedRange=[start,end];customDateDraft={rs:start,re:end};customDateEditing=false;
+  $('#rs-pick').value=start;$('#re-pick').value=end;
+  if(changed)render();
+}
+// Only explicit query controls reset legend intent. Background catalog recovery,
+// as-of changes, midnight, formatting and chart reconstruction do not.
+let doughnutIntentRevision=0;
+const doughnutHiddenIds=new Set();
+function queryIntentKey() {
+  return JSON.stringify([state.win,state.win==='custom'?[state.rs,state.re]:null,_selKey(state.srcSel),_selKey(state.mdlSel),state.metric,state.group]);
+}
+function resetDoughnutIntent(){doughnutIntentRevision++;doughnutHiddenIds.clear();}
+function changeQueryIntent(change){const before=queryIntentKey();change();if(before!==queryIntentKey())resetDoughnutIntent();}
+function rememberDoughnutVisibility(chart) {
+  if(!chart?.$entityIds||chart.$intentRevision!==doughnutIntentRevision)return;
+  chart.$entityIds.forEach((id,index)=>{if(chart.getDataVisibility(index))doughnutHiddenIds.delete(id);else doughnutHiddenIds.add(id);});
+}
 function currentQueryKey() {
   return JSON.stringify([state.win,state.rs,state.re,localDayStr(),_selKey(state.srcSel),_selKey(state.mdlSel),state.metric,state.group,v2Status?.stamp?.report_timezone]);
 }
@@ -151,15 +207,15 @@ async function readFullCatalog(dim,signal) {
       const items=[];let first=null,cursor=null;
       do{
         const page=await apiV2('catalog',{dimension:dim,search:'',page:{limit:200,cursor}},signal);
-        if(signal?.aborted||sequence!==catalogSequences[dim])return;
+        if(signal?.aborted||sequence!==catalogSequences[dim])return false;
         if(first)verifyStamp(first,page);else first=page;
         items.push(...page.items);cursor=page.next_cursor;
       }while(cursor);
       registerLabels(dim,items);
       catalogs[dim]={items,next:null,total:first.total_count,stamp:first.stamp};
-      return;
+      return true;
     }catch(e){
-      if(signal?.aborted||sequence!==catalogSequences[dim])return;
+      if(signal?.aborted||sequence!==catalogSequences[dim])return false;
       if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code))continue;
       throw e;
     }
@@ -168,16 +224,27 @@ async function readFullCatalog(dim,signal) {
 function syncSelections() {
   for(const dim of ['source','model']){
     const key=dim==='source'?'srcSel':'mdlSel',ids=catalogItems(dim).map(x=>x.id),previous=previousCatalogIds[dim];
-    let sel=state[key];
+    let sel=state[key],solo=state[dim==='source'?'srcSolo':'mdlSolo'];
+    // Stable model IDs contain case-sensitive base64url; only source IDs have legacy case aliases.
+    const matchKey=id=>dim==='source'?id.toLowerCase():id;
+    if(solo!==null){
+      const match=ids.find(id=>matchKey(id)===matchKey(solo));
+      // Source catalogs depend on the cutoff and successful source scans, so even
+      // a complete first directory cannot prove that a saved target is invalid.
+      // Models are invalidated only by the global server check after the query.
+      solo=match??solo;setSelection(dim,new Set([solo]),solo);
+      previousCatalogIds[dim]=new Set(ids);
+      continue;
+    }
     if(sel&&ids.length){
       if(sel.exclude)sel=new Set(ids.filter(id=>!sel.has(id)));
       if(sel.size){
-        const lower=new Map(ids.map(id=>[id.toLowerCase(),id]));
-        const alive=new Set([...sel].map(id=>lower.get(id.toLowerCase())).filter(Boolean));
+        const known=new Map(ids.map(id=>[matchKey(id),id]));
+        const alive=new Set([...sel].map(id=>known.get(matchKey(id))).filter(Boolean));
         if(previous)for(const id of ids)if(!previous.has(id))alive.add(id);
-        sel=alive.size===0?(previous?sel:null):alive.size===ids.length?null:alive;
+        sel=alive.size===0?(previous||dim==='model'?sel:null):alive.size===ids.length?null:alive;
       }
-      state[key]=sel;persist(dim==='source'?SRC_LS_KEY:MDL_LS_KEY,sel);
+      setSelection(dim,sel);
     }
     previousCatalogIds[dim]=new Set(ids);
   }
@@ -185,16 +252,17 @@ function syncSelections() {
 function migrateModels() {
   if(!state.mdlSel)return;
   const next=new Set();next.exclude=!!state.mdlSel.exclude;
-  for(const name of state.mdlSel){
-    if(name==='m1:u'||name.startsWith('m1:n:')){next.add(name);continue;}
+  const migrate=name=>{
+    if(name==='m1:u'||name.startsWith('m1:n:'))return name;
     const normalized=name.toLowerCase(),bytes=new TextEncoder().encode(normalized);
     const encoded=btoa(Array.from(bytes,b=>String.fromCharCode(b)).join('')).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-    const id=name?'m1:n:'+encoded:'m1:u';next.add(id);labels.model.set(id,name);
-  }
-  state.mdlSel=next;persist(MDL_LS_KEY,next);
+    const id=name?'m1:n:'+encoded:'m1:u';labels.model.set(id,name);return id;
+  };
+  for(const name of state.mdlSel)next.add(migrate(name));
+  setSelection('model',next,state.mdlSolo===null?null:migrate(state.mdlSolo));
 }
 async function fetchDashboard(signal) {
-  const key=currentQueryKey(),query=buildQuery(), trend=state.win.includes('week')?{unit:'week',periods:10,anchor_date:localDayStr()}:state.win.includes('month')?{unit:'month',periods:12,anchor_date:localDayStr()}:null;
+  const query=buildQuery(),key=currentQueryKey(), trend=state.win.includes('week')?{unit:'week',periods:10,anchor_date:localDayStr()}:state.win.includes('month')?{unit:'month',periods:12,anchor_date:localDayStr()}:null;
   const response=await apiV2('query',{kind:'dashboard',query,series_unit:'day',max_points:10000,table_limit:100,comparison:comparisonSpec(),trend},signal);
   const payload=response.payload.data, fixed={...query,as_of_ms:response.as_of_ms}, extra=[];
   let day=payload.latest_day,sourceTable=payload.source_table,modelTable=payload.model_table;
@@ -231,8 +299,8 @@ async function load(passive) {
   const seq=++loadSeq;pendingQueryKey=currentQueryKey();v2Controller?.abort();const controller=v2Controller=new AbortController();
   clearTimeout(coldRetryTimer);coldRetryTimer=null;
   try {
-    let status=await apiV2('status?arf='+(passive===true?'':state.arf),undefined,controller.signal);
-    if(seq!==loadSeq)return {ok:false,superseded:true};v2Status=status;
+    let status=await readStatusV2('status?arf='+(passive===true?'':state.arf),controller.signal,()=>seq===loadSeq);
+    if(seq!==loadSeq)return {ok:false,superseded:true};
     let scanIssue=observeScanStatus(status);
     registerLabels('source',(status.sources||[]).map(s=>({id:s.id,label:s.label||s.id})));
     if(!status.ready){
@@ -249,20 +317,35 @@ async function load(passive) {
     // Source membership is as-of dependent; model names are snapshot metadata.
     const changedCatalogs=['source','model'].filter(dim=>dim==='source'||!catalogs[dim].stamp||stampKey(catalogs[dim].stamp)!==stampKey(status.stamp));
     if(changedCatalogs.length){
-      await Promise.all(changedCatalogs.map(dim=>readFullCatalog(dim,controller.signal)));
-      if(seq!==loadSeq)return {ok:false,superseded:true};
+      const completed=await Promise.all(changedCatalogs.map(dim=>readFullCatalog(dim,controller.signal)));
+      if(seq!==loadSeq||controller.signal.aborted||completed.some(done=>!done))return {ok:false,superseded:true};
       syncSelections();
     }
     pendingQueryKey=currentQueryKey();
     let next;
     for(let attempt=0;attempt<2;attempt++){
       try{next=await fetchDashboard(controller.signal);break;}
-      catch(e){if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){status=v2Status=await apiV2('status?arf=',undefined,controller.signal);scanIssue=observeScanStatus(status);continue;}throw e;}
+      catch(e){if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){status=await readStatusV2('status?arf=',controller.signal,()=>seq===loadSeq);scanIssue=observeScanStatus(status);continue;}throw e;}
     }
-    if(seq!==loadSeq)return {ok:false,superseded:true};
-    // Only the server's global check may invalidate a restored nonempty model selection.
-    if(restoringSelection&&state.mdlSel&&!state.mdlSel.exclude&&state.mdlSel.size&&next.response.warnings.includes('ALL_SELECTED_MODELS_UNKNOWN')){
-      restoringSelection=false;state.mdlSel=null;persist(MDL_LS_KEY,null);return load(true);
+    if(seq!==loadSeq||controller.signal.aborted||next.key!==currentQueryKey())return {ok:false,superseded:true};
+    if(restoringSelection){
+      // UNKNOWN_SOURCE uses the static source registry; directory absence alone is insufficient.
+      const clearSource=state.srcSolo!==null&&next.response.warnings.includes('UNKNOWN_SOURCE:'+state.srcSolo);
+      let clearModel=false;
+      if(state.mdlSel&&!state.mdlSel.exclude&&state.mdlSel.size&&next.response.warnings.includes('ALL_SELECTED_MODELS_UNKNOWN')){
+        // A failed source can hide its models, even when that source is not selected.
+        // Check all sources at this snapshot/cutoff without reusing cached coverage.
+        const confirmation=await apiV2('query',{kind:'totals',query:{...next.query,window:{kind:'all'},sources:{mode:'all'},metric:'total',group_by:'none'}},controller.signal);
+        if(seq!==loadSeq||controller.signal.aborted||next.key!==currentQueryKey())return {ok:false,superseded:true};
+        verifyStamp(next.response,confirmation);
+        clearModel=confirmation.source_coverage==='complete'&&confirmation.warnings.includes('ALL_SELECTED_MODELS_UNKNOWN');
+      }
+      if(clearSource||clearModel){
+        restoringSelection=false;
+        if(clearSource)setSelection('source',null);
+        if(clearModel)setSelection('model',null);
+        return load(true);
+      }
     }
     restoringSelection=false;v2View=next;loadFailed=false;loadFailureSince=null;
     registerLabels('source',next.tables.source.rows);registerLabels('model',next.tables.model.rows);
@@ -279,6 +362,7 @@ async function load(passive) {
     return {ok:true,status};
   } catch(e){
     if(seq!==loadSeq||e.name==='AbortError')return {ok:false,superseded:true};
+    if(e.code==='INVALID_CUSTOM_RANGE')return {ok:false,invalidRange:true};
     showLoadFailure(e);if(!DATA)coldRetryTimer=setTimeout(()=>{if(!document.hidden)load(true);},5000);
     return {ok:false};
   }
@@ -294,8 +378,8 @@ function prepareDays() {
   daysAll=[extent.first,extent.last].filter(Boolean);
   const today=localDayStr(), first=extent.first||'', last=extent.last||'';
   for(const id of ['day-pick','rs-pick','re-pick']){const el=$('#'+id);el.min=first;el.max=id==='day-pick'&&last&&last<today?today:last;}
-  if(!state.rs){state.rs=last?addDay(last,-6):'';state.re=last;}
-  for(const[id,value]of [['day-pick',isDayWin(state.win)?winDay():''],['rs-pick',state.rs],['re-pick',state.re]])if(document.activeElement!==$('#'+id))$('#'+id).value=value||'';
+  ensureCustomRange();
+  for(const[id,value]of [['day-pick',isDayWin(state.win)?winDay():''],['rs-pick',customDateDraft.rs],['re-pick',customDateDraft.re]])if(document.activeElement!==$('#'+id))$('#'+id).value=value||'';
   if(isDayWin(state.win)){
     $('#day-prev').disabled=!first||addDay(winDay(),-1)<first;
     $('#day-next').disabled=!last||addDay(winDay(),1)>last;
@@ -343,6 +427,19 @@ function renderCards() {
   if(cwVisible())items.push([t('card.cw'),m.cache_write,hasTotal?ratioText(m.cache_write,m.total)+t('card.cwSub'):'—']);
   items.push([t('card.output'),m.output_combined,hasTotal?ratioText(m.output_combined,m.total)+t('card.reasonShare',ratioText(m.reasoning_output,m.output_combined)):'—']);
   $('#cards').innerHTML=items.map(([label,value,detail,highlight,delta])=>`<div class="card${highlight?' hl':''}"><div class="k">${escapeHtml(label)}</div><div class="v" title="${escapeHtml(metricTitle(value))}">${escapeHtml(metricText(value))}</div><div class="sub">${escapeHtml(detail)}${delta||''}</div></div>`).join('');
+}
+async function readStatusV2(path,signal,isCurrent) {
+  const sequence=++statusRequestSeq;
+  const current=()=>sequence===statusRequestSeq&&!signal?.aborted&&isCurrent();
+  try {
+    const result=await apiV2(path,undefined,signal);
+    if(!result||typeof result!=='object'||!Array.isArray(result.sources))throw new Error('Invalid status response');
+    if(current()){v2Status=result;statusReachable=true;}
+    return result;
+  } catch(error) {
+    if(current()){statusReachable=false;}
+    throw error;
+  }
 }
 function renderStatus() {
   if(!DATA?.ready)return;
@@ -416,22 +513,23 @@ function daySeries(day) {
 }
 function renderCharts() {
   const d=v2View.response.payload.data,single=isDayWin(state.win);
+  const reportTimezone=v2View.response.stamp.report_timezone;
   $('#day-prev').hidden=!single;$('#day-next').hidden=!single;$('#day-back').hidden=!single||state.win==='today';
   $('#hourly-panel').hidden=single;$('#grid2').classList.toggle('single',single);
   $('#daily-h2').textContent=t(single?'h2.dayHourly':'h2.daily');
   const metric=d.totals.metrics[METRIC_IDS[state.metric]];
   $('#daily-sub').textContent=single&&metric.state==='exact'&&metric.known_value==='0'?t('empty.noSel'):t(single?'sub.dayTotal':'sub.total',metricText(metric));
   drawSeries('#chartDaily',single?daySeries(v2View.day):d.series,single?null:point=>{
-    if(d.series.unit==='day')enterDay(point.label);else {state.win='custom';state.rs=dateInReportZone(point.start_ms);state.re=addDay(dateInReportZone(point.end_ms_exclusive),-1);render();}
+    if(d.series.unit==='day')enterDay(point.label);else {changeQueryIntent(()=>{state.win='custom';state.rs=dateInReportZone(point.start_ms,reportTimezone);state.re=addDay(dateInReportZone(point.end_ms_exclusive,reportTimezone),-1);});customDateEditing=false;render();}
   });
   if(!single){
     if(d.trend){
       const unit=state.win.includes('week')?'week':'month';$('#hourly-h2').textContent=t(unit==='week'?'h2.trendWk':'h2.trendMo');$('#hourly-sub').textContent=t(unit==='week'?'sub.trendWk':'sub.trendMo',unit==='week'?10:12);
       const selectedWindow=state.win,selectedIndex=d.trend.points.length-1-(['thisweek','thismonth'].includes(selectedWindow)?0:1);
       drawSeries('#chartHourly',d.trend,(point,index)=>{
-        if(index===selectedIndex)state.win=selectedWindow;
-        else {state.win='custom';state.rs=dateInReportZone(point.start_ms);state.re=addDay(dateInReportZone(point.end_ms_exclusive),-1);}
-        render();
+        changeQueryIntent(()=>{if(index===selectedIndex)state.win=selectedWindow;
+        else {state.win='custom';state.rs=dateInReportZone(point.start_ms,reportTimezone);state.re=addDay(dateInReportZone(point.end_ms_exclusive,reportTimezone),-1);}});
+        customDateEditing=false;render();
       },{selectedIndex,label:point=>unit==='week'?point.label.slice(5):point.label.slice(0,7)});
     }else{
       $('#hourly-h2').textContent=t('h2.hourly');$('#hourly-sub').textContent=v2View.day?t('sub.hourlyDay',v2View.day.date,metricText(v2View.day.total.metrics[METRIC_IDS[state.metric]])):t('empty.none');
@@ -440,19 +538,22 @@ function renderCharts() {
   }
   renderDoughnut();
 }
-function dateInReportZone(ms) {
-  const parts=new Intl.DateTimeFormat('en-US',{timeZone:v2Status.stamp.report_timezone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(Number(ms)));
+function dateInReportZone(ms,reportTimezone) {
+  const parts=new Intl.DateTimeFormat('en-US',{timeZone:reportTimezone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(Number(ms)));
   const get=type=>parts.find(p=>p.type===type).value;return `${get('year')}-${get('month')}-${get('day')}`;
 }
 function renderDoughnut() {
   const d=v2View.response.payload.data.distribution,rows=d.rows,total=BigInt(d.known_total||'0'),hasSlices=rows.length>0&&total>0n;
   $('#doughnut-h2').textContent=t(state.group==='model'?'h2.modelShare':'h2.sourceShare');
+  rememberDoughnutVisibility(charts['#chartSource']);
   const canvas=$('#chartSource'),empty=$('#doughnut-empty');empty.hidden=hasSlices;empty.textContent=d.complete?t('empty.noSel'):metricText(unknownMetric());
   if(canvas)canvas.style.display=hasSlices?'':'none';
   if(!hasSlices){if(charts['#chartSource']){charts['#chartSource'].destroy();delete charts['#chartSource'];}return;}
+  const ids=rows.map(r=>r.id),members=new Set(ids);
+  for(const id of doughnutHiddenIds)if(!members.has(id))doughnutHiddenIds.delete(id);
   const datasets=[{data:rows.map(r=>r.value.known_value==null?null:Number(r.value.known_value)),exactValues:rows.map(r=>r.value),backgroundColor:rows.map((r,i)=>chartColor(r,i)+'dd'),borderColor:'#0b0e14',borderWidth:2}];
-  const options={responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{boxWidth:10,boxHeight:10}},tooltip:{callbacks:{label:it=>tooltipMetricText(it.dataset.exactValues[it.dataIndex])}}}};
-  mkChart('#chartSource',{type:'doughnut',data:{labels:rows.map(r=>`${displayKey(r)} ${ratioText(r.value,{state:d.complete?'exact':'partial',known_value:total.toString()})}`),datasets},options,plugins:[centerTextPlugin],$center:{v:formatInteger(total),l:t('dough.center',t(METRICS[state.metric].labelKey))}});
+  const options={responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{boxWidth:10,boxHeight:10},onClick:(event,item,legend)=>{Chart.overrides.doughnut.plugins.legend.onClick(event,item,legend);rememberDoughnutVisibility(legend.chart);}},tooltip:{callbacks:{label:it=>tooltipMetricText(it.dataset.exactValues[it.dataIndex])}}}};
+  mkChart('#chartSource',{type:'doughnut',$entityIds:ids,$intentRevision:doughnutIntentRevision,$hiddenEntityIds:new Set(doughnutHiddenIds),data:{labels:rows.map(r=>`${displayKey(r)} ${ratioText(r.value,{state:d.complete?'exact':'partial',known_value:total.toString()})}`),datasets},options,plugins:[centerTextPlugin],$center:{v:formatInteger(total),l:t('dough.center',t(METRICS[state.metric].labelKey))}});
 }
 function renderModelTable(){renderDetailTable('model');}
 function renderSourceTable(){renderDetailTable('source');}
@@ -523,7 +624,7 @@ function buildFilterPanel(dim) {
   const input=element.querySelector('.ms-search');input.placeholder=t('ms.search',catalogs[dim].total);
   if(!previous||element.hidden||document.activeElement!==input)input.value=panel.search;
   input.oninput=e=>{if(e.isComposing)return;panel.search=e.target.value;element.dataset.q=panel.search;panel.visibleLimit=200;renderFilterList(dim);};
-  for(const act of ['all','none']){const button=element.querySelector(`[data-act="${act}"]`);button.textContent=t('ms.'+act);button.onclick=()=>{const key=dim==='source'?'srcSel':'mdlSel';state[key]=act==='all'?null:new Set();persist(dim==='source'?SRC_LS_KEY:MDL_LS_KEY,state[key]);render();};}
+  for(const act of ['all','none']){const button=element.querySelector(`[data-act="${act}"]`);button.textContent=t('ms.'+act);button.onclick=()=>{setSelection(dim,act==='all'?null:new Set(),null,true);render();};}
   const list=element.querySelector('.ms-list');
   list.onchange=e=>{const checkbox=e.target.closest('input[data-v]');if(checkbox)(dim==='source'?toggleSrc:toggleMdl)(checkbox.dataset.v);};
   list.onscroll=()=>{if(list.scrollTop+list.clientHeight>=list.scrollHeight-80&&panel.visibleLimit<panel.items.length){panel.visibleLimit+=200;renderFilterList(dim);}};
@@ -580,18 +681,30 @@ function rescanUntilNew(done) {
   const op={finished:false,timers:new Set(),controller:new AbortController()};manualRefresh=op;
   const active=()=>manualRefresh===op&&!op.finished;
   const later=(fn,ms)=>{const timer=setTimeout(()=>{op.timers.delete(timer);if(active())fn();},ms);op.timers.add(timer);};
-  op.finish=(timedOut=false,failed=false)=>{if(!active())return;op.finished=true;for(const timer of op.timers)clearTimeout(timer);op.controller.abort();manualRefresh=null;rescanBusy=false;if(!failed)rescanTimedOut=timedOut;rescanTimedOutGen=v2Status?.refresh_generation||'0';$('#btn-refresh').disabled=false;$('#btn-refresh').textContent=t('btn.refresh');if(timedOut&&!recoveryUntil){recoveryUntil=Date.now();recoveryBase=v2Status?.refresh_generation??null;}if(timedOut||failed)retryInBackground();if(done)done({ok:!timedOut&&!failed,timedOut,failed});};
+  op.finish=(timedOut=false,failed=false)=>{
+    if(!active())return;
+    op.finished=true;for(const timer of op.timers)clearTimeout(timer);op.controller.abort();
+    manualRefresh=null;rescanBusy=false;if(!failed)rescanTimedOut=timedOut;
+    rescanTimedOutGen=v2Status?.refresh_generation||'0';
+    $('#btn-refresh').disabled=false;$('#btn-refresh').textContent=t('btn.refresh');
+    // An explicitly requested update reports incomplete sources immediately;
+    // ordinary background hiccups still use the quiet notice delay.
+    if(failed)scanIssueSince=Math.min(scanIssueSince??Date.now(),Date.now()-NOTICE_DELAY_MS);
+    if(timedOut&&!recoveryUntil){recoveryUntil=Date.now();recoveryBase=v2Status?.refresh_generation??null;}
+    if(timedOut||failed)retryInBackground();
+    renderStatus();if(done)done({ok:!timedOut&&!failed,timedOut,failed});
+  };
   rescanBusy=true;$('#btn-refresh').disabled=true;$('#btn-refresh').textContent=t('btn.rescaning');renderStatus();later(()=>op.finish(true),RETRY_WAIT_MS);
   const start=async()=>{
     try{
-      const initial=await apiV2('status?arf=',undefined,op.controller.signal);if(!active())return;
+      const initial=await readStatusV2('status?arf=',op.controller.signal,active);if(!active())return;
       const base=BigInt(initial.refresh_generation||'0');
       await apiV2('refresh',{},op.controller.signal);if(!active())return;
       const poll=async()=>{try{
-        const status=await apiV2('status?arf=',undefined,op.controller.signal);if(!active())return;v2Status=status;observeScanStatus(status);renderStatus();
+        const status=await readStatusV2('status?arf=',op.controller.signal,active);if(!active())return;observeScanStatus(status);renderStatus();
         if(BigInt(status.refresh_generation||'0')!==base&&!status.refreshing){
           const result=await load(true);if(!active())return;
-          if(result?.ok){op.finish(false,!!result.status.refresh_error);return;}
+          if(result?.ok){op.finish(false,observeScanStatus(result.status));return;}
         }
       }catch(e){if(active())showLoadFailure(e);}if(active())later(poll,RETRY_DELAY_MS);};
       later(poll,300);

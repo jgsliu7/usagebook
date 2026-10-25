@@ -49,6 +49,7 @@
 
 - 默认 `~/.gemini/tmp/<项目标识>/chats/` ✅;**项目标识双形态必须兼容**:新版可读 slug(如 `my-project`,映射存 `~/.gemini/projects.json`,可反查真实路径)、旧版 `sha256(项目路径)` 40 位 hex,首运行自动迁移(storage.ts:263-324)。
 - env:❌ `GEMINI_DATA_DIR`/`GEMINI_HOME` **不存在**。真实:**`GEMINI_CLI_HOME`**(替换 home,paths.ts:22-28);另有 `GEMINI_TELEMETRY_OUTFILE`;macOS Seatbelt 沙箱特例 `~/.cache/.gemini`(storage.ts:92-108)。ccusage 的 `GEMINI_DATA_DIR` 可保留为兼容别名但须标注"源码不存在"。
+- **2026-10-24 路径裁决**：普通非沙箱环境，非空 `GEMINI_CLI_HOME` 是一个替代 HOME 的路径，扫描 `<GEMINI_CLI_HOME>/.gemini/tmp`，不扫描旧错误路径 `<GEMINI_CLI_HOME>/tmp`。未设置或空字符串才使用默认 HOME。兼容别名 `GEMINI_DATA_DIR` 直用、`GEMINI_HOME` 拼 `tmp`，维持逗号分根及 trim/忽略空分段；所有显式根合并，按 canonical 路径去重。配置意图在目录存在性过滤前保存：任一非空显式配置即使目录不存在或没有记录也不回落默认 HOME。Seatbelt 自动发现未在此项扩展。依据：[官方 paths.ts](https://github.com/google-gemini/gemini-cli/blob/f41d0bc8f7fe79563d353f97c7580ed4d8fd24d7/packages/core/src/utils/paths.ts)、[storage.ts](https://github.com/google-gemini/gemini-cli/blob/f41d0bc8f7fe79563d353f97c7580ed4d8fd24d7/packages/core/src/config/storage.ts)。
 - **subagent 独立文件**:`chats/<父sessionId>/<subagentSessionId>.jsonl`(kind: subagent)——须扫描,勿漏算;父子各自独立计量不重复。
 - **默认 30 天会话保留策略**会清理数据(session-management.md:159-186)——历史数据天然缺失,统计须知晓。
 

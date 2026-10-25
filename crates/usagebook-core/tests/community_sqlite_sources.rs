@@ -153,8 +153,14 @@ fn openclaw_sqlite_canonical() {
     );
     let e1 = records
         .iter()
-        .find(|r| r.dedup_key == "openclaw:main:sessA:ev-1")
+        .find(|r| r.session_id == "sessA" && r.ts_ms == 1750000000000)
         .unwrap();
+    let identity: serde_json::Value =
+        serde_json::from_str(e1.dedup_key.strip_prefix("openclaw:").unwrap()).unwrap();
+    assert!(!identity[0].as_str().unwrap().is_empty());
+    assert_eq!(identity[1], "main");
+    assert_eq!(identity[2], "sessA");
+    assert_eq!(identity[3], "id:ev-1");
     // exclusive 直取(§7.3):input 不减 cache;output 拆 reasoning
     assert_eq!(
         (
@@ -173,8 +179,9 @@ fn openclaw_sqlite_canonical() {
     );
     let ez = records
         .iter()
-        .find(|r| r.dedup_key == "openclaw:main:sessA:ev-z")
+        .find(|r| r.session_id == "sessA" && r.ts_ms == 1791338400000)
         .unwrap();
+    assert_ne!(e1.dedup_key, ez.dedup_key);
     assert_eq!(
         (ez.input_uncached, ez.output, ez.reasoning_output),
         (100, 20, 10)
@@ -298,7 +305,7 @@ fn hermes_state_db() {
             h1.cache_write,
             h1.reasoning_output
         ),
-        (100, 50, 10, 5, 5)
+        (100, 45, 10, 5, 5)
     );
     let h3 = records.iter().find(|r| r.session_id == "h3").unwrap();
     assert_eq!(h3.cost_usd, Some(0.05), "actual 缺失回落 estimated(§5)");
@@ -382,13 +389,11 @@ fn opencode_v2_and_json_fallback() {
     std::fs::create_dir_all(&dir_a).unwrap();
     let conn = Connection::open(dir_a.join("opencode.db")).unwrap();
     conn.execute_batch(
-        "CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
-         INSERT INTO session_message VALUES('om1','osess1','{\"type\":\"assistant\",
-           \"modelID\":\"claude-sonnet-4-5\",
+        "CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT);
+         INSERT INTO session_message VALUES('om1','osess1','assistant',1,1750000000000,'{\"modelID\":\"claude-sonnet-4-5\",
            \"tokens\":{\"input\":10,\"cache\":{\"read\":2,\"write\":1},\"output\":5,\"reasoning\":1},
            \"time\":{\"created\":1750000000000},\"cost\":0.01}');
-         INSERT INTO session_message VALUES('om2','osess1','{\"type\":\"user\",
-           \"tokens\":{\"input\":9},\"time\":{\"created\":1750000000000}}');",
+         INSERT INTO session_message VALUES('om2','osess1','user',2,1750000000000,'{\"tokens\":{\"input\":9},\"time\":{\"created\":1750000000000}}');",
     )
     .unwrap();
     drop(conn);
@@ -450,7 +455,11 @@ fn opencode_v2_and_json_fallback() {
         stats3.notes
     );
     let s = &records3[0];
-    assert_eq!(s.dedup_key, "opencode:session:ses_x");
+    let identity: serde_json::Value =
+        serde_json::from_str(s.dedup_key.strip_prefix("opencode:").unwrap()).unwrap();
+    assert!(!identity[0].as_str().unwrap().is_empty());
+    assert_eq!(identity[1], "ses_x");
+    assert_eq!(identity[2], "session-total");
     assert_eq!(s.model, "glm-5.3-flash", "model JSON 取 id(§2)");
     assert_eq!(
         (

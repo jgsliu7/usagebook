@@ -1,6 +1,6 @@
 //! Gemini CLI 适配器 —— 依据 docs/数据源档案/18-gemini.md(Community,本机未实证)。
 //!
-//! 根:~/.gemini/tmp;GEMINI_DATA_DIR(tmp 级直用)或 GEMINI_HOME(~/.gemini 级拼 tmp)(§1)
+//! 根:<GEMINI_CLI_HOME 或 HOME>/.gemini/tmp;兼容别名见 §7.1,显式配置不回落默认
 //! 文件:递归 *.jsonl + *.json 双格式(§2)
 //! jsonl:type=="gemini"(逐字节精确)且带 tokens;同 id 后值覆盖前值(流式更新,§4)
 //! inclusive 推断:total==input+output+thoughts+tool 且 cached>0 → input 减 cached(§3)
@@ -8,10 +8,10 @@
 //! 时间戳:行 timestamp|created_at(ISO)> startTime > 文件 mtime(§5)
 //! 去重:有 id 用 id;无 id 内容键;stats 用 文件名:模型(§4)
 
-use crate::common::{env_roots, home, iso_to_ms, json_u64, walk_with};
+use crate::common::{home, iso_to_ms, json_u64, walk_with};
 use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 pub struct GeminiSource;
@@ -64,23 +64,25 @@ impl UsageSource for GeminiSource {
     }
 
     fn discover_roots(&self) -> Vec<PathBuf> {
-        // §7.1:真实变量为 GEMINI_CLI_HOME(替换 home);GEMINI_DATA_DIR/GEMINI_HOME 为
-        // 第三方解析器约定,保留作兼容别名
-        let mut roots = env_roots("GEMINI_CLI_HOME")
-            .into_iter()
-            .map(|p| p.join("tmp"))
-            .collect::<Vec<_>>();
-        roots.extend(env_roots("GEMINI_DATA_DIR"));
-        for p in env_roots("GEMINI_HOME") {
-            roots.push(p.join("tmp"));
+        // Preserve explicit configuration before checking existence: a missing
+        // selected home must not silently read a different user's default data.
+        let mut roots = Vec::new();
+        if let Some(p) = std::env::var_os("GEMINI_CLI_HOME").filter(|p| !p.is_empty()) {
+            roots.push(PathBuf::from(p).join(".gemini/tmp"));
         }
-        roots.retain(|p| p.is_dir());
-        if roots.is_empty() {
-            let d = home().join(".gemini/tmp");
-            if d.is_dir() {
-                roots.push(d);
+        // Only the compatibility aliases use the existing comma/trim convention.
+        for (key, suffix) in [("GEMINI_DATA_DIR", ""), ("GEMINI_HOME", "tmp")] {
+            if let Ok(value) = std::env::var(key) {
+                for segment in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    roots.push(PathBuf::from(segment).join(suffix));
+                }
             }
         }
+        if roots.is_empty() {
+            roots.push(home().join(".gemini/tmp"));
+        }
+        let mut seen = HashSet::new();
+        roots.retain(|p| p.is_dir() && p.canonicalize().ok().is_some_and(|p| seen.insert(p)));
         roots
     }
 
@@ -93,7 +95,7 @@ impl UsageSource for GeminiSource {
         if roots.is_empty() {
             stats
                 .notes
-                .push("未发现 ~/.gemini/tmp 或 GEMINI_DATA_DIR/GEMINI_HOME".into());
+                .push("未发现 Gemini 用量目录（GEMINI_CLI_HOME/.gemini/tmp；兼容 GEMINI_DATA_DIR/GEMINI_HOME；显式配置不回落默认 HOME）".into());
             return (vec![], stats);
         }
         let mut files: Vec<PathBuf> = Vec::new();
@@ -194,8 +196,7 @@ impl UsageSource for GeminiSource {
             if is_jsonl {
                 stats.files_parsed += 1;
                 let mut sticky = String::new();
-                crate::common::for_each_line(path, |line| {
-                    stats.lines_total += 1;
+                let read_outcome = crate::common::for_each_line(path, |line| {
                     let Ok(v) = serde_json::from_str::<Value>(line) else {
                         stats.lines_bad_json += 1;
                         return;
@@ -219,6 +220,7 @@ impl UsageSource for GeminiSource {
                     }
                     sticky = sticky_model;
                 });
+                read_outcome.apply_to_stats(&mut stats);
             } else {
                 // .json(§2):messages 形状或 stats.models 会话聚合
                 let doc = std::fs::read_to_string(path)

@@ -213,7 +213,7 @@ pub(crate) fn scan_buddy_wire(
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (total, bad) = for_each_line(path, |line| {
+        let read_outcome = for_each_line(path, |line| {
             let Ok(v) = serde_json::from_str::<Value>(line) else {
                 stats.lines_bad_json += 1;
                 return;
@@ -320,8 +320,8 @@ pub(crate) fn scan_buddy_wire(
                 }
             }
         });
-        stats.lines_total += total;
-        stats.lines_bad_json += bad;
+        let total = read_outcome.lines_delivered;
+        read_outcome.apply_to_stats(&mut stats);
         if total > 0 {
             stats.files_parsed += 1;
         }
@@ -361,6 +361,10 @@ impl UsageSource for WorkbuddySource {
 
     fn discover_roots(&self) -> Vec<PathBuf> {
         self.roots()
+    }
+
+    fn input_containers(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        roots.iter().map(|root| root.join("projects")).collect()
     }
 
     fn scan_roots(

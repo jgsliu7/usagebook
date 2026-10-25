@@ -11,3 +11,6 @@ pub mod resolve;
 pub mod types;
 pub use db::Ledger;
 pub use types::{LedgerError, Result};
+
+/// Explicitly admitted durable adapters, independent of discovery or readiness.
+pub const DURABLE_SUPPORTED_SOURCES: &[&str] = &["claude"];

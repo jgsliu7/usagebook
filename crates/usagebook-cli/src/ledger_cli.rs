@@ -137,7 +137,8 @@ fn execute(command: LedgerCommand) -> usagebook_core::ledger::Result<()> {
                 ));
             };
             let l = Ledger::init(&path, &timezone)?;
-            json!({"initialized":true,"path":path,"timezone":timezone,"stamp":l.stamp()?})
+            json!({"initialized":true,"path":path,"timezone":timezone,"stamp":l.stamp()?,
+                "collection_started":false,"next_step":"启动 serve 开始采集；若服务已在运行，请先重启。"})
         }
         LedgerCommand::Status => {
             let l = Ledger::open(&path, false)?;
@@ -265,14 +266,16 @@ pub fn load_legacy(conn: &rusqlite::Connection) -> QueryResult<LegacySnapshot> {
         }
         if source == "ccswitch-rollup" {
             let p = usagebook_core::common::home().join(".cc-switch/cc-switch.db");
+            snapshot.observe_input_containers(source, vec![p.clone()]);
             if p.exists() {
                 if snapshot.load_ccswitch_at(&p).is_err() {
                     snapshot.sources.insert(
                         source.into(),
                         LegacySourceStatus {
-                            last_scanned_ms: Some(now_ms()),
+                            last_scanned_ms: None,
                             stale: true,
                             error: Some("SOURCE_READ_FAILED".into()),
+                            unaccounted_rows: 0,
                         },
                     );
                 }
@@ -283,6 +286,7 @@ pub fn load_legacy(conn: &rusqlite::Connection) -> QueryResult<LegacySnapshot> {
                         last_scanned_ms: Some(now_ms()),
                         stale: false,
                         error: None,
+                        unaccounted_rows: 0,
                     },
                 );
             }
@@ -290,15 +294,23 @@ pub fn load_legacy(conn: &rusqlite::Connection) -> QueryResult<LegacySnapshot> {
         }
         let _ = usagebook_core::common::take_walk_error();
         let roots = adapter.discover_roots();
+        snapshot.observe_input_containers(source, adapter.input_containers(&roots));
         let (records, stats) = usagebook_core::common::scan_source_cached(adapter.as_ref(), &roots);
-        snapshot.push_records(source, records, now_ms())?;
-        if stats.failed || stats.lines_bad_json > 0 {
+        let normalization = snapshot.push_records(source, records, now_ms());
+        if let Err(error) = &normalization {
+            // push_records only validates this adapter's records and commits
+            // atomically. Keep DB/routing failures outside this source boundary.
+            // Its fixed validation messages contain no model names or source text.
+            tracing::warn!(source, code = %error.code, reason = %error.message, "来源归一化失败");
+        }
+        if normalization.is_err() || stats.failed || stats.lines_bad_json > 0 {
             snapshot.sources.insert(
                 source.into(),
                 LegacySourceStatus {
-                    last_scanned_ms: Some(now_ms()),
+                    last_scanned_ms: None,
                     stale: true,
                     error: Some("SOURCE_READ_FAILED".into()),
+                    unaccounted_rows: 0,
                 },
             );
         }
@@ -407,6 +419,9 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
         .transpose()
         .map_err(|_| ("invalid as-of".into(), 2))?
         .map(|d| d.timestamp_millis());
+    // A rolling window and its cutoff must use the same clock reading. Other
+    // windows adopt the first query's resolved cutoff below.
+    let asof = asof.or_else(|| args.days.map(|_| now_ms()));
     let window = if let Some(days) = args.days {
         let ms = i64::try_from(days)
             .ok()
@@ -445,7 +460,7 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
     } else {
         Selector::Include { ids: args.model }
     };
-    let query = Query {
+    let mut query = Query {
         window,
         report_timezone: timezone,
         as_of_ms: asof.map(|v| v.to_string()),
@@ -456,6 +471,7 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
     };
     let mut partial = false;
     let mut shown_warnings = std::collections::BTreeSet::new();
+    let mut report_stamp: Option<Stamp> = None;
     for dimension in [Dimension::Day, Dimension::Source, Dimension::Model] {
         let mut page = Page::default();
         loop {
@@ -467,6 +483,10 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
                     page: page.clone(),
                 })
                 .map_err(query_exit)?;
+            check_report_stamp(&mut report_stamp, &response.stamp).map_err(query_exit)?;
+            if query.as_of_ms.is_none() {
+                query.as_of_ms = Some(response.as_of_ms.clone());
+            }
             partial |= response.source_coverage == "partial";
             print_report_page(&response, json_output, &mut shown_warnings);
             let next = response
@@ -489,6 +509,7 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
                 page: page.clone(),
             })
             .map_err(query_exit)?;
+        check_report_stamp(&mut report_stamp, &response.stamp).map_err(query_exit)?;
         partial |= response.source_coverage == "partial";
         print_report_page(&response, json_output, &mut shown_warnings);
         if let Some(next) = response.payload.get("next_cursor").and_then(|v| v.as_str()) {
@@ -505,6 +526,19 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
     } else {
         Ok(())
     }
+}
+fn check_report_stamp(expected: &mut Option<Stamp>, actual: &Stamp) -> QueryResult<()> {
+    if let Some(expected) = expected {
+        if expected != actual {
+            return Err(QueryError::new(
+                "CURSOR_STALE",
+                "report snapshot changed between pages",
+            ));
+        }
+    } else {
+        *expected = Some(actual.clone());
+    }
+    Ok(())
 }
 fn read_query_file(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;

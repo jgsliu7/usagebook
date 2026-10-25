@@ -77,7 +77,7 @@ fn scan_ide_db(
         return;
     };
     stats.files_parsed += 1;
-    while let Ok(Some(row)) = rows.next() {
+    while let Some(row) = crate::common::next_sqlite_row(&mut rows, "qoder", stats) {
         let vals: Vec<SqlValue> = (0..5)
             .filter_map(|i| row.get::<_, SqlValue>(i).ok())
             .collect();
@@ -204,7 +204,7 @@ impl UsageSource for QoderSource {
                 files.len()
             ));
             for path in &files {
-                let (total, bad) = for_each_line(path, |line| {
+                let read_outcome = for_each_line(path, |line| {
                     let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
                         return;
                     };
@@ -267,8 +267,7 @@ impl UsageSource for QoderSource {
                         dedup_key: key,
                     });
                 });
-                stats.lines_total += total;
-                stats.lines_bad_json += bad;
+                read_outcome.apply_to_stats(&mut stats);
                 stats.files_parsed += 1;
             }
         }

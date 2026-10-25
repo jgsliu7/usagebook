@@ -75,31 +75,121 @@ fn root_path(path: &Path) -> PathBuf {
         path.join("projects")
     }
 }
-fn list_files(root: &Path, mut visit: impl FnMut(PathBuf) -> Result<()>) -> Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum EnumerationStatus {
+    Complete,
+    Partial,
+    RootUnavailable,
+}
+#[must_use = "incomplete discovery must not certify missing files or identity evidence"]
+struct EnumerationSummary {
+    status: EnumerationStatus,
+    errors: u64,
+    first_error: Option<LedgerError>,
+}
+impl EnumerationSummary {
+    fn complete(&self) -> bool {
+        self.status == EnumerationStatus::Complete
+    }
+    fn record_error(&mut self, error: std::io::Error) {
+        self.errors = self.errors.saturating_add(1);
+        self.first_error.get_or_insert_with(|| source_io(error));
+        if self.complete() {
+            self.status = EnumerationStatus::Partial;
+        }
+    }
+}
+enum DiscoveryKind {
+    Directory,
+    File,
+    Other,
+}
+struct DiscoveryEntry {
+    path: PathBuf,
+    kind: std::io::Result<DiscoveryKind>,
+}
+fn discovery_entry(entry: std::io::Result<fs::DirEntry>) -> std::io::Result<DiscoveryEntry> {
+    let entry = entry?;
+    Ok(DiscoveryEntry {
+        path: entry.path(),
+        kind: entry.file_type().map(|kind| {
+            if kind.is_dir() {
+                DiscoveryKind::Directory
+            } else if kind.is_file() {
+                DiscoveryKind::File
+            } else {
+                // Symlinks are deliberately not followed, including directory links.
+                DiscoveryKind::Other
+            }
+        }),
+    })
+}
+fn list_files(root: &Path, visit: impl FnMut(PathBuf) -> Result<()>) -> Result<EnumerationSummary> {
+    list_files_with(root, visit, |path| {
+        fs::read_dir(path).map(|entries| entries.map(discovery_entry))
+    })
+}
+fn list_files_with<I: Iterator<Item = std::io::Result<DiscoveryEntry>>>(
+    root: &Path,
+    mut visit: impl FnMut(PathBuf) -> Result<()>,
+    mut read_dir: impl FnMut(&Path) -> std::io::Result<I>,
+) -> Result<EnumerationSummary> {
+    let mut summary = EnumerationSummary {
+        status: EnumerationStatus::Complete,
+        errors: 0,
+        first_error: None,
+    };
+    let entries = match read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            summary.status = EnumerationStatus::RootUnavailable;
+            summary.record_error(error);
+            return Ok(summary);
+        }
+    };
     // Depth-first iterators retain O(directory depth), never a Vec of every child directory.
-    let mut stack = vec![fs::read_dir(root).map_err(source_io)?];
+    let mut stack = vec![entries];
     while let Some(entries) = stack.last_mut() {
         let Some(entry) = entries.next() else {
             stack.pop();
             continue;
         };
-        let entry = entry.map_err(source_io)?;
-        let kind = entry.file_type().map_err(source_io)?;
-        let path = entry.path();
-        if kind.is_symlink() {
-            continue;
-        }
-        if kind.is_dir() {
-            stack.push(fs::read_dir(&path).map_err(source_io)?);
-        } else if kind.is_file()
-            && path.extension().is_some_and(|s| s == "jsonl")
-            && !(path.file_name().is_some_and(|s| s == "journal.jsonl")
-                && path.components().any(|s| s.as_os_str() == "subagents"))
-        {
-            visit(path)?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                summary.record_error(error);
+                // The failed iterator item has no reliable path. Abandon only this
+                // directory; retrying next could loop forever on a persistent fault.
+                stack.pop();
+                continue;
+            }
+        };
+        let kind = match entry.kind {
+            Ok(kind) => kind,
+            Err(error) => {
+                summary.record_error(error);
+                continue;
+            }
+        };
+        let path = entry.path;
+        match kind {
+            DiscoveryKind::Directory => match read_dir(&path) {
+                Ok(entries) => stack.push(entries),
+                Err(error) => summary.record_error(error),
+            },
+            DiscoveryKind::File
+                if path.extension().is_some_and(|s| s == "jsonl")
+                    && !(path.file_name().is_some_and(|s| s == "journal.jsonl")
+                        && path.components().any(|s| s.as_os_str() == "subagents")) =>
+            {
+                // Ledger/SQL/cancellation failures from the callback are fatal,
+                // not filesystem gaps that best-effort discovery may swallow.
+                visit(path)?;
+            }
+            _ => {}
         }
     }
-    Ok(())
+    Ok(summary)
 }
 // Preserve complete-record semantics while slow-path callers account and cancel
 // every <=64 KiB read. Even a legal 16 MiB line cannot bypass the I/O budget.
@@ -186,7 +276,7 @@ fn hash_prefix(path: &Path, len: i64, mtime: Option<i64>, prefix_len: i64) -> Re
 }
 
 impl Ledger {
-    /// New roots inherit the entire source's committed route, including paused roots.
+    /// New roots inherit the source's route and conservatively retain any pause.
     pub fn register_claude_root(&mut self, path: &Path) -> Result<String> {
         self.require_writer()?;
         let absolute = if path.is_absolute() {
@@ -210,7 +300,15 @@ impl Ledger {
             return Err(LedgerError::RouteInconsistent);
         }
         let route = routes.first().map(String::as_str).unwrap_or("live");
-        let inserted=tx.execute("INSERT INTO source_roots(root_id,identity_family,namespace_key,collector_key,report_source,native_tool,locator,enabled,identity_version,parser_version,route) VALUES(?1,'claude','unknown:claude','claude','claude','claude',?2,1,1,?3,?4) ON CONFLICT DO NOTHING",params![id,locator,PARSER_VERSION,route])?;
+        // Pause, forget and restore can disable existing roots. A newly found
+        // directory must not silently bypass that decision. Read and register
+        // under the same writer transaction; an existing root stays unchanged.
+        let enabled: bool = tx.query_row(
+            "SELECT COALESCE(MIN(enabled),1) FROM source_roots WHERE report_source='claude'",
+            [],
+            |r| r.get(0),
+        )?;
+        let inserted=tx.execute("INSERT INTO source_roots(root_id,identity_family,namespace_key,collector_key,report_source,native_tool,locator,enabled,identity_version,parser_version,route) VALUES(?1,'claude','unknown:claude','claude','claude','claude',?2,?5,1,?3,?4) ON CONFLICT DO NOTHING",params![id,locator,PARSER_VERSION,route,enabled])?;
         if inserted > 0 {
             super::db::bump(&tx)?;
         }
@@ -283,16 +381,23 @@ impl Ledger {
                     }
                     Ok(())
                 });
-                match enumerated {
-                    Ok(()) => {
-                        self.conn.execute("UPDATE source_roots SET enumeration_done=1,last_enumerated_ms=?2,error_code=NULL,failure_count=0,retry_after_ms=NULL WHERE root_id=?1",params![root_id,now_ms()])?;
-                        self.conn.execute("UPDATE source_objects SET state='missing',error_code=CASE WHEN target_done=0 THEN 'SourceMissingBeforeComplete' ELSE NULL END WHERE root_id=?1 AND state<>'missing' AND object_id NOT IN(SELECT object_id FROM acquisition_seen)",[&root_id])?;
+                let enumerated = enumerated?;
+                if enumerated.complete() {
+                    self.conn.execute("UPDATE source_roots SET enumeration_done=1,last_enumerated_ms=?2,error_code=NULL,failure_count=0,retry_after_ms=NULL WHERE root_id=?1",params![root_id,now_ms()])?;
+                    self.conn.execute("UPDATE source_objects SET state='missing',error_code=CASE WHEN target_done=0 THEN 'SourceMissingBeforeComplete' ELSE NULL END WHERE root_id=?1 AND state<>'missing' AND object_id NOT IN(SELECT object_id FROM acquisition_seen)",[&root_id])?;
+                } else {
+                    summary.errors = summary.errors.saturating_add(enumerated.errors);
+                    // Only a genuinely inaccessible root earns root-wide backoff.
+                    // A local gap must leave healthy siblings discoverable next poll.
+                    let error = enumerated
+                        .first_error
+                        .as_ref()
+                        .expect("incomplete enumeration has a diagnostic");
+                    if enumerated.status == EnumerationStatus::RootUnavailable {
+                        self.fail_root(&root_id, error)?;
+                    } else {
+                        self.conn.execute("UPDATE source_roots SET enumeration_done=0,error_code=?2,failure_count=0,retry_after_ms=NULL WHERE root_id=?1",params![root_id,error.code()])?;
                     }
-                    Err(e) if is_source_error(&e) => {
-                        summary.errors += 1;
-                        self.fail_root(&root_id, &e)?;
-                    }
-                    Err(e) => return Err(e),
                 }
             }
             // SQL retains the pending set; file count never becomes an in-memory Object Vec.
@@ -975,9 +1080,17 @@ fn prove_identity_connection_with(
     if !suppressed
         || epoch != current_epoch
         || identity_probe_digest(conn, message)? != guard_digest
-        || verify_identity_probe(conn).is_err()
     {
         return Ok(None);
+    }
+    match verify_identity_probe(conn) {
+        Ok(()) => {}
+        Err(error)
+            if is_source_error(&error) || matches!(error, LedgerError::IncompleteEvidence) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     }
     Ok(Some(reader::IdentityProof {
         counterpart,
@@ -1000,18 +1113,20 @@ fn capture_identity_probe(
     }
     for root in roots {
         progress(0)?;
-        if list_files(&root_path(Path::new(&root)), |p| {
+        let enumeration = list_files(&root_path(Path::new(&root)), |p| {
             progress(0)?;
-            let (len, mtime) = metadata_stamp(&fs::metadata(&p)?);
+            let (len, mtime) = metadata_stamp(&fs::metadata(&p).map_err(source_io)?);
             conn.execute(
                 "INSERT OR IGNORE INTO identity_probe_files VALUES(?1,?2,?3)",
                 params![path_text(&p)?, len, mtime],
             )?;
             Ok(())
-        })
-        .is_err()
-        {
-            return Ok(false);
+        });
+        match enumeration {
+            Ok(summary) if summary.complete() => {}
+            Ok(_) => return Ok(false),
+            Err(error) if is_source_error(&error) => return Ok(false),
+            Err(error) => return Err(error),
         }
     }
     // Missing registered objects cannot be certified by mere payload target_done.
@@ -1157,7 +1272,7 @@ pub(crate) fn verify_identity_probe(conn: &rusqlite::Connection) -> Result<()> {
         .collect::<rusqlite::Result<_>>()?;
     let mut count = 0i64;
     for root in roots {
-        list_files(&root_path(Path::new(&root)), |p| {
+        let enumeration = list_files(&root_path(Path::new(&root)), |p| {
             let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM identity_probe_files WHERE locator=?1)",
                 [path_text(&p)?],
@@ -1169,6 +1284,9 @@ pub(crate) fn verify_identity_probe(conn: &rusqlite::Connection) -> Result<()> {
             count += 1;
             Ok(())
         })?;
+        if !enumeration.complete() {
+            return Err(LedgerError::IncompleteEvidence);
+        }
     }
     // Overlapping registered roots intentionally see a file more than once; identity still deduplicates.
     let expected: i64 = conn.query_row("SELECT COUNT(*) FROM identity_probe_files", [], |r| {
@@ -1687,4 +1805,61 @@ pub fn helper_input_backpressure_regression() -> Result<bool> {
 #[cfg(feature = "regression-hooks")]
 pub fn audit_heartbeat_regression(path: &Path) -> Result<bool> {
     reader::audit_heartbeat_regression(path)
+}
+
+/// Inject filesystem discovery failures without depending on platform permission semantics.
+#[cfg(feature = "regression-hooks")]
+pub fn discovery_fault_regression(
+    root: &Path,
+    fault_path: &Path,
+    stage: &str,
+    visit: impl FnMut(PathBuf) -> Result<()>,
+) -> Result<(bool, bool, u64, Option<&'static str>)> {
+    type Entries = Box<dyn Iterator<Item = std::io::Result<DiscoveryEntry>>>;
+    let summary = list_files_with(root, visit, |path| -> std::io::Result<Entries> {
+        if stage == "open" && path == fault_path {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        if stage == "next" && path == fault_path {
+            // Infinite errors make accidental retries observable as a hanging regression.
+            return Ok(Box::new(std::iter::repeat_with(|| {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            })));
+        }
+        let fault_path = fault_path.to_owned();
+        let type_fault = stage == "file_type";
+        let entry_fault = stage == "entry";
+        Ok(Box::new(fs::read_dir(path)?.map(move |entry| {
+            let mut entry = discovery_entry(entry)?;
+            if entry.path == fault_path {
+                if entry_fault {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                if type_fault {
+                    entry.kind = Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+            }
+            Ok(entry)
+        })))
+    })?;
+    Ok((
+        summary.complete(),
+        summary.status == EnumerationStatus::RootUnavailable,
+        summary.errors,
+        summary.first_error.as_ref().map(LedgerError::code),
+    ))
+}
+
+/// Exercise both strict identity discovery passes, including changes between them.
+#[cfg(feature = "regression-hooks")]
+pub fn identity_discovery_regression(
+    ledger: &mut Ledger,
+    progress: &mut impl FnMut(u64) -> Result<()>,
+    change: impl FnOnce(&mut Ledger) -> Result<()>,
+) -> Result<()> {
+    if !capture_identity_probe(&ledger.conn, progress)? {
+        return Err(LedgerError::IncompleteEvidence);
+    }
+    change(ledger)?;
+    verify_identity_probe(&ledger.conn)
 }

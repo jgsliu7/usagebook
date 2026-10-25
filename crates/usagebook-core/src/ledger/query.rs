@@ -926,6 +926,12 @@ impl<'a> QueryService<'a> {
                 let (saved, saved_at) = saved_counts.get(info.id).copied().unwrap_or((0, None));
                 let (conflict, pending) = unresolved.get(info.id).copied().unwrap_or((0, 0));
                 let(publishing,last_pub):(bool,Option<i64>)=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM ingest_runs u JOIN source_roots r ON r.identity_family=u.identity_family AND r.namespace_key=u.namespace_key WHERE r.report_source=?1 AND u.state='publishing'),(SELECT MAX(u.finished_ms) FROM ingest_runs u JOIN source_roots r ON r.identity_family=u.identity_family AND r.namespace_key=u.namespace_key WHERE r.report_source=?1)",[info.id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                let compat_pending: bool =
+                    self.conn
+                        .query_row(super::resolve::COMPAT_PENDING_SQL, [info.id], |row| {
+                            row.get(0)
+                        })?;
+                let publishing = publishing || compat_pending;
                 let retry = retry.into_iter().chain(objretry).min();
                 last_saved = last_saved.into_iter().chain(saved_at).max();
                 let overdue:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM source_objects o JOIN source_roots r USING(root_id) WHERE r.report_source=?1 AND o.audit_due_ms<?2)",params![info.id,ctx.asof],|r|r.get(0))?;
@@ -933,7 +939,7 @@ impl<'a> QueryService<'a> {
                     "paused"
                 } else if root_errors + isolated > 0 {
                     "error"
-                } else if unenumerated + incomplete > 0 {
+                } else if unenumerated + incomplete > 0 || publishing {
                     "collecting"
                 } else {
                     "ready"
@@ -942,6 +948,27 @@ impl<'a> QueryService<'a> {
             } else {
                 let state = self.legacy.and_then(|l| l.sources.get(info.id));
                 sources.push(json!({"id":info.id,"route":"live","state":if state.is_some_and(|s|s.error.as_deref()==Some("LOADING")){"collecting"}else if state.is_some_and(|s|s.stale){"stale"}else if state.is_some_and(|s|s.error.is_some()){"error"}else if state.is_some(){"ready"}else{"collecting"},"pending_identities":"0","conflicted_identities":"0","saved_candidates":"0","identity_link_blocked_objects":"0","source_readable":state.is_some_and(|s|s.error.is_none()),"isolated_objects":"0","failed_roots":"0","incomplete_objects":"0","next_retry_at_ms":null,"last_published_at_ms":null,"publishing":false,"audit_last_completed_ms":null,"audit_overdue":false,"last_saved_at_ms":state.and_then(|s|s.last_scanned_ms).map(|n|n.to_string()),"error":state.and_then(|s|s.error.clone())}));
+            }
+        }
+        for source in &mut sources {
+            let id = source["id"].as_str().unwrap_or_default().to_owned();
+            let durable = source["route"] == "ledger";
+            let live = self.legacy.and_then(|l| l.sources.get(&id));
+            source["durable_supported"] =
+                json!(super::DURABLE_SUPPORTED_SOURCES.contains(&id.as_str()));
+            source["history_protection"] = json!(if durable { "durable" } else { "unprotected" });
+            source["last_scanned_at_ms"] = json!(if durable {
+                None
+            } else {
+                live.and_then(|s| s.last_scanned_ms).map(|n| n.to_string())
+            });
+            if id == "ccswitch-rollup" && !durable {
+                let count = live.map_or(0, |s| s.unaccounted_rows);
+                source["accounting"] = json!({
+                    "state":if count > 0 {"not_included"} else {"no_evidence"},
+                    "unaccounted_rows":count.to_string(),
+                    "reason":if count > 0 {Some("LEGACY_DAY_COVERAGE_UNKNOWN")} else {None}
+                });
             }
         }
         Ok(
@@ -962,6 +989,16 @@ impl<'a> QueryService<'a> {
                     ctx.warnings.insert("SOURCE_READ_GAP".into());
                 }
             }
+        }
+        if selection.allows("claude")
+            && self
+                .conn
+                .query_row(super::resolve::COMPAT_PENDING_SQL, ["claude"], |row| {
+                    row.get::<_, bool>(0)
+                })?
+        {
+            ctx.incomplete.insert("claude".into());
+            ctx.warnings.insert("IDENTITY_PENDING".into());
         }
         let mut st=self.conn.prepare("SELECT DISTINCT r.report_source FROM source_roots r WHERE r.route='ledger' AND(r.enabled=0 OR r.error_code IS NOT NULL OR r.enumeration_done=0 OR EXISTS(SELECT 1 FROM source_objects o WHERE o.root_id=r.root_id AND(o.state<>'ready' OR o.target_done=0)))")?;
         let mut rows = st.query([])?;

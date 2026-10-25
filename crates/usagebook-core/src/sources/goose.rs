@@ -221,7 +221,7 @@ impl UsageSource for GooseSource {
                 }
             };
             stats.files_parsed += 1;
-            while let Ok(Some(row)) = rows.next() {
+            while let Some(row) = crate::common::next_sqlite_row(&mut rows, "goose", &mut stats) {
                 let vals: Vec<SqlValue> = (0..11)
                     .filter_map(|i| row.get::<_, SqlValue>(i).ok())
                     .collect();
@@ -338,7 +338,7 @@ fn scan_ledger(
         return;
     };
     let mut skipped_compaction = 0u64;
-    while let Ok(Some(row)) = rows.next() {
+    while let Some(row) = crate::common::next_sqlite_row(&mut rows, "goose", stats) {
         let vals: Vec<SqlValue> = (0..11)
             .filter_map(|i| row.get::<_, SqlValue>(i).ok())
             .collect();

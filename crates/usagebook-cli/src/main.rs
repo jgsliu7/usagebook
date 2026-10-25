@@ -29,9 +29,12 @@ enum Command {
         /// 监听端口
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
-        /// 无前端驱动时的重扫回退间隔(秒,最小 5;看板轮询 ?arf= 声明时按其档位)
+        /// 后台两轮采集之间的等待秒数（5..=86400），不受页面刷新档位影响
         #[arg(long, default_value_t = 60)]
         refresh_secs: u64,
+        /// continuous 持续采集；on-demand 成功完成后仅有人查看才继续定期采集
+        #[arg(long, value_enum, default_value_t = ledger_http::CollectionMode::Continuous)]
+        collection_mode: ledger_http::CollectionMode,
         /// 服务就绪后打开本机看板
         #[arg(long)]
         open: bool,
@@ -134,12 +137,13 @@ fn main() {
         Some(Command::Serve {
             port,
             refresh_secs,
+            collection_mode,
             open,
         }) => {
             if args.source != "all" || args.days.is_some() || args.max_files.is_some() {
                 ledger_cli::fail("serve does not accept report filters", 2)
             }
-            ledger_http::run(port, refresh_secs, open);
+            ledger_http::run(port, refresh_secs, collection_mode, open);
         }
         None => {
             if args.max_files.is_some() {

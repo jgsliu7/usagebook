@@ -25,8 +25,8 @@
 ```
 
 - 用量行:`type=="session.shutdown"`;`session.start`/`resume` 忽略。
-- **累计快照语义(关键)**:shutdown 的 usage 是 (session,model) 累计;resume 会话会再次 shutdown → 收集同 (session,model) 全部 shutdown 按时间排序,**相邻差分**(首见取全量;总量下降 = 重启,取全量)拆成区间增量。
-- 映射:`inputTokens` **同时含 cacheRead+cacheWrite**(ccusage 减两者,juejin 只减 cacheRead → 取 ccusage,fixture 100−(10+20)=70 佐证);output/reasoning 直取。
+- **累计快照语义(关键)**：shutdown 的 usage 是 (物理根,session,model) 累计；按日志事件顺序，首个可信快照取全量，后续仅当原始计数与五个互斥桶均单调时差分。相同计数增量为零；相同事件 ID 只有完整载荷一致才是重放。下降、纯桶重分类、同 ID 冲突均显式失败。resume、时间变化、sessionStartTime 变化不构成已取证的重置证据，不能重新加整份历史。
+- 映射：`inputTokens` 同时含 cacheRead+cacheWrite；`outputTokens` 含 reasoning。互斥五桶为 input−cacheRead−cacheWrite、cacheRead、cacheWrite、output−reasoning、reasoning。具体边界见 §8。
 
 ## 3. OTel 格式(JSONL,span/log record)
 
@@ -34,19 +34,19 @@
   - span 且 `gen_ai.operation.name=="chat"` 或 name 以 `"chat "` 开头 → **ChatSpan**;
   - 非 span 且 `event.name=="gen_ai.client.inference.operation.details"` 或 body 以 `"GenAI inference:"` 开头 → **InferenceLog**;
   - `copilot_chat.agent.turn` → AgentTurnLog;`gen_ai.operation.name=="invoke_agent"` → AgentSummarySpan。
-- 映射:`gen_ai.usage.input_tokens`(含 cache_read,减 min(input,cache_read))、`output_tokens`、`cache_read.input_tokens`、`cache_write.input_tokens`|`cache_creation.input_tokens`(取首个>0)、`reasoning.output_tokens`|`reasoning_tokens`。数值可为数字或字符串。
+- 映射：`gen_ai.usage.input_tokens` 同时含 cache_read/cache_write，`output_tokens` 含 reasoning，统一拆为互斥五桶。`cache_write.input_tokens` / `cache_creation.input_tokens` 和 `reasoning.output_tokens` / `reasoning_tokens` 保留双名兼容；两名同时出现须数值相等。数值可为精确的非负整数或十进制整数字符串，非法值不得当零。
 - 时间戳:`[秒,纳秒]` 数组(endTime>startTime>hrTime>_hrTime>time)> 数值标量量级自适应 > timeUnixNano > 文件 mtime。
 
 ## 4. 双计防御(本实现取简化规则)
 
-- 同 (session,model) 的 OTel 行,时间 ≤ 该组**最后一个 shutdown 时间** → 丢弃(session-state 是正本)。
-- OTel 内部同 traceId 优先级:ChatSpan > InferenceLog > AgentTurnLog > AgentSummarySpan。
+- 同物理根的 (session,model) OTel 行，时间 ≤ 该组最后一个 shutdown 时间 → 丢弃（session-state 是正本）；不同根、不同 session 的截止点互不影响。
+- OTel 内部同物理根、session、traceId 优先级：ChatSpan > InferenceLog > AgentTurnLog > AgentSummarySpan。
 
 ## 5. 会话 / 模型 / 去重
 
-- session-state 会话 = 目录名;OTel 会话 attr:`gen_ai.conversation.id` 系 > `github.copilot.interaction_id` > `gen_ai.response.id` > traceId。
+- session-state 会话 = 目录名；存在 `session.start.data.sessionId` 时必须相符。OTel 会话只使用 `gen_ai.conversation.id`、`copilot_chat.session_id`、`copilot_chat.chat_session_id`、`session.id`，多个字段同时存在须一致。response/interaction/trace 是操作身份，不能代替已证明的 session；缺失或冲突显式失败。
 - 模型:`gen_ai.response.model` > `gen_ai.request.model`;剥 `-1m-internal`/`-1m` 后缀。
-- 去重:session-state 事件 `id` 优先(`copilot:shutdown:{sid}:{event_id}:{model}`),否则内容键;OTel 内容键(spanId+ts+model)。
+- 去重：物理根域参与所有键；同根路径别名通过 canonicalize 合一，不同根的相同 session/请求文本不相消。session-state 事件 `id` 载荷一致才重放，缺 ID 的旧格式以文件顺序及相邻累计差分处理；OTel 以 session、操作 ID、时间、模型构造内容键，同键不同桶显式失败。
 
 ## 6. 口径 / 成本
 
@@ -74,7 +74,26 @@
 ### 7.3 语义(定稿)
 
 - **inputTokens 同时含 cacheRead+cacheWrite** ✅(一手双证据:CLI 归一化函数 `inputUncached = max(0, inputTokens − cacheRead − cacheWrite)`;OTel metric 官方描述 "input tokens used, including cached tokens")→ 减两者正确。
-- **outputTokens 已含 reasoningTokens**(子集,OTel 描述 "including reasoning tokens")——直取,**勿相加**。
+- **outputTokens 已含 reasoningTokens**（子集，OTel 描述 "including reasoning tokens"）——互斥 output 桶取 outputTokens−reasoningTokens，reasoning 单列一次。
 - ⚠️ **cacheWrite 是 max 快照非可加增量**(Anthropic 缓存写按断点累计,`Math.max(上次, 本次5m+1h)`)——会话内求和时 input 恒等式对 cacheWrite 部分不严格。
 - 🆕 **官方成本 `totalNanoAiu`**:美元 ≈ `totalNanoAiu / 1e9 × 0.01`(1 AIU = 1 credit = $0.01,schema overageEntitlement 描述);`requests.cost` 是"计费乘数"(experimental)维持不取 ✅。
 - OTel 属性(v1.0.92 现版):span 树 `invoke_agent → plan → chat <model>/execute_tool`;token 属性 `gen_ai.usage.input_tokens / output_tokens / cache_read.input_tokens / cache_write.input_tokens(1.0.64 曾名 cache_creation,双名兼容保留)/ reasoning.output_tokens`。§3 的 `copilot_chat.agent.turn`/`"GenAI inference:"` 判据在 v1.0.92 全部 0 命中(旧版/fixture 遗留),降为历史兼容。
+
+
+## 8. 2026-10-24 第三轮 v1.1 实施契约
+
+### 每会话覆盖与失败保护
+
+- `session-store.db` 是逐请求主通道，覆盖单位是 `(规范化物理根, session_id)`，不再以根中任意一行独占所有会话。已覆盖会话保留 DB 权威；完全未入库会话从 shutdown/OTel 补齐，仍按 §4 消除 fallback 重叠。
+- 同 session 正常 DB/events/OTel 重叠健康成功。不能用时间、token 总和差额或 `modelMetrics.requests.count` 猜测 DB 缺口：API 请求数与 DB usage 行是否包含相同的失败/重试请求尚无一一对应的取证合同。fallback 正用量模型在 DB 完全无行则能证明该会话存在缺口，此时整源标失败，不用差额补账。DB 零 token 行仍建立 session/model 覆盖。
+- 无表、空表和旧版缺可选 `reasoning_tokens` / `total_nano_aiu` 列可兼容；DB 打开/查询/读取错误、身份缺失/冲突及非法用量不得伪装成空库成功。读取 fallback 同样传播 I/O/JSON 错误。
+- 沿用源级保护：`ScanStats.failed` 使 CLI 标 partial 并退出 5；HTTP 丢弃当轮该源候选，保留上次完整快照（包括成功空快照），健康来源仍继续。失败不进入成功 L1b/L2 缓存。根指纹继续覆盖 DB、sidecar 与 fallback 文件，未入库会话增改会使缓存失效。
+
+### 三通道共同五桶和累计策略
+
+- input 包括两种 cache，output 包括 reasoning。子桶超过总桶、负数、非整数、数值超界和双名冲突均失败，禁止饱和减法掩盖矛盾。已知可选字段缺失取 0，显式 null/非法内容不是缺失。
+- shutdown 只在 Copilot 内部差分，不修改其他适配器的 `SnapshotDiff`。原始计数与互斥桶都须单调；两次相同计数的增量为 0；同事件 ID 的完整 JSON 载荷做进程内摘要核对，正文/上下文不进入缓存。没有已核实的重置边界时保守失败，本轮不增加 checkpoint/compaction 消费。
+- DB 保留 `total_nano_aiu / 1e9 × 0.01` 的既有成本转换；shutdown/OTel 不把 `requests.cost` 当美元，费用、日期和展示 session 的来源语义不变。
+- live parser 缓存代次随第三轮统一升级；不改持久 Claude 账本的解析标识，不迁移或删除用户源数据。
+
+一手核验：[GitHub SDK 事件说明](https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/streaming-events)、[固定版本 shutdown/schema](https://github.com/github/copilot-sdk/blob/be9764fe7c10e48e17b37bf6a3198b1f26f7e9e8/nodejs/src/generated/session-events.ts)、[OTel GenAI 属性](https://opentelemetry.io/docs/specs/semconv/registry/attributes/gen-ai/)。OTel 的包含关系用 SHOULD 描述；此处仅落实已有 Copilot 通道的取证合同，不推及任意第三方采集器。

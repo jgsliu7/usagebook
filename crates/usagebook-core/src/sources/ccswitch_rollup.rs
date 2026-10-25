@@ -163,14 +163,27 @@ pub fn backfill_at(
     let mut skipped_unknown_app = 0u64;
     let mut skipped_empty = 0u64;
     let mut normalized_legacy_rows = 0i64;
-    let Ok(rows) = rows else {
-        stats
-            .notes
-            .push("cc-switch rollups 读取失败,本轮跳过回填".into());
-        return (vec![], stats);
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            stats.failed = true;
+            stats
+                .notes
+                .push(format!("cc-switch rollups 读取失败: {error}"));
+            return (vec![], stats);
+        }
     };
-    for row in rows.flatten() {
-        let (date, app_type, model, i, cr, cw, o, n_req, legacy_rows) = row;
+    for row in rows {
+        let (date, app_type, model, i, cr, cw, o, n_req, legacy_rows) = match row {
+            Ok(row) => row,
+            Err(error) => {
+                stats.failed = true;
+                stats
+                    .notes
+                    .push(format!("cc-switch rollups 读取中断: {error}"));
+                break;
+            }
+        };
         let Some(native) = native_of(&app_type) else {
             skipped_unknown_app += 1;
             continue;

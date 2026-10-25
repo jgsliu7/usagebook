@@ -23,6 +23,162 @@ use std::path::{Path, PathBuf};
 
 pub struct PiSource;
 
+/// Stage only identity, lineage and metering facts in memory, never message content.
+fn project_usage(v: &Value) -> Option<Value> {
+    Some(usage_projection(
+        v,
+        &[
+            "/type",
+            "/id",
+            "/parentId",
+            "/parentSession",
+            "/timestamp",
+            "/version",
+            "/message/role",
+            "/message/timestamp",
+            "/message/model",
+            "/message/provider",
+            "/message/usage/input",
+            "/message/usage/cacheRead",
+            "/message/usage/cacheWrite",
+            "/message/usage/output",
+            "/message/usage/reasoning",
+            "/message/usage/reasoningTokens",
+            "/message/usage/totalTokens",
+            "/message/usage/cacheWrite1h",
+            "/message/usage/cost/total",
+        ],
+    ))
+}
+
+/// A child may copy any branch, not necessarily a byte prefix. Entry IDs are
+/// scoped to a proven parent edge; independent sessions never share ownership.
+fn copied_rows(
+    files: &[PathBuf],
+    aliases: &HashMap<PathBuf, Vec<usize>>,
+    docs: &[std::sync::Arc<UsageLines>],
+    stats: &mut ScanStats,
+) -> (Vec<HashSet<u64>>, Vec<bool>) {
+    use super::fork_lineage::{lexical, quarantine};
+    let mut parents = vec![Vec::new(); files.len()];
+    let mut bad = vec![false; files.len()];
+    let mut missing_id = vec![false; files.len()];
+    let mut entries: Vec<HashMap<String, Value>> = vec![HashMap::new(); files.len()];
+    for (i, doc) in docs.iter().enumerate() {
+        // Standalone sessions preserve their already-readable prefix. Read failures
+        // quarantine a whole family only when copy ownership depends on this file.
+        let headers: Vec<_> = doc
+            .events
+            .iter()
+            .filter(|(_, v)| v["type"] == "session")
+            .collect();
+        if headers.len() > 1 {
+            bad[i] = true;
+        }
+        if let Some((_, header)) = headers.first() {
+            if let Some(parent) = header.get("parentSession").filter(|v| !v.is_null()) {
+                if let Some(parent) = parent.as_str().filter(|s| !s.is_empty()) {
+                    let path = Path::new(parent);
+                    let resolved = if path.is_absolute() {
+                        lexical(path)
+                    } else {
+                        lexical(&files[i].parent().unwrap_or(Path::new("")).join(path))
+                    };
+                    parents[i] = aliases.get(&resolved).cloned().unwrap_or_default();
+                    if parents[i].len() != 1 {
+                        bad[i] = true;
+                    }
+                } else {
+                    bad[i] = true;
+                }
+            }
+        }
+        for (_, entry) in &doc.events {
+            if entry["type"] == "session" || entry["type"] == "label" {
+                continue;
+            }
+            let Some(id) = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                if entry.pointer("/message/usage").is_some() {
+                    missing_id[i] = true;
+                }
+                continue;
+            };
+            let mut projection = entry.clone();
+            projection.as_object_mut().unwrap().remove("parentId");
+            if entries[i].insert(id.to_string(), projection).is_some() {
+                bad[i] = true;
+            }
+        }
+    }
+    let mut skipped = vec![HashSet::new(); files.len()];
+    for i in 0..files.len() {
+        if parents[i].len() != 1 {
+            continue;
+        }
+        let parent = parents[i][0];
+        if missing_id[i] || missing_id[parent] {
+            bad[i] = true;
+        }
+        let parent_header = docs[parent]
+            .events
+            .iter()
+            .find(|(_, v)| v["type"] == "session");
+        if parent_header.and_then(|(_, v)| v["id"].as_str()).is_none() {
+            bad[i] = true;
+        }
+        let child_header = docs[i].events.iter().find(|(_, v)| v["type"] == "session");
+        if child_header.and_then(|(_, v)| v["id"].as_str()).is_none()
+            || child_header.map(|(_, v)| &v["id"]) == parent_header.map(|(_, v)| &v["id"])
+        {
+            bad[i] = true;
+        }
+        let mut witnessed = false;
+        for (line, entry) in &docs[i].events {
+            let Some(id) = entry["id"].as_str() else {
+                continue;
+            };
+            if entry["type"] == "session" || entry["type"] == "label" {
+                continue;
+            }
+            if let Some(original) = entries[parent].get(id) {
+                let mut projection = entry.clone();
+                projection.as_object_mut().unwrap().remove("parentId");
+                if &projection != original {
+                    bad[i] = true;
+                } else {
+                    witnessed = true;
+                    skipped[i].insert(*line);
+                }
+            }
+        }
+        // A nonempty parent with no copied identity is not proof of a fork.
+        if !entries[parent].is_empty() && !witnessed {
+            bad[i] = true;
+        }
+    }
+    for (child, ancestors) in parents.iter().enumerate() {
+        if !ancestors.is_empty() {
+            bad[child] |= !docs[child].readable || docs[child].bad > 0;
+            for &parent in ancestors {
+                bad[parent] |= !docs[parent].readable || docs[parent].bad > 0;
+            }
+        }
+    }
+    let bad = quarantine(&parents, bad);
+    if bad.iter().any(|b| *b) {
+        stats.failed = true;
+        stats.notes.push(format!(
+            "分叉谱系无法完整验证，隔离 {} 个相关会话",
+            bad.iter().filter(|b| **b).count()
+        ));
+    }
+    (skipped, bad)
+}
+
 /// 词法归一路径(去 `./`、消化 `../`;canonicalize 对不存在路径的兜底形态)。
 fn normalize_lexical(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -147,7 +303,24 @@ impl UsageSource for PiSource {
             per_root.push((r.display().to_string(), got.len()));
             files.extend(got);
         }
+        let aliases = super::fork_lineage::unique_files(&mut files);
         stats.files_seen = files.len();
+        let docs: Vec<_> = files
+            .iter()
+            .map(|path| {
+                let mut lines = UsageLines::default();
+                // Keep Pi's established UTF-8 and final-line contract. Source-level
+                // caching already covers this source; no lossy JSONL reader here.
+                let outcome = for_each_line(path, |line| lines.push(line, project_usage));
+                lines.readable = outcome.reached_eof
+                    && outcome.error.is_none()
+                    && outcome.invalid_utf8_lines == 0;
+                stats.lines_bad_json += lines.bad;
+                outcome.apply_to_stats(&mut stats);
+                std::sync::Arc::new(lines)
+            })
+            .collect();
+        let (copied, blocked) = copied_rows(&files, &aliases, &docs, &mut stats);
 
         let mut dedup: HashMap<String, UsageRecord> = HashMap::new();
         let mut models: HashSet<String> = HashSet::new();
@@ -160,18 +333,17 @@ impl UsageSource for PiSource {
         let mut identity_ok = 0u64;
         let mut cw1h_nonzero = 0u64; // cacheWrite1h 非 0:单列观察不并入,上报待考证(§4/§8)
 
-        for path in &files {
+        for (file_index, path) in files.iter().enumerate() {
+            if blocked[file_index] {
+                continue;
+            }
             let file_stem = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "unknown".into());
-            let root = path
-                .ancestors()
-                .nth(3) // <root>/<org?>/<session>/entries.jsonl → 根;不足三层时回退父目录链
-                .or(path.parent())
-                .and_then(|p| p.to_str())
-                .unwrap_or("")
-                .to_string();
+            let root = super::fork_lineage::physical(path)
+                .to_string_lossy()
+                .into_owned();
             let mut ctx = FileCtx {
                 header_id: None,
                 root,
@@ -179,12 +351,11 @@ impl UsageSource for PiSource {
                 line_no: 0,
             };
             let mut parsed_any = false;
-            let (total, bad) = for_each_line(path, |line| {
-                ctx.line_no += 1;
-                let Ok(v) = serde_json::from_str::<Value>(line) else {
-                    stats.lines_bad_json += 1;
+            docs[file_index].events.iter().for_each(|(line_no, v)| {
+                ctx.line_no = *line_no;
+                if copied[file_index].contains(line_no) {
                     return;
-                };
+                }
                 let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
                 match t {
                     // 首行 session 头:捕获真实会话 id(cwd 不入用量模型,§2/§3)
@@ -196,7 +367,14 @@ impl UsageSource for PiSource {
                         }
                     }
                     // 已知非用量类型(§3 本机全集)
-                    "model_change" | "thinking_level_change" => {}
+                    "model_change"
+                    | "thinking_level_change"
+                    | "label"
+                    | "compaction"
+                    | "branch_summary"
+                    | "custom"
+                    | "custom_message"
+                    | "session_info" => {}
                     "message" => {
                         let Some(m) = v.get("message").filter(|x| x.is_object()) else {
                             stats.lines_unknown_type += 1; // message 行但信封异常:计数上报不静默
@@ -321,8 +499,7 @@ impl UsageSource for PiSource {
                     _ => stats.lines_unknown_type += 1,
                 }
             });
-            stats.lines_total += total;
-            stats.lines_bad_json += bad;
+            let total = docs[file_index].total;
             if parsed_any || total > 0 {
                 stats.files_parsed += 1;
             }

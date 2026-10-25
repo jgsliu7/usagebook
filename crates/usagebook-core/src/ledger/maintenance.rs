@@ -191,6 +191,11 @@ fn publish_install_marker(path: &Path, marker: &InstallMarker) -> Result<()> {
 }
 pub(crate) fn check_conn(c: &Connection) -> Result<()> {
     db::validate(c)?;
+    check_integrity(c)?;
+    check_selected_events(c)?;
+    check_daily_rollups(c)
+}
+fn check_integrity(c: &Connection) -> Result<()> {
     let result: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     if result != "ok" {
         return Err(LedgerError::CorruptLedger);
@@ -201,8 +206,7 @@ pub(crate) fn check_conn(c: &Connection) -> Result<()> {
     if fk.is_some() {
         return Err(LedgerError::CorruptLedger);
     }
-    check_selected_events(c)?;
-    check_daily_rollups(c)
+    Ok(())
 }
 
 fn check_selected_events(c: &Connection) -> Result<()> {
@@ -294,6 +298,13 @@ fn clean_sidecars(p: &Path) -> Result<()> {
     }
     Ok(())
 }
+fn check_backup_wal(input: &Path) -> Result<()> {
+    let input_wal = PathBuf::from(format!("{}-wal", input.display()));
+    if input_wal.exists() && std::fs::metadata(input_wal)?.len() > 0 {
+        return Err(LedgerError::InvalidInput("backup has an active WAL".into()));
+    }
+    Ok(())
+}
 fn readonly_check(p: &Path) -> Result<()> {
     let c = db::open_connection(p, false)?;
     check_conn(&c)
@@ -306,17 +317,12 @@ fn check_install_epoch(p: &Path, epoch: &str) -> Result<()> {
     }
     Ok(())
 }
-fn copy_database(c: &Connection, dest: &Path) -> Result<()> {
-    if dest.exists() {
-        return Err(LedgerError::InvalidInput("output already exists".into()));
-    }
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)?;
-    drop(f);
-    db::private_file(dest)?;
-    let mut target = Connection::open(dest)?;
+/// Copy the SQLite snapshot into a file that this invocation already owns.
+/// Validation is deliberately separate: an older backup is validated only
+/// after its private copy has passed through the existing schema migration.
+fn copy_database_contents(c: &Connection, dest: &Path) -> Result<Connection> {
+    let mut target =
+        Connection::open_with_flags(dest, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     {
         let backup = rusqlite::backup::Backup::new(c, &mut target)?;
         backup.run_to_completion(256, std::time::Duration::from_millis(1), None)?;
@@ -324,11 +330,54 @@ fn copy_database(c: &Connection, dest: &Path) -> Result<()> {
     target.execute_batch(
         "PRAGMA foreign_keys=ON; PRAGMA temp_store=FILE; PRAGMA cache_size=-8192;",
     )?;
+    Ok(target)
+}
+fn create_database_file(dest: &Path) -> Result<()> {
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    drop(f);
+    Ok(())
+}
+fn copy_database(c: &Connection, dest: &Path) -> Result<()> {
+    create_database_file(dest)?;
+    db::private_file(dest)?;
+    let target = copy_database_contents(c, dest)?;
+    // Ordinary backups still require the complete current-version checks.
     check_conn(&target)?;
     checkpoint(&target)?;
     drop(target);
     clean_sidecars(dest)?;
     sync_file(dest)?;
+    Ok(())
+}
+/// Own every early restore failure, including file creation, copy and migration.
+/// A published install marker transfers ownership to the recovery protocol.
+struct RestorePending<'a> {
+    ledger: &'a Path,
+    path: PathBuf,
+    created: bool,
+}
+impl Drop for RestorePending<'_> {
+    fn drop(&mut self) {
+        if self.created && !marker_path(self.ledger).exists() {
+            // This uninstalled copy is disposable even if migration left a WAL
+            // or rollback journal. No source/current database is touched here.
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let _ =
+                    std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+fn restore_stage(name: &str) -> Result<()> {
+    regression_stop(name);
+    #[cfg(feature = "regression-hooks")]
+    if std::env::var("USAGEBOOK_LEDGER_RESTORE_FAIL_AT").as_deref() == Ok(name) {
+        return Err(LedgerError::InvalidInput("injected restore failure".into()));
+    }
     Ok(())
 }
 
@@ -806,10 +855,13 @@ fn delete_selected(c: &Connection) -> Result<()> {
     drop(rows);
     drop(st);
     c.execute("UPDATE source_objects SET checkpoint=NULL,checkpoint_format=NULL,saved_offset=NULL,state='replay_required',target_done=0,object_revision=object_revision+1 WHERE object_id IN(SELECT object_id FROM usage_observations WHERE observation_id IN(SELECT id FROM delete_ids))",[])?;
-    c.execute(
+    let removed = c.execute(
         "DELETE FROM usage_observations WHERE observation_id IN(SELECT id FROM delete_ids)",
         [],
     )?;
+    if removed > 0 {
+        super::resolve::invalidate_run_units(c)?;
+    }
     let mut st = c.prepare("SELECT family,namespace,publish_key,visible FROM affected_units")?;
     let mut rows = st.query([])?;
     while let Some(r) = rows.next()? {
@@ -865,29 +917,46 @@ impl Maintenance {
         Ok(())
     }
     pub fn restore(&self, input: &Path, apply: Option<&str>) -> Result<Preview> {
-        if std::fs::canonicalize(input)? == std::fs::canonicalize(&self.path)? {
+        let canonical_input = std::fs::canonicalize(input)?;
+        let input = canonical_input.as_path();
+        if input == std::fs::canonicalize(&self.path)? {
             return Err(LedgerError::InvalidInput(
                 "backup must differ from current ledger".into(),
             ));
         }
         // Never read a moving backup with an unmerged WAL as a standalone export.
-        let input_wal = PathBuf::from(format!("{}-wal", input.display()));
-        if input_wal.exists() && std::fs::metadata(input_wal)?.len() > 0 {
-            return Err(LedgerError::InvalidInput("backup has an active WAL".into()));
-        }
+        check_backup_wal(input)?;
         let input_hash = hash_file(input)?;
         let current = db::open_connection(&self.path, true)?;
         check_conn(&current)?;
         let before = db::stamp(&current)?;
-        let source = db::open_connection(input, false)?;
-        check_conn(&source)?;
-        let pending = self
-            .path
-            .with_extension(format!("{}.restore.pending.db", new_epoch()));
-        copy_database(&source, &pending)?;
-        drop(source);
+        let source = db::open_restore_source(input)?;
+        check_integrity(&source)?;
+        let mut staging = RestorePending {
+            ledger: &self.path,
+            path: self
+                .path
+                .with_extension(format!("{}.restore.pending.db", new_epoch())),
+            created: false,
+        };
         let result = (|| -> Result<Preview> {
-            let c = db::open_connection(&pending, true)?;
+            let pending = &staging.path;
+            create_database_file(pending)?;
+            staging.created = true;
+            db::private_file(pending)?;
+            restore_stage("restore_pending_created")?;
+            let copied = copy_database_contents(&source, pending)?;
+            restore_stage("restore_pending_copied")?;
+            drop(copied);
+            drop(source);
+            check_backup_wal(input)?;
+            if hash_file(input)? != input_hash {
+                return Err(LedgerError::StaleObservation);
+            }
+            let c = db::open_connection(pending, true)?;
+            restore_stage("restore_pending_migrated")?;
+            check_conn(&c)?;
+            restore_stage("restore_pending_checked")?;
             c.execute_batch(
                 "BEGIN IMMEDIATE; CREATE TEMP TABLE delete_ids(id INTEGER PRIMARY KEY);",
             )?;
@@ -899,8 +968,9 @@ impl Maintenance {
             preview.replacement = Some(replacement_impact(&current, &c)?);
             let rules = rule_digest(&current)?;
             preview.preview_token = hash_parts(
-                "restore-preview/v1",
+                "restore-preview/v2",
                 &[
+                    "restore-schema-v1-to-v2/1",
                     &input_hash,
                     &before.epoch,
                     &before.commit_seq,
@@ -923,13 +993,14 @@ impl Maintenance {
                 regression_stop("restore_after_commit");
                 checkpoint(&c)?;
                 drop(c);
-                clean_sidecars(&pending)?;
-                readonly_check(&pending)?;
-                sync_file(&pending)?;
-                sync_dir(&pending)?;
+                clean_sidecars(pending)?;
+                readonly_check(pending)?;
+                sync_file(pending)?;
+                sync_dir(pending)?;
                 checkpoint(&current)?;
                 drop(current);
                 clean_sidecars(&self.path)?;
+                check_backup_wal(input)?;
                 if hash_file(input)? != input_hash {
                     return Err(LedgerError::StaleObservation);
                 }
@@ -941,7 +1012,7 @@ impl Maintenance {
                     pending: pending.file_name().unwrap().to_string_lossy().into(),
                     recovery: recovery.file_name().unwrap().to_string_lossy().into(),
                     old_hash: hash_file(&self.path)?,
-                    new_hash: hash_file(&pending)?,
+                    new_hash: hash_file(pending)?,
                     epoch,
                 };
                 let p = marker_path(&self.path);
@@ -950,7 +1021,7 @@ impl Maintenance {
                 std::fs::rename(&self.path, &recovery)?;
                 sync_dir(&self.path)?;
                 regression_stop("install_old_renamed");
-                std::fs::rename(&pending, &self.path)?;
+                std::fs::rename(pending, &self.path)?;
                 sync_dir(&self.path)?;
                 regression_stop("install_new_installed");
                 check_install_epoch(&self.path, &marker.epoch)?;
@@ -962,10 +1033,6 @@ impl Maintenance {
             }
             Ok(preview)
         })();
-        if !marker_path(&self.path).exists() && pending.exists() {
-            let _ = clean_sidecars(&pending);
-            let _ = std::fs::remove_file(&pending);
-        }
         result
     }
 }

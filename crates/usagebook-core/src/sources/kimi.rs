@@ -21,22 +21,45 @@ pub struct KimiSource;
 
 fn project_usage(v: &Value) -> Option<Value> {
     match v.get("type").and_then(Value::as_str) {
-        Some("usage.record") => Some(usage_projection(
+        Some(_) => Some(usage_projection(
             v,
             &[
                 "/type",
-                "/usageScope",
+                "/id",
+                "/parentId",
+                "/agentId",
                 "/time",
+                "/created_at",
+                "/protocolVersion",
+                "/protocol_version",
                 "/model",
+                "/usageScope",
+                "/turnId",
+                "/turnStep",
+                "/seq",
+                "/promptId",
+                "/messageId",
+                "/branch",
+                "/base/branch",
+                "/base/line",
+                "/turns",
+                "/count",
+                "/legacyUndoLine",
+                "/fromTurnId",
+                "/message/id",
+                "/message/role",
+                "/message/origin/kind",
+                "/message/origin/trigger",
+                "/message/origin/phase",
+                "/origin/kind",
+                "/origin/trigger",
+                "/origin/phase",
                 "/usage/inputOther",
                 "/usage/inputCacheRead",
                 "/usage/inputCacheCreation",
                 "/usage/output",
             ],
         )),
-        Some("llm.request") => Some(usage_projection(v, &["/type", "/model"])),
-        Some(t) if is_known_type(t) => None,
-        Some(_) => Some(usage_projection(v, &["/type"])),
         None => {
             if let Some(t) = v.pointer("/message/type").and_then(Value::as_str) {
                 if KNOWN_OLD_MSG_TYPES.contains(&t) {
@@ -100,6 +123,281 @@ fn session_agent_from_path(path: &Path) -> (String, String) {
     }
 }
 
+fn session_directory(path: &Path) -> PathBuf {
+    if path
+        .ancestors()
+        .nth(2)
+        .and_then(Path::file_name)
+        .is_some_and(|n| n == "agents")
+    {
+        path.ancestors().nth(3).unwrap().to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    }
+}
+
+/// Return copied-prefix boundaries and quarantined files. Metadata is read only
+/// beside already discovered wires; parent IDs are resolved in this snapshot,
+/// never converted into a path to open.
+fn fork_boundaries(
+    files: &[PathBuf],
+    docs: &[std::sync::Arc<UsageLines>],
+    stats: &mut ScanStats,
+) -> (Vec<Option<u64>>, Vec<bool>) {
+    use super::fork_lineage::{physical, quarantine};
+    use std::io::Read;
+    struct Session {
+        dir: PathBuf,
+        id: String,
+        parent: Option<String>,
+        wires: HashMap<String, usize>,
+        agents: HashMap<String, Value>,
+        bad: bool,
+        read_bad: bool,
+    }
+    let mut sessions: Vec<Session> = Vec::new();
+    let mut by_dir = HashMap::new();
+    let mut file_session = Vec::new();
+    for (index, path) in files.iter().enumerate() {
+        let dir = physical(&session_directory(path));
+        let session = *by_dir.entry(dir.clone()).or_insert_with(|| {
+            let mut s = Session {
+                id: dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                dir: dir.clone(),
+                parent: None,
+                wires: HashMap::new(),
+                agents: HashMap::new(),
+                bad: false,
+                read_bad: false,
+            };
+            let state = dir.join("state.json");
+            match std::fs::symlink_metadata(&state) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => s.bad = true,
+                Ok(_) => {
+                    // Reject an escaped metadata symlink before opening it.
+                    if physical(&state).parent() != Some(dir.as_path()) {
+                        s.bad = true;
+                    } else {
+                        let stamp = file_stamp(&state);
+                        let mut bytes = Vec::new();
+                        let parsed = std::fs::File::open(&state).and_then(|file| {
+                            file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)
+                        });
+                        if parsed.is_err()
+                            || bytes.len() > 16 * 1024 * 1024
+                            || stamp != file_stamp(&state)
+                        {
+                            s.bad = true;
+                        } else if let Ok(meta) = serde_json::from_slice::<Value>(&bytes) {
+                            if !meta.is_object() {
+                                s.bad = true;
+                            }
+                            if let Some(id) = meta.get("id") {
+                                let short =
+                                    s.id.strip_prefix("ses_")
+                                        .or_else(|| s.id.strip_prefix("session_"))
+                                        .unwrap_or(&s.id);
+                                match id.as_str() {
+                                    Some(id) if id == s.id || id == short => s.id = id.to_string(),
+                                    _ => s.bad = true,
+                                }
+                            }
+                            if let Some(agents) = meta.get("agents") {
+                                if let Some(agents) = agents.as_object() {
+                                    s.agents = agents
+                                        .iter()
+                                        .map(|(id, meta)| {
+                                            (
+                                                id.clone(),
+                                                usage_projection(
+                                                    meta,
+                                                    &[
+                                                        "/type",
+                                                        "/parentAgentId",
+                                                        "/forkedFrom",
+                                                        "/labels/parentAgentId",
+                                                    ],
+                                                ),
+                                            )
+                                        })
+                                        .collect();
+                                } else {
+                                    s.bad = true;
+                                }
+                            }
+                            if let Some(parent) = meta.get("forkedFrom").filter(|v| !v.is_null()) {
+                                if let Some(parent) = parent.as_str().filter(|v| !v.is_empty()) {
+                                    s.parent = Some(parent.to_string());
+                                } else {
+                                    s.bad = true;
+                                }
+                            }
+                        } else {
+                            s.bad = true;
+                        }
+                    }
+                }
+            }
+            let i = sessions.len();
+            sessions.push(s);
+            i
+        });
+        let agent = session_agent_from_path(path).1;
+        if sessions[session].wires.insert(agent, index).is_some() {
+            sessions[session].bad = true;
+        }
+        sessions[session].read_bad |= !docs[index].readable || docs[index].bad > 0;
+        file_session.push(session);
+    }
+    let mut identities: HashMap<(PathBuf, String), Vec<usize>> = HashMap::new();
+    for (i, session) in sessions.iter().enumerate() {
+        identities
+            .entry((
+                session.dir.parent().unwrap_or(Path::new("")).to_path_buf(),
+                session.id.clone(),
+            ))
+            .or_default()
+            .push(i);
+    }
+    let mut parents = vec![Vec::new(); sessions.len()];
+    let mut bad: Vec<_> = sessions.iter().map(|s| s.bad).collect();
+    let mut boundary = vec![None; files.len()];
+    for (i, session) in sessions.iter().enumerate() {
+        if let Some(parent) = &session.parent {
+            parents[i] = identities
+                .get(&(
+                    session.dir.parent().unwrap_or(Path::new("")).to_path_buf(),
+                    parent.clone(),
+                ))
+                .cloned()
+                .unwrap_or_default();
+            if parents[i].len() != 1 {
+                bad[i] = true;
+                continue;
+            }
+            let ancestor = &sessions[parents[i][0]];
+            // The metadata roster is part of ancestry completeness, not an
+            // instruction to open undeclared paths outside the discovery set.
+            if !session.wires.contains_key("main")
+                || !ancestor.wires.contains_key("main")
+                || session
+                    .agents
+                    .keys()
+                    .any(|agent| !session.wires.contains_key(agent))
+                || ancestor
+                    .agents
+                    .keys()
+                    .any(|agent| !ancestor.wires.contains_key(agent))
+            {
+                bad[i] = true;
+            }
+            let main_fork_time = session.wires.get("main").and_then(|&file| {
+                docs[file]
+                    .events
+                    .iter()
+                    .rev()
+                    .find(|(_, v)| v["type"] == "forked" && v["agentId"] == "main")
+                    .and_then(|(_, v)| v["time"].as_f64())
+            });
+            for (agent, &child_file) in &session.wires {
+                let child = &docs[child_file].events;
+                let Some(marker) = child.iter().rposition(|(_, v)| v["type"] == "forked") else {
+                    // Published create() seals a fresh wire and registers a sub
+                    // agent without forkedFrom; agent fork() always records it.
+                    // Combined with the new wire boundary this proves an agent
+                    // created after the session fork, even if the parent later
+                    // creates an independent agent with the same local name.
+                    let meta = session.agents.get(agent);
+                    let fresh_time = child
+                        .first()
+                        .filter(|(_, v)| v["type"] == "metadata")
+                        .and_then(|(_, v)| v["created_at"].as_f64());
+                    let fresh = agent != "main"
+                        && meta.is_some_and(|m| {
+                            m["type"] == "sub"
+                                && (m["parentAgentId"] == "main"
+                                    || m.pointer("/labels/parentAgentId")
+                                        .is_some_and(|v| v == "main"))
+                                && m.get("forkedFrom").is_none_or(Value::is_null)
+                        })
+                        && main_fork_time
+                            .zip(fresh_time)
+                            .is_some_and(|(fork, created)| {
+                                created > fork
+                                    && fork > 0.0
+                                    && child.iter().all(|(_, v)| {
+                                        v["time"].as_f64().is_none_or(|time| time >= created)
+                                    })
+                            });
+                    if !fresh {
+                        bad[i] = true;
+                    }
+                    continue;
+                };
+                let Some(&parent_file) = ancestor.wires.get(agent) else {
+                    bad[i] = true;
+                    continue;
+                };
+                let (_, marker_value) = &child[marker];
+                if marker_value["agentId"].as_str() != Some(agent.as_str())
+                    || marker_value["time"]
+                        .as_f64()
+                        .is_none_or(|time| !time.is_finite() || time <= 0.0)
+                {
+                    bad[i] = true;
+                    continue;
+                }
+                let original = &docs[parent_file].events;
+                // Full copies and provable turn prefixes preserve exact ordering.
+                // Flattened/reordered branches without a unique protocol mapping fail closed.
+                if marker > original.len()
+                    || child[..marker]
+                        .iter()
+                        .zip(original.iter())
+                        .any(|(a, b)| a.1 != b.1)
+                {
+                    bad[i] = true;
+                    continue;
+                }
+                if marker == 0 && !original.is_empty() {
+                    bad[i] = true;
+                    continue;
+                }
+                boundary[child_file] = Some(child[marker].0);
+            }
+        } else if session
+            .wires
+            .values()
+            .any(|&file| docs[file].events.iter().any(|(_, v)| v["type"] == "forked"))
+        {
+            // The remaining copy may be the only historical evidence: never silently drop it.
+            bad[i] = true;
+        }
+    }
+    for (child, ancestors) in parents.iter().enumerate() {
+        if !ancestors.is_empty() {
+            bad[child] |= sessions[child].read_bad;
+            for &parent in ancestors {
+                bad[parent] |= sessions[parent].read_bad;
+            }
+        }
+    }
+    let bad = quarantine(&parents, bad);
+    if bad.iter().any(|b| *b) {
+        stats.failed = true;
+        stats.notes.push(format!(
+            "分叉谱系无法完整验证，隔离 {} 个相关会话",
+            bad.iter().filter(|b| **b).count()
+        ));
+    }
+    (boundary, file_session.iter().map(|&s| bad[s]).collect())
+}
+
 /// epoch 值归一毫秒:<1e12 视为秒 ×1000(旧根 time/timestamp 为秒,§4)。
 fn norm_ms(t: f64) -> i64 {
     if t > 0.0 && t < 1e12 {
@@ -119,6 +417,7 @@ fn norm_ms(t: f64) -> i64 {
 /// 桌面版语料(kimi-work,2026-10-18 实证)增补:tools.register_user_tool 亦非用量)
 const KNOWN_TYPES: &[&str] = &[
     "metadata",
+    "forked",
     "llm.request",
     "context.append_loop_event",
     "context.append_message",
@@ -263,8 +562,31 @@ pub(crate) fn scan_kimi_wire(
         per_root.push((r.display().to_string(), got.len()));
         files.extend(got);
     }
+    super::fork_lineage::unique_files(&mut files);
     stats.files_seen = files.len();
     prune_usage_cache(source_id, &files);
+
+    let docs: Vec<_> = files
+        .iter()
+        .map(|path| {
+            let (lines, outcome) = cached_usage_file(
+                source_id,
+                path,
+                Some(FileParser {
+                    project: project_usage,
+                    keep: |_| true,
+                }),
+                || read_usage_jsonl_committed(path, project_usage, |_| true),
+            );
+            lines.account(&mut stats, outcome);
+            lines
+        })
+        .collect();
+    let (copied_before, blocked) = if source_id == "kimi" {
+        fork_boundaries(&files, &docs, &mut stats)
+    } else {
+        (vec![None; files.len()], vec![false; files.len()])
+    };
 
     let mut dedup: HashMap<String, UsageRecord> = HashMap::new();
     let mut clash = crate::common::DedupTracker::default();
@@ -274,8 +596,14 @@ pub(crate) fn scan_kimi_wire(
     let mut old_null_usage = 0u64; // 旧根 StatusUpdate 但 token_usage 为 null
     let mut no_time_skipped = 0u64;
 
-    for path in &files {
+    for (file_index, path) in files.iter().enumerate() {
+        if blocked[file_index] {
+            continue;
+        }
         let (session_id, agent) = session_agent_from_path(path);
+        let source_path = super::fork_lineage::physical(path)
+            .to_string_lossy()
+            .into_owned();
         let mut ctx = FileCtx {
             session_id,
             agent,
@@ -283,22 +611,16 @@ pub(crate) fn scan_kimi_wire(
             line_no: 0,
         };
         let mut parsed_any = false;
-        let (lines, outcome) = cached_usage_file(
-            source_id,
-            path,
-            Some(FileParser {
-                project: project_usage,
-                keep: |_| true,
-            }),
-            || read_usage_jsonl_committed(path, project_usage, |_| true),
-        );
-        lines.account(&mut stats, outcome);
+        let lines = &docs[file_index];
         let mut consume = |line_no: u64, v: &Value| {
             ctx.line_no = line_no;
             // —— 新格式:顶层有 type ——
             if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
                 match t {
                     "usage.record" => {
+                        if copied_before[file_index].is_some_and(|boundary| line_no < boundary) {
+                            return;
+                        }
                         // usageScope 双值:turn=增量计入,session=累计不计(§5.1)
                         let scope = v.get("usageScope").and_then(|x| x.as_str()).unwrap_or("");
                         if scope != "turn" {
@@ -332,8 +654,8 @@ pub(crate) fn scan_kimi_wire(
                         sessions.insert(ctx.session_id.clone());
                         // 五元组键:session+agent+行号+行内序数(§5.2;行内单 usage,ordinal 恒 1)
                         let key = format!(
-                            "{}:{}:{}:{}:{}",
-                            source_id, ctx.session_id, ctx.agent, ctx.line_no, 1
+                            "{}:{}:{}:{}:{}:{}",
+                            source_id, ctx.session_id, ctx.agent, ctx.line_no, 1, source_path
                         );
                         let rec = UsageRecord {
                             source: source_id,
@@ -383,6 +705,9 @@ pub(crate) fn scan_kimi_wire(
             if let Some(m) = v.get("message") {
                 match m.get("type").and_then(|x| x.as_str()) {
                     Some("StatusUpdate") => {
+                        if copied_before[file_index].is_some_and(|boundary| line_no < boundary) {
+                            return;
+                        }
                         // 本机实证:用量在 message.payload.token_usage(可为 null)
                         let tu = v.pointer("/message/payload/token_usage");
                         if tu.is_none() || tu.is_some_and(|x| x.is_null()) {
@@ -408,8 +733,8 @@ pub(crate) fn scan_kimi_wire(
                         models.insert("unknown".into());
                         sessions.insert(ctx.session_id.clone());
                         let key = format!(
-                            "{}:{}:{}:{}:{}",
-                            source_id, ctx.session_id, ctx.agent, ctx.line_no, 1
+                            "{}:{}:{}:{}:{}:{}",
+                            source_id, ctx.session_id, ctx.agent, ctx.line_no, 1, source_path
                         );
                         let rec = UsageRecord {
                             source: source_id,

@@ -80,3 +80,21 @@ RequestDelta(每条 assistant 消息 = 单次请求用量)。
 - 时间戳双轨:事件 envelope `timestamp` ISO 字符串;`message.timestamp` epoch 毫秒数字(官方优先后者)。§4 自适应规则保留 ✅。
 - sessionId UUIDv7、事件 id UUIDv4;去重键升级为 `openclaw:{agentId}:{session}:{event_id}`(JSONL 与 SQLite 通用),message.idempotencyKey 兜底。
 - `agents/<agentId>` 是人格隔离不是主/子代理层级;子代理是同库另一条 session(parent_session_key 血缘),用量不双计。
+
+## 8. 2026-10-25：正典冷归档（R4-03）
+
+本节覆盖旧文档“SQLite 只需读 transcript_events”的边界。冷存储是 OpenClaw 可选功能，默认关闭；关闭后仍可能有已经归档的正典历史，因此读取不以当前开关作为准入条件。
+
+固定上游依据：`bd04f4c33ca2cb9a339162c227cdb65b48d0ac3d` 的 `src/state/openclaw-agent-db-contract.ts`、`src/state/openclaw-agent-schema.sql`、`src/config/sessions/session-cold-storage-codec.ts` 与 `session-cold-storage-worker.ts`。该提交当前数据库协议为 **24**；20 引入冷归档，21–24 没有取消此冷包协议。不是只支持数据库版本20。
+
+- SQLite 在同一只读事务里读取热事件和 `session_transcript_cold_archives` 引用。后者是权威历史，不能将无热行当成无用量。声明协议高于24或负数时明确失败；声明20–24却缺失冷表时失败；既有无版本和旧版热库仍按已支持列形状读取。冷表存在时必须能读取完整描述符，未知存储类型和不支持的列形状失败。
+- `storage=file` 只读该 agent 的 `sessions/cold/<64位小写十六进制>.jsonl.zst` 正典引用，拒绝越出目录的符号链接；`storage=sqlite` 从同一事务读取 blob。恢复后残留但不再被引用的文件不计，也不泛扫冷目录。
+- 验证压缩大小、SHA256、首行 header/version1/sessionId/generation、事件计数、严格递增 seq、last_seq 和 raw_bytes。**raw_bytes 是 event_json 的 UTF-8 字节数之和，再加 event_count−1**，不是解压后整个包长度。event 的 created_at 是必填整数；identity/active/index/fts 辅助行检查字段类型，但不写入用量缓存。未知标签、重复 header、错类型均失败。
+- 单包压缩输入、解压输出和热压缩事件各限64 MiB，zstd 内部窗口亦限64 MiB；冷引用最多100,000条。超限不猜测、截断或发布0，按来源读取失败处理。标准上游冷包自身也使用64 MiB解码上限。
+- SQLite 事件身份为物理库域、逻辑 agent、session 与 event id（缺 id 回退 seq）的长度安全元组。Unix 物理域用 dev/inode，Windows 用 volume/file index；没有可靠文件ID的平台用规范化实际路径，不根据大小/mtime/内容推断物理别名。相同原始事件的热冷镜像只算一次；同身份用量投影冲突失败。generation 仅用于验证，不生成新计费身份。不同物理库、不同 agent 保持隔离。
+- 指纹包括主库及伴随文件、冷引用描述符的哈希、被引用冷文件状态。每个数据库在读取结束后和整源结束时检查同连接 data_version、数据库状态；已读冷文件也在整源结束复核，避免早读文件在晚读文件期间变化却发布成功。完成单库读取后即结束事务，最终守卫只保留只读连接，不长期持有读快照。
+- 不修改上游库、恢复热表、迁移 schema 或持久化正文/FTS/整包。失败继续使用既有 CLI partial/退出5、HTTP 保留最后完整结果与原成功时间；首次失败为0/partial，恢复后才发布新完整结果。界面沿用短状态和悬停信息。
+
+外部回归：私有工作区 `test/ledger/r4_openclaw.rs` 与 `test/ledger/fourth_round_http.py`。前者有固定上游完整 STRICT DDL（FK、CHECK、索引和触发器）验证，覆盖热→文件→blob→恢复、空/损坏/未知/超限、原始五桶和直报成本、物理域、多agent、冷缓存失效、归档/恢复并发及整源末端复核。测试输入全部合成，不表示本机真实用户启用了冷归档。
+
+2026-10-25 实现复核补充：选择SQLite后端后必须存在可读且列形状受支持的 `transcript_events`，即使冷引用表为空也不能把缺失热表认定为完整空。该规则同样适用于无版本的SQLite投影；正常“空”是必要表存在、查询成功且没有事件，缺表属于来源失败并保留HTTP上一份完整结果。

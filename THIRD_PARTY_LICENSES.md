@@ -98,7 +98,12 @@ For alternative licenses (OR), the upstream alternatives are preserved; addition
 | uuid 1.18.1 | Apache-2.0 OR MIT | [crate](https://crates.io/crates/uuid/1.18.1); `LICENSE-APACHE` [text](#license-954f335b8baf5e1a); `LICENSE-MIT` [text](#license-11cd7e6caed4b237) |
 | vcpkg 0.2.15 | MIT/Apache-2.0 | [crate](https://crates.io/crates/vcpkg/0.2.15); `LICENSE-APACHE` [text](#license-954f335b8baf5e1a); `LICENSE-MIT` [text](#license-6196143cbaf5e145) |
 | version_check 0.9.5 | MIT/Apache-2.0 | [crate](https://crates.io/crates/version_check/0.9.5); `LICENSE-APACHE` [text](#license-954f335b8baf5e1a); `LICENSE-MIT` [text](#license-ed2fda479dacddad) |
+| windows-core 0.62.2 | MIT OR Apache-2.0 | [crate](https://crates.io/crates/windows-core/0.62.2); `license-apache-2.0` [text](#license-783829b43aacb86c); `license-mit` [text](#license-ff82c90f84945c60) |
+| windows-implement 0.60.2 | MIT OR Apache-2.0 | [crate](https://crates.io/crates/windows-implement/0.60.2); `license-apache-2.0` [text](#license-783829b43aacb86c); `license-mit` [text](#license-ff82c90f84945c60) |
+| windows-interface 0.59.3 | MIT OR Apache-2.0 | [crate](https://crates.io/crates/windows-interface/0.59.3); `license-apache-2.0` [text](#license-783829b43aacb86c); `license-mit` [text](#license-ff82c90f84945c60) |
 | windows-link 0.2.1 | MIT OR Apache-2.0 | [crate](https://crates.io/crates/windows-link/0.2.1); `license-apache-2.0` [text](#license-783829b43aacb86c); `license-mit` [text](#license-ff82c90f84945c60) |
+| windows-result 0.4.1 | MIT OR Apache-2.0 | [crate](https://crates.io/crates/windows-result/0.4.1); `license-apache-2.0` [text](#license-783829b43aacb86c); `license-mit` [text](#license-ff82c90f84945c60) |
+| windows-strings 0.5.1 | MIT OR Apache-2.0 | [crate](https://crates.io/crates/windows-strings/0.5.1); `license-apache-2.0` [text](#license-783829b43aacb86c); `license-mit` [text](#license-ff82c90f84945c60) |
 | windows-sys 0.61.2 | MIT OR Apache-2.0 | [crate](https://crates.io/crates/windows-sys/0.61.2); `license-apache-2.0` [text](#license-783829b43aacb86c); `license-mit` [text](#license-ff82c90f84945c60) |
 | zmij 1.0.23 | MIT | [crate](https://crates.io/crates/zmij/1.0.23); `LICENSE-MIT` [text](#license-30fefc3a7d6a0041) |
 | zstd 0.13.3 | MIT | [crate](https://crates.io/crates/zstd/0.13.3); `LICENSE` [text](#license-84b7e1b767becaf1) |

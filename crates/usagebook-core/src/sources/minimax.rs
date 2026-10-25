@@ -65,6 +65,13 @@ impl UsageSource for MinimaxSource {
         roots
     }
 
+    fn input_containers(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        roots
+            .iter()
+            .map(|root| root.join("v2/sqlite/runtime-state.sqlite"))
+            .collect()
+    }
+
     fn scan_roots(
         &self,
         roots: &[std::path::PathBuf],
@@ -202,7 +209,9 @@ impl UsageSource for MinimaxSource {
                     conn.prepare("SELECT session_id, record_json FROM local_runtime_sessions")
                 {
                     if let Ok(mut rows) = stmt.query([]) {
-                        while let Ok(Some(row)) = rows.next() {
+                        while let Some(row) =
+                            crate::common::next_sqlite_row(&mut rows, "minimax", &mut stats)
+                        {
                             let sid: String = row.get(0).unwrap_or_default();
                             let json: Option<String> = row.get(1).ok();
                             let dir = json
@@ -235,7 +244,9 @@ impl UsageSource for MinimaxSource {
                 let sql = format!("SELECT session_id, {} FROM local_runtime_sessions", col);
                 if let Ok(mut stmt) = conn.prepare(&sql) {
                     if let Ok(mut rows) = stmt.query([]) {
-                        while let Ok(Some(row)) = rows.next() {
+                        while let Some(row) =
+                            crate::common::next_sqlite_row(&mut rows, "minimax", &mut stats)
+                        {
                             let sid: String = row.get(0).unwrap_or_default();
                             if let Some(d) = row.get::<_, Option<String>>(1).ok().flatten() {
                                 workspace.insert(sid, d);
@@ -294,7 +305,7 @@ impl UsageSource for MinimaxSource {
             }
             let mut raw_rows: Vec<RawRow> = Vec::new();
             let mut need_backfill: HashSet<String> = HashSet::new(); // 含 model NULL 行的会话
-            while let Ok(Some(row)) = rows.next() {
+            while let Some(row) = crate::common::next_sqlite_row(&mut rows, "minimax", &mut stats) {
                 // 0 id, 1 session_id, 2 agent_name, 3 model, 4 turn_id, 5 ts,
                 // 6 input, 7 output, 8 reasoning, 9 cache_read, 10 cache_write, 11 cost_usd
                 let (Ok(id), Ok(session_id), Ok(agent_name)) = (

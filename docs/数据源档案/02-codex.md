@@ -1,6 +1,6 @@
 # 数据源档案:Codex CLI
 
-> 取证快照:v1.0 · 本机 `~/.codex` 8.1G / 1355 个会话文件(全品类最大)
+> 取证快照:v1.1（2026-10-24请求归属修订） · 本机 `~/.codex` 8.1G / 1355 个会话文件(全品类最大)
 > 三方取证:本机 ✅ 字段级 / 开源实现 ✅(ccusage、tokscale、stormzhang、aiusage、juejin)/ 网络资料 ✅(ccusage 官方 Codex 适配文档、社区 schema 逆向、issue 实证)
 > ⚠️ 本源格式**无官方 schema 承诺**;真实风险 issue 为 **#9660 / #24425 / #25215**(此前记录的 #45392 经多渠道核实**不存在**,已废除)。
 
@@ -76,11 +76,11 @@ payload: {
 1b. **成对双发 + 引导空事件 + 继承基线(v1.0 实现时本机新证据,已回写;三轮 jq 独立复算验证)**:
    - 每个 turn 的 token_count **成对出现**,两事件 `last_*`/`total_*` 全同、仅 timestamp 不同(Σ原始 last ≈ 2× 末条 total);文件首事件常为**空 info 引导行**(`last`/`total` 字段为 JSON null,值非缺失)。
    - `total_tokens` 字段语义 = `input(含缓存) + output(含推理)`;五桶直接相加会把 cached 双计(inclusive)——校验线与增量线都必须用同一口径。
-   - **去重键不得含 timestamp**(否则成对双双入账):正确键 = `(session, model, 五分量, total_now)`,total_now 会话内单调,天然区分不同 turn。
+   - **去重键不得含 timestamp**(否则成对双双入账):现行键为 `(原始归属thread, model, 五分量, total_now)` 的结构化编码。展示用 `session_id` 是树根，不能用于请求去重；独立child即使用量完全相同也各计一次。turn_id用于继承归属核对，不加入计费键，避免下一turn重发旧快照时重复计费。只有首条session_meta决定本文件canonical thread；见§10。
    - **互验公式**:`继承基线 = first_total − first_last`(新会话=0;fork/子代理文件=父前缀累计,本机实证 145M/155M 级);校验 `Σ(去重后 last) ≈ last_total − 继承基线`,差值>1% 标"口径存疑"。本机 1356 会话终版结果:34 个(2.5%)存疑,全部为 fork 子会话残差(重放边缘语义,v1.1 随 fork 状态机消化)。
-   - MultiAgent 子代理文件**只含子代理自身 token_count**(重放前缀不重发用量事件),但 total 计数器含父前缀累计——因此"只看 last 增量"天然正确,这正是"last 为主增量源"的又一实证。
+   - 早期本机抽样的一类MultiAgent子代理文件只含自身token_count，但total可含父前缀累计，因此保留last增量。**此观察不能推广为全部fork格式**：legacy可能复制祖先token_count，paginated可能引用共享前缀或物理复制子代理前缀，现按§10逐类证明归属。
 2. **去重键**(ccusage `adapters/codex/src/loader.rs:240-284`):优先 `response_id`(Response 键);否则 **Usage 元组键** (timestamp, model, input, cached, cache_creation, output, reasoning, total)——"同时间同模型同分量"视为同一次用量;命中合并 service_tier。
-3. **fork / MultiAgent V2 子代理重放**:子代理 rollout 会**重放父历史前缀**,直接求和双计。
+3. **fork / MultiAgent V2 子代理重放**:部分子代理 rollout 会重放父历史前缀，直接求和双计。以下第三方算法是历史调研参考，现行实现以§10的官方格式与身份边界为准；不以全树相同计数猜测同请求。
    - tokscale `codex.rs:300-332,575-636,828-836`:`forked_child_*` 状态字段(waiting_for_turn_context / inherited_baseline / task_started_turn_ids);子代理拿到自己的 turn_context 前跳过重放快照;**总量未超继承基线即跳过**。
    - ccusage:`replay_plan.is_replayed_compaction` 按 response_id 丢重放 compact。
    - ccusage 官方文档:"最终继承快照为子基线,只统计子 turn 新增量",旧重放格式按时间戳兼容 📄。
@@ -118,12 +118,47 @@ payload: {
 |---|---|
 | 无 schema 承诺 + 跨版本变化(0.153+ 分页并存) | 格式签名(type/payload.type 集合指纹);不匹配→原样归档+标记待适配;递归 glob 不假设深度 |
 | 累计 vs 增量混淆 | tokscale 状态机(§5.1)+ 双法互验,差值>1% 标"口径存疑" |
-| fork/子代理重放双计 | 继承基线状态机 + total 稳定身份键(§5.3) |
+| fork/子代理重放双计 | thread请求域 + 可证明的复制归属与物理前缀边界(§10) |
 | 2025-09 前会话无 token | 空转正常,不入异常 |
 | 模型名双源不一致 | 统一以 turn_context.model 为维度;limit_name 仅套餐信息 |
-| 会话跨天(目录按天) | 以 session_meta.session_id 去重,不按文件 |
-| 坏 JSON 行(#24425) | 跳过 + 计数上报 |
+| 会话跨天(目录按天) | 首条session_meta.id保持线程身份；相同thread的镜像/分段按请求键消重，root只负责展示分组 |
+| 坏JSON/读取失败或继承归属不明 | 显式failed/partial；HTTP保留上次完整来源快照，恢复后完整替换 |
 
 ## 9. v1 支持结论
 
-**✅ 支持,首发第一梯队**(本机 8.1G 最大数据源)。三方证据闭环:本机字段级(双口径/额度/分层目录/archived 实证)、开源(tokscale 状态机 + ccusage 双键为实现蓝本)、ccusage 官方适配文档。**档案冻结 v1.0,可写适配器。**
+**✅ 支持,首发第一梯队**(本机 8.1G 最大数据源)。三方证据闭环:本机字段级(双口径/额度/分层目录/archived 实证)、开源(tokscale 状态机 + ccusage 双键为实现蓝本)、ccusage 官方适配文档。**v1.1在原支持范围内修正线程身份与继承归属；不新增压缩归档支持。**
+
+
+## 10. v1.1线程、根分组与继承归属（2026-10-24）
+
+### 10.1 官方格式与身份
+
+以官方固定提交 `970111f6cb62cc02fe36a82ea7d71b37a2889c97` 的[SessionMeta/HistoryPosition](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/protocol/src/protocol.rs)、[recorder](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/rollout/src/recorder.rs)、[初始化历史持久化](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/session/mod.rs)和[ordinal规则](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/rollout/src/ordinal.rs)为证：
+
+- 文件第一条 `session_meta.payload.id` 是当前canonical thread；`session_id` 是树根，用作既有会话展示分组。首条缺id时仅从该条session_id回退，仍缺则文件名回退；不向后查祖先metadata补当前id。
+- 后续session_meta可能来自复制历史，不允许覆盖当前thread或root。相同根下两个独立child各自计费；相同thread的成对token_count、sessions/archived_sessions明文镜像仍一次。
+- `token_usage_record` 仍不作为第二计费通道。仅保留thread/turn/response身份、usage桶及thread_token_usage累计桶，用于核对复制归属；同一thread/response身份给出不同turn或usage明确失败。没有该记录的正常旧格式继续支持。
+
+### 10.2 三种历史布局
+
+| 布局 | 处理 |
+|---|---|
+| 本线程记录，没有复制祖先meta | 按canonical thread计入。单独出现forked_from_id并不代表这些记录是复制前缀，不因此失败。 |
+| legacy复制前缀 | 后续祖先meta开始的记录暂不假定属于当前thread。必须由token_usage_record的明确thread身份，或已证明本地归属的父/祖先记录中相同turn身份及精确usage匹配证明。官方 `thread_settings_applied.thread_id` 是复制初始化结束后的本线程边界；多层fork保留父边界，后续child新请求回到当前thread域。此边界不清空token_info：父last/total完整快照随后可被child的限额更新原样重发；即使turn/model已换，完整快照未变也保持原请求，不新增child费用。 |
+| paginated引用前缀 | history_base引用另一物理rollout的不可变前缀，本文件只读本地delta；有history_base时token_count ordinal须达到end_ordinal_exclusive。history_base.thread_id实际可能是revert rollout ID，不能当canonical thread。首个带last的本地快照可能只是继承seed重发：根据文件名末尾rollout UUID匹配history_base，检查该物理文件在截止前的最终快照；旧文件名仅以canonical作为原始rollout标识，不用逻辑父替代未知物理base。完全相同则仍为原请求；本地total扣last后逐桶匹配base累计才证明是新请求。多层引用按已证明快照迭代处理；缺失或循环依赖无法证明时failed。 |
+| paginated子代理物理复制 | `subagent_history_start_ordinal` 前的用量事件需继承归属证明；该ordinal起的事件属于本线程。仅复制response_items模型上下文、没有token_info或history_base时，本线程从自己的用量开始；local_start不是父rollout的ordinal截止。缺必需ordinal、未知history_mode或不合法边界明确失败。 |
+
+父文件缺失时，复制前缀若带明确请求归属仍可使用；无证明则failed。纯引用布局不重复装载共享前缀，只统计被扫描到的父文件与当前local delta；不为此前不支持的压缩文件扩充能力。legacy无可靠新旧边界的记录不能靠树根或相同数字推断归属。
+
+引用布局的base证据有ordinal时只取截止前最后快照，不匹配任意旧counter；没有ordinal时只接纳唯一一致快照（镜像可相同）。同物理rollout同ordinal快照冲突明确failed。`forked_from_id`与`forked_from_ordinal_exclusive`描述逻辑父边界，不能拿来截取另一个物理base；revert可能保持canonical和逻辑父不变而替换物理rollout/base。
+
+物理父前缀也可能是已确认的零基线：父文件可读且无坏 JSON、没有继承依赖，以原始非空行号和 ordinal 从 0 连续证明已提交的空前缀；只接纳 metadata、上下文/设置边界、明确全零或空 info 的 token_count。引用截止必须在已证明区间内，且 child 首次 total 与 last 逐桶及总数相等。缺文件、前缀内过滤行/ordinal 缺口、未提交边界、非零继承基线、继承依赖和冲突镜像不能当零。截止后的正用量或已过滤非用量事件不会撤销此前已证明的空前缀。
+
+首条本地快照还有一条独立充分证明：它之前已出现当前thread/turn/response明确的token_usage_record，且usage与last逐桶相等、thread_token_usage与total逐桶及总数相等。此时父文件缺失也可计入明确本地请求。之后才出现的请求身份、缺少累计或累计不匹配，均不能代替base证明。引用首条无上述证明则failed；不能仅根据同turn的相同last把启动重放当新费用。总量基线行没有last时不收费，后续保留已支持的累计差分；它之后首次带last仍校验引用seed。分页物理复制的local-start边界也不清空已有继承seed。
+
+### 10.3 失败、缓存与隐私
+
+- 继承归属有歧义设置ScanStats.failed，不能只写notes后声称complete。CLI按既有规则可返回有效候选但coverage为partial、退出5；HTTP整源保留上次完整快照，包括成功空快照，首次失败则无该源可用历史。健康来源独立刷新。
+- live解析缓存代次升级为14。缓存仍保存最小投影并每轮重新判断源级身份；不把失败候选缓存为成功来源结果。父文件消失、重现、新进程和尾部追加均重新核对。
+- 新投影仅增加history_mode、history_base的rollout标识/ordinal、forked_from_id/ordinal、subagent_history_start_ordinal、必要turn/request身份、token桶（含明确请求的thread累计）及thread_settings边界。history_base字节偏移、cwd、指令、正文、工具内容不进入缓存。
+- 回归覆盖同根两child=300、同thread镜像=150、legacy真实复制前缀只一次、多层fork、父缺失有/无证明、首条缺id回退、双表示、模型变化、分页引用/物理前缀、冷/热缓存与跨进程恢复。CLI/HTTP源级失败保护另作组合回归。
