@@ -1,7 +1,7 @@
 //! Typed, process-local bridge for sources that have not entered the durable ledger.
 //! Never serializes a synthetic midnight request for native daily evidence.
 use super::query_types::{QueryError, QueryResult};
-use crate::model::{Caliber, UsageRecord};
+use crate::model::{Caliber, ScanStats, UsageRecord};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,6 +35,9 @@ pub enum LegacyEntry {
     SessionTotal {
         record: UsageRecord,
         known_fields: u16,
+        /// Explicit nullable precision, including unknown request count/date/model.
+        projection: Option<[Option<i64>; 10]>,
+        reason: Option<String>,
     },
 }
 impl LegacyEntry {
@@ -52,6 +55,8 @@ pub struct LegacySourceStatus {
     pub error: Option<String>,
     /// Diagnostic day rows only; never a request count or an amount to add.
     pub unaccounted_rows: usize,
+    /// Readable historical evidence that cannot be allocated to request windows.
+    pub unallocated_sessions: usize,
 }
 #[derive(Debug, Clone)]
 pub struct LegacySnapshot {
@@ -156,6 +161,7 @@ impl LegacySnapshot {
                     &s.error,
                     s.last_scanned_ms.is_some(),
                     s.unaccounted_rows,
+                    s.unallocated_sessions,
                 )
             })
             .collect();
@@ -186,6 +192,15 @@ impl LegacySnapshot {
         records: Vec<UsageRecord>,
         scanned_ms: i64,
     ) -> QueryResult<()> {
+        self.push_records_with_stats(source, records, &ScanStats::default(), scanned_ms)
+    }
+    pub fn push_records_with_stats(
+        &mut self,
+        source: &str,
+        records: Vec<UsageRecord>,
+        stats: &ScanStats,
+        scanned_ms: i64,
+    ) -> QueryResult<()> {
         // A source is a single publication unit. A valid prefix must not survive
         // a later normalization failure, nor may failure advance its success time.
         let mut accepted = Vec::with_capacity(records.len());
@@ -198,7 +213,15 @@ impl LegacySnapshot {
             if record.model.len() > 1024 {
                 return Err(QueryError::limit("legacy model exceeds 1024 bytes"));
             }
-            let fields = legacy_metrics(&record)?;
+            let precision = stats
+                .session_total_precision
+                .get(&record.dedup_key)
+                .filter(|_| record.caliber == Caliber::SessionTotal);
+            let fields = if let Some(precision) = precision {
+                precision.metrics
+            } else {
+                legacy_metrics(&record)?
+            };
             // Checking each supplied bucket alone misses an overflowing derived
             // total (or an impossible subset). Query output uses this evaluator too.
             super::metrics::evaluate(&fields)
@@ -212,10 +235,19 @@ impl LegacySnapshot {
                 },
                 Caliber::SessionTotal => LegacyEntry::SessionTotal {
                     record,
-                    known_fields: 0,
+                    known_fields: if precision.is_some() { 1023 } else { 0 },
+                    projection: precision.map(|p| p.metrics),
+                    reason: precision.map(|p| p.reason.clone()),
                 },
             });
         }
+        let unallocated_sessions = accepted
+            .iter()
+            .filter(|entry| {
+                matches!(entry,
+            LegacyEntry::SessionTotal { record, .. } if record.source == "goose")
+            })
+            .count();
         self.entries.extend(accepted);
         self.sources.insert(
             source.into(),
@@ -224,6 +256,7 @@ impl LegacySnapshot {
                 stale: false,
                 error: None,
                 unaccounted_rows: 0,
+                unallocated_sessions,
             },
         );
         Ok(())
@@ -297,6 +330,7 @@ impl LegacySnapshot {
                 stale: false,
                 error: None,
                 unaccounted_rows,
+                unallocated_sessions: 0,
             },
         );
         Ok(())

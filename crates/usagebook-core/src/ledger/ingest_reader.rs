@@ -20,9 +20,80 @@ pub(super) struct Job {
     pub mtime: Option<i64>,
     pub offset: i64,
     pub audit: bool,
+    pub stream: bool,
+    pub proof: Option<PrefixProof>,
     pub identity: Option<IdentityJob>,
     #[serde(skip)]
     pub cancel: Option<Arc<AtomicBool>>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct PrefixProof {
+    pub len: i64,
+    pub digest: Vec<u8>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct FileVersion {
+    device: u64,
+    file: u64,
+    change: Option<(i64, i64)>,
+}
+#[cfg(unix)]
+fn file_version(_: Option<&File>, meta: &Metadata) -> Result<FileVersion> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(FileVersion {
+        device: meta.dev(),
+        file: meta.ino(),
+        change: Some((meta.ctime(), meta.ctime_nsec())),
+    })
+}
+#[cfg(windows)]
+fn file_version(file: Option<&File>, _: &Metadata) -> Result<FileVersion> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = file.ok_or(LedgerError::StaleObservation)?;
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+        return Err(source_io(std::io::Error::last_os_error()));
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(FileVersion {
+        device: info.dwVolumeSerialNumber as u64,
+        file: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        change: None,
+    })
+}
+#[cfg(not(any(unix, windows)))]
+fn file_version(_: Option<&File>, _: &Metadata) -> Result<FileVersion> {
+    Err(LedgerError::InvalidInput(
+        "SourceIdentityUnsupported".into(),
+    ))
+}
+pub(super) fn require_version(
+    path: &Path,
+    len: i64,
+    mtime: Option<i64>,
+    expected: &FileVersion,
+) -> Result<()> {
+    #[cfg(windows)]
+    let file = Some(File::open(path).map_err(source_io)?);
+    #[cfg(not(windows))]
+    let file: Option<File> = None;
+    let meta = fs::metadata(path).map_err(source_io)?;
+    if metadata_stamp(&meta) != (len, mtime) || file_version(file.as_ref(), &meta)? != *expected {
+        return Err(LedgerError::StaleObservation);
+    }
+    Ok(())
+}
+fn require_open_version(file: &File, job: &Job, expected: &FileVersion) -> Result<()> {
+    let meta = file.metadata().map_err(source_io)?;
+    if metadata_stamp(&meta) != (job.len, job.mtime)
+        || file_version(Some(file), &meta)? != *expected
+    {
+        return Err(LedgerError::StaleObservation);
+    }
+    require_version(&job.path, job.len, job.mtime, expected)
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct IdentityJob {
@@ -46,6 +117,11 @@ pub(super) enum Event {
     Progress {
         task: String,
     },
+    Prefix {
+        task: String,
+        accepted: bool,
+        version: FileVersion,
+    },
     Identity {
         task: String,
         proof: Option<IdentityProof>,
@@ -56,10 +132,14 @@ pub(super) enum Event {
         offset: i64,
         audit_bytes: Option<String>,
         ignored: u64,
+        version: Option<FileVersion>,
     },
     Done {
         task: String,
         bytes: u64,
+        parsed_bytes: u64,
+        seal: Option<Vec<u8>>,
+        version: Option<FileVersion>,
         more: bool,
         error: Option<String>,
     },
@@ -70,7 +150,8 @@ impl Event {
             Self::Batch { task, .. }
             | Self::Done { task, .. }
             | Self::Progress { task }
-            | Self::Identity { task, .. } => task,
+            | Self::Identity { task, .. }
+            | Self::Prefix { task, .. } => task,
         }
     }
 }
@@ -196,6 +277,9 @@ impl Pool {
                         let _ = sender.send(Event::Done {
                             task: task.clone(),
                             bytes: 0,
+                            parsed_bytes: 0,
+                            seal: None,
+                            version: None,
                             more: false,
                             error: Some("ReaderHelperFailed".into()),
                         });
@@ -214,6 +298,9 @@ impl Pool {
                                 let _ = sender.send(Event::Done {
                                     task: task.clone(),
                                     bytes: 0,
+                                    parsed_bytes: 0,
+                                    seal: None,
+                                    version: None,
                                     more: false,
                                     error: Some("ReaderHelperFailed".into()),
                                 });
@@ -300,6 +387,10 @@ fn run(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
         run_identity(job, emit);
         return;
     }
+    if job.stream {
+        run_stream(job, emit);
+        return;
+    }
     let mut read_bytes = 0u64;
     let mut budget_bytes = 0u64;
     let mut heartbeat = Instant::now();
@@ -335,6 +426,7 @@ fn run(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
                 offset,
                 audit_bytes,
                 ignored: std::mem::take(ignored),
+                version: None,
             })
         };
         loop {
@@ -429,10 +521,222 @@ fn run(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
     let _ = emit(Event::Done {
         task: job.task.clone(),
         bytes: read_bytes,
+        parsed_bytes: read_bytes,
+        seal: None,
+        version: None,
         more,
         error,
     });
 }
+// A fixed large target stays in one slot/handle across all progress slices. The
+// SHA value below is the internal state, never a finalized digest used as input.
+// One such job is scheduled at a time; another slot remains available for small
+// healthy files. 64 GiB is explicit: larger targets report a backed-off limit.
+const MAX_STREAM_BYTES: i64 = 64 * 1024 * 1024 * 1024;
+fn run_stream(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
+    let mut bytes = 0u64;
+    let mut parsed_bytes = 0u64;
+    let mut seal = None;
+    let mut final_version = None;
+    let started = Instant::now();
+    // Budget scales to the fixed target (1 MiB/s + 60 s, <= 18h 13m). The
+    // independent five-second no-progress watchdog owns slow-I/O helper fallback.
+    let budget = std::time::Duration::from_secs(60 + job.len.max(0) as u64 / (1024 * 1024));
+    let result = (|| -> Result<()> {
+        if job.len > MAX_STREAM_BYTES {
+            return Err(LedgerError::InvalidInput("SourceReadBudgetExceeded".into()));
+        }
+        if job.offset < 0 || job.offset > job.len {
+            return Err(LedgerError::StaleObservation);
+        }
+        let check = || -> Result<()> {
+            check_cancelled(job)?;
+            if started.elapsed() > budget {
+                return Err(LedgerError::InvalidInput("SourceReadBudgetExceeded".into()));
+            }
+            Ok(())
+        };
+        check()?;
+        let mut file = File::open(&job.path).map_err(source_io)?;
+        let meta = file.metadata().map_err(source_io)?;
+        let version = file_version(Some(&file), &meta)?;
+        require_open_version(&file, job, &version)?;
+        let mut hash = Sha256::new();
+        if let Some(proof) = &job.proof {
+            if proof.len != job.offset || proof.digest.len() != 32 {
+                return Err(LedgerError::StaleObservation);
+            }
+            let mut left = proof.len as u64;
+            let mut buffer = [0u8; 64 * 1024];
+            let mut progress = Instant::now();
+            let mut slice = 0u64;
+            while left > 0 {
+                check()?;
+                let cap = left.min(buffer.len() as u64) as usize;
+                let n = file.read(&mut buffer[..cap]).map_err(source_io)?;
+                if n == 0 {
+                    return Err(LedgerError::StaleObservation);
+                }
+                hash.update(&buffer[..n]);
+                bytes += n as u64;
+                if job.audit {
+                    throttle_read(job, n as u64, &mut emit)?;
+                }
+                left -= n as u64;
+                slice += n as u64;
+                if slice >= SLICE_BYTES || progress.elapsed().as_millis() >= 250 {
+                    require_open_version(&file, job, &version)?;
+                    emit(Event::Progress {
+                        task: job.task.clone(),
+                    })?;
+                    std::thread::yield_now();
+                    slice = 0;
+                    progress = Instant::now();
+                }
+            }
+            require_open_version(&file, job, &version)?;
+            let accepted = hash.clone().finalize().as_slice() == proof.digest.as_slice();
+            emit(Event::Prefix {
+                task: job.task.clone(),
+                accepted,
+                version: version.clone(),
+            })?;
+            if !accepted {
+                return Ok(());
+            }
+            super::super::types::regression_stop("prefix_after_verified");
+        } else if job.offset != 0 {
+            return Err(LedgerError::StaleObservation);
+        }
+        let mut input =
+            BufReader::with_capacity(64 * 1024, file.take((job.len - job.offset) as u64));
+        let mut offset = job.offset;
+        let mut batch = Vec::new();
+        let mut projected = 0usize;
+        let mut ignored = 0u64;
+        let mut slice_bytes = 0u64;
+        let mut progress = Instant::now();
+        let flush = |batch: &mut Vec<Observation>,
+                     ignored: &mut u64,
+                     offset: i64,
+                     input: &BufReader<std::io::Take<File>>,
+                     emit: &mut dyn FnMut(Event) -> Result<()>|
+         -> Result<()> {
+            check()?;
+            require_open_version(input.get_ref().get_ref(), job, &version)?;
+            emit(Event::Batch {
+                task: job.task.clone(),
+                observations: std::mem::take(batch),
+                offset,
+                audit_bytes: None,
+                ignored: std::mem::take(ignored),
+                version: Some(version.clone()),
+            })
+        };
+        loop {
+            check()?;
+            let mut line = Vec::new();
+            let n = read_bounded_line(&mut input, &mut line, &mut |n| {
+                bytes += n;
+                parsed_bytes += n;
+                if job.audit {
+                    throttle_read(job, n, &mut emit)?;
+                }
+                check()?;
+                if progress.elapsed().as_millis() >= 250 {
+                    emit(Event::Progress {
+                        task: job.task.clone(),
+                    })?;
+                    progress = Instant::now();
+                }
+                Ok(())
+            })?;
+            if n == 0 {
+                // A proof-only audit leaves its existing checkpoint and stamp intact.
+                if offset != job.offset || !batch.is_empty() || ignored != 0 || job.proof.is_none()
+                {
+                    flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                }
+                require_open_version(input.get_ref().get_ref(), job, &version)?;
+                if offset == job.len {
+                    seal = Some(hash.finalize().to_vec());
+                    final_version = Some(version);
+                }
+                return Ok(());
+            }
+            if n > MAX_LINE_BYTES {
+                flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                return Err(LedgerError::RecordTooLarge);
+            }
+            if !line.ends_with(b"\n") {
+                flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                return Ok(());
+            }
+            let next = offset
+                .checked_add(n as i64)
+                .ok_or(LedgerError::NumericOverflow)?;
+            let parsed = claude::visit_line(&line, |mut o| {
+                o.object_id = job.object_id;
+                o.content_generation = job.generation.clone();
+                o.record_key = offset.to_string();
+                o.observed_ms = now_ms();
+                if o.candidate_key.is_empty() {
+                    o.candidate_key = hash_parts(
+                        "usagebook/unidentified",
+                        &[
+                            &job.root,
+                            &path_text(&job.path)?,
+                            &job.generation,
+                            &o.record_key,
+                        ],
+                    );
+                }
+                o.normalized_hash = claude::normalized_hash(&o)?;
+                let size = claude::normalized_bytes(&o)?.len();
+                if batch.len() >= BATCH_ROWS || projected + size > SLICE_BYTES as usize {
+                    flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                    projected = 0;
+                }
+                projected += size;
+                batch.push(o);
+                Ok(())
+            });
+            match parsed {
+                Ok(n) => ignored += n,
+                Err(error) => {
+                    flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                    return Err(error);
+                }
+            }
+            hash.update(&line);
+            offset = next;
+            slice_bytes += n as u64;
+            if slice_bytes >= SLICE_BYTES || progress.elapsed().as_millis() >= 100 {
+                flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                projected = 0;
+                slice_bytes = 0;
+                progress = Instant::now();
+                std::thread::yield_now();
+            }
+        }
+    })();
+    let error = result.err().map(|error| match error {
+        LedgerError::InvalidInput(ref message) if message == "SourceReadBudgetExceeded" => {
+            message.clone()
+        }
+        _ => error.code().to_owned(),
+    });
+    let _ = emit(Event::Done {
+        task: job.task.clone(),
+        bytes,
+        parsed_bytes,
+        seal,
+        version: final_version,
+        more: false,
+        error,
+    });
+}
+
 fn check_cancelled(job: &Job) -> Result<()> {
     if job
         .cancel
@@ -531,6 +835,9 @@ fn run_identity(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
     let _ = emit(Event::Done {
         task: job.task.clone(),
         bytes,
+        parsed_bytes: 0,
+        seal: None,
+        version: None,
         more: false,
         error: result.err().map(|e| e.code().to_owned()),
     });
@@ -549,6 +856,9 @@ pub(super) fn stale_helper_completion_regression() -> bool {
         .send(Event::Done {
             task: "old-task".into(),
             bytes: 0,
+            parsed_bytes: 0,
+            seal: None,
+            version: None,
             more: false,
             error: None,
         })
@@ -576,6 +886,8 @@ pub(super) fn helper_input_backpressure_regression() -> Result<bool> {
         mtime: None,
         offset: 0,
         audit: false,
+        stream: false,
+        proof: None,
         cancel: None,
         identity: Some(IdentityJob {
             ledger: PathBuf::from("unused"),
@@ -606,6 +918,8 @@ pub(super) fn audit_heartbeat_regression(path: &Path) -> Result<bool> {
         mtime,
         offset: 0,
         audit: true,
+        stream: false,
+        proof: None,
         identity: None,
         cancel: None,
     };
@@ -633,4 +947,101 @@ pub(super) fn audit_heartbeat_regression(path: &Path) -> Result<bool> {
         Ok(())
     });
     Ok(progress_before_commit >= 2 && committed && completed)
+}
+
+#[cfg(feature = "regression-hooks")]
+pub(super) fn stream_reader_regression(
+    path: &Path,
+    prefix_len: i64,
+    digest: Vec<u8>,
+    mut callback: impl FnMut(&str) -> Result<bool>,
+) -> Result<serde_json::Value> {
+    let (len, mtime) = metadata_stamp(&fs::metadata(path)?);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let job = Job {
+        task: "stream-regression".into(),
+        path: path.to_owned(),
+        root: "test".into(),
+        object_id: 1,
+        generation: "test".into(),
+        len,
+        mtime,
+        offset: prefix_len,
+        audit: false,
+        stream: true,
+        proof: (prefix_len > 0).then_some(PrefixProof {
+            len: prefix_len,
+            digest,
+        }),
+        identity: None,
+        cancel: Some(cancel.clone()),
+    };
+    let mut events = Vec::new();
+    run(&job, |event| {
+        let phase = match &event {
+            Event::Progress { .. } => "progress",
+            Event::Prefix { .. } => "prefix",
+            Event::Batch { .. } => "batch",
+            Event::Done { .. } => "done",
+            _ => "identity",
+        };
+        if callback(phase)? {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        events.push(serde_json::to_value(&event).map_err(|_| LedgerError::CorruptLedger)?);
+        Ok(())
+    });
+    Ok(serde_json::Value::Array(events))
+}
+
+#[cfg(feature = "regression-hooks")]
+pub(super) fn helper_stream_regression(
+    path: &Path,
+    prefix_len: i64,
+    digest: Vec<u8>,
+) -> Result<serde_json::Value> {
+    let (len, mtime) = metadata_stamp(&fs::metadata(path)?);
+    let mut job = Job {
+        task: "stream-helper-old".into(),
+        path: path.to_owned(),
+        root: "test".into(),
+        object_id: 1,
+        generation: "test".into(),
+        len,
+        mtime,
+        offset: prefix_len,
+        audit: false,
+        stream: true,
+        proof: Some(PrefixProof {
+            len: prefix_len,
+            digest,
+        }),
+        identity: None,
+        cancel: None,
+    };
+    let mut pool = Pool::new();
+    pool.dispatch_helper(job.clone())?;
+    let mut events = Vec::new();
+    let mut restarted = false;
+    let start = Instant::now();
+    while start.elapsed().as_secs() < 15 {
+        if let Some(event) = pool.next() {
+            if !restarted && event.task() == "stream-helper-old" {
+                pool.cancel("stream-helper-old")?;
+                job.task = "stream-helper-new".into();
+                pool.dispatch_helper(job.clone())?;
+                restarted = true;
+                continue;
+            }
+            if event.task() == "stream-helper-new" {
+                let done = matches!(event, Event::Done { .. });
+                events.push(serde_json::to_value(event).map_err(|_| LedgerError::CorruptLedger)?);
+                if done {
+                    return Ok(serde_json::Value::Array(events));
+                }
+            }
+        }
+    }
+    pool.cancel(&job.task)?;
+    Err(LedgerError::IncompleteEvidence)
 }

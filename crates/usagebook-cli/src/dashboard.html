@@ -539,7 +539,8 @@ function chartShapeKey(cfg) {
      datasets 身份分量:Chart.js 的 legend 隐藏态按 dataset 索引存续,排名互换时若走复用
      路径,隐藏会落到错误的系列上——身份变即重建 */
   const ident = cfg.$entityIds ? JSON.stringify(cfg.$entityIds)
-    : cfg.data.datasets.map(d => d.label).join('\u0000') || cfg.data.labels.join('\u0000');   // 环图使用稳定实体 ID；其他图保留原有系列身份规则
+    : cfg.$seriesIds ? JSON.stringify([cfg.$seriesNamespace,cfg.$seriesIds])
+    : cfg.data.datasets.map(d => d.label).join('\u0000') || cfg.data.labels.join('\u0000');
   return [cfg.type, cfg.data.labels.length, cfg.data.datasets.length, yt, state.lang,
     cfg.options && cfg.options.onClick ? 'clk' : '', ident].join('|');
 }
@@ -555,6 +556,11 @@ function mkChart(id, cfg) {
   const c = charts[id];
   const key = chartShapeKey(cfg);
   const restoreVisibility = chart => {
+    if (cfg.$seriesIds) {
+      chart.$seriesIds=cfg.$seriesIds;chart.$seriesNamespace=cfg.$seriesNamespace;chart.$intentRevision=cfg.$intentRevision;
+      cfg.$seriesIds.forEach((entity,index)=>chart.setDatasetVisibility(index,!cfg.$hiddenSeriesIds.has(entity)));
+      return;
+    }
     if (!cfg.$entityIds) return;
     chart.$entityIds = cfg.$entityIds; chart.$intentRevision = cfg.$intentRevision;
     cfg.$entityIds.forEach((entity, index) => {
@@ -577,6 +583,7 @@ function mkChart(id, cfg) {
         c.options.plugins.tooltip.callbacks = cfg.options.plugins.tooltip.callbacks;
         c.options.plugins.tooltip.filter = cfg.options.plugins.tooltip.filter;
       }
+      if (cfg.options?.plugins?.legend?.onClick) c.options.plugins.legend.onClick=cfg.options.plugins.legend.onClick;
       restoreVisibility(c);
       c.update('none');
       return c;
@@ -589,7 +596,7 @@ function mkChart(id, cfg) {
   nc.$shape = key;
   nc.$center = cfg.$center;
   restoreVisibility(nc);
-  if (cfg.$center || cfg.$entityIds) nc.update('none');   // 构造内 attached 时同步首绘读不到 $center,补一次同步重绘(环心首帧不缺)
+  if (cfg.$center || cfg.$entityIds || cfg.$seriesIds) nc.update('none');   // 自定义状态在构造后恢复，首帧同步重绘
   charts[id] = nc;
   return nc;
 }
@@ -684,7 +691,7 @@ function setSelection(dim, sel, solo = null, userChange = false) {
   state[source?'srcSel':'mdlSel']=sel;
   state[source?'srcSolo':'mdlSolo']=solo;
   persist(source?SRC_LS_KEY:MDL_LS_KEY,sel,solo);
-  if(userChange&&before!==queryIntentKey())resetDoughnutIntent();
+  if(userChange&&before!==queryIntentKey())resetChartIntent();
 }
 function restoreSelection(dim) {
   const source=dim==='source',value=JSON.parse(lsGet(source?SRC_LS_KEY:MDL_LS_KEY)||'null');

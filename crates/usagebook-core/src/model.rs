@@ -69,6 +69,13 @@ impl UsageRecord {
     }
 }
 
+/// Precision of a cumulative-only observation. Unknown components stay unknown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTotalPrecision {
+    pub metrics: [Option<i64>; 10],
+    pub reason: String,
+}
+
 /// 单源扫描结果:记录 + 取证统计(未知行/坏行必须计数上报,禁止静默)。
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -96,6 +103,7 @@ pub struct ScanStats {
     #[serde(default)]
     pub key_clash: u64,
     pub notes: Vec<String>,
+    pub session_total_precision: std::collections::BTreeMap<String, SessionTotalPrecision>,
 }
 
 /// 数据源实证等级:verified = 本机装过该工具、档案三腿齐全;

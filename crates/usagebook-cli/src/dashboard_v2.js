@@ -162,16 +162,53 @@ function editCustomDate(key,value,commit) {
 }
 // Only explicit query controls reset legend intent. Background catalog recovery,
 // as-of changes, midnight, formatting and chart reconstruction do not.
-let doughnutIntentRevision=0;
+let chartIntentRevision=0;
 const doughnutHiddenIds=new Set();
+// Each bar chart owns a bounded history. Only hidden identities need storage;
+// namespace separates models, sources and the ungrouped aggregate. Other is a
+// stable bucket identity, independent of whichever models currently compose it.
+const BAR_HIDDEN_LIMIT=512;
+const barVisibility={
+  '#chartDaily':{hidden:new Map(),seen:0},
+  '#chartHourly':{hidden:new Map(),seen:0},
+};
+const barSeriesKey=(namespace,id)=>JSON.stringify([namespace,id]);
 function queryIntentKey() {
   return JSON.stringify([state.win,state.win==='custom'?[state.rs,state.re]:null,_selKey(state.srcSel),_selKey(state.mdlSel),state.metric,state.group]);
 }
-function resetDoughnutIntent(){doughnutIntentRevision++;doughnutHiddenIds.clear();}
-function changeQueryIntent(change){const before=queryIntentKey();change();if(before!==queryIntentKey())resetDoughnutIntent();}
+function resetChartIntent(){
+  chartIntentRevision++;doughnutHiddenIds.clear();
+  for(const entry of Object.values(barVisibility)){entry.hidden.clear();entry.seen=0;}
+}
+function changeQueryIntent(change){const before=queryIntentKey();change();if(before!==queryIntentKey())resetChartIntent();}
 function rememberDoughnutVisibility(chart) {
-  if(!chart?.$entityIds||chart.$intentRevision!==doughnutIntentRevision)return;
+  if(!chart?.$entityIds||chart.$intentRevision!==chartIntentRevision)return;
   chart.$entityIds.forEach((id,index)=>{if(chart.getDataVisibility(index))doughnutHiddenIds.delete(id);else doughnutHiddenIds.add(id);});
+}
+function rememberBarVisibility(id,chart) {
+  if(!chart?.$seriesIds||chart!==charts[id]||chart.$intentRevision!==chartIntentRevision)return;
+  const entry=barVisibility[id];
+  chart.$seriesIds.forEach((entity,index)=>{
+    const key=barSeriesKey(chart.$seriesNamespace,entity);
+    if(chart.isDatasetVisible(index))entry.hidden.delete(key);
+    else if(!entry.hidden.has(key))entry.hidden.set(key,entry.seen);
+  });
+  trimBarVisibility(entry,new Set(chart.$seriesIds.map(entity=>barSeriesKey(chart.$seriesNamespace,entity))));
+}
+function trimBarVisibility(entry,current) {
+  // Server charts have a bounded current key set (Top-N or registered sources).
+  // Keep those choices; evict the least recently displayed absent identities.
+  if(entry.hidden.size<=BAR_HIDDEN_LIMIT)return;
+  const absent=[...entry.hidden].filter(([key])=>!current.has(key)).sort((a,b)=>a[1]-b[1]);
+  for(const [key] of absent){if(entry.hidden.size<=BAR_HIDDEN_LIMIT)break;entry.hidden.delete(key);}
+}
+function hiddenBarSeries(id,namespace,ids) {
+  rememberBarVisibility(id,charts[id]);
+  const entry=barVisibility[id],current=new Set(ids.map(entity=>barSeriesKey(namespace,entity)));
+  entry.seen++;
+  for(const key of current)if(entry.hidden.has(key))entry.hidden.set(key,entry.seen);
+  trimBarVisibility(entry,current);
+  return new Set(ids.filter(entity=>entry.hidden.has(barSeriesKey(namespace,entity))));
 }
 function currentQueryKey() {
   return JSON.stringify([state.win,state.rs,state.re,localDayStr(),_selKey(state.srcSel),_selKey(state.mdlSel),state.metric,state.group,v2Status?.stamp?.report_timezone]);
@@ -296,7 +333,7 @@ function verifyStamp(expected,actual) {
   if(stampKey(expected.stamp)!==stampKey(actual.stamp)){const e=new Error(words('数据已更新，正在重新读取','Data changed; reloading'));e.code='CURSOR_STALE';throw e;}
 }
 async function load(passive) {
-  const seq=++loadSeq;pendingQueryKey=currentQueryKey();v2Controller?.abort();const controller=v2Controller=new AbortController();
+  const seq=++loadSeq,intentRevision=chartIntentRevision;pendingQueryKey=currentQueryKey();v2Controller?.abort();const controller=v2Controller=new AbortController();
   clearTimeout(coldRetryTimer);coldRetryTimer=null;
   try {
     let status=await readStatusV2('status?arf='+(passive===true?'':state.arf),controller.signal,()=>seq===loadSeq);
@@ -327,7 +364,7 @@ async function load(passive) {
       try{next=await fetchDashboard(controller.signal);break;}
       catch(e){if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){status=await readStatusV2('status?arf=',controller.signal,()=>seq===loadSeq);scanIssue=observeScanStatus(status);continue;}throw e;}
     }
-    if(seq!==loadSeq||controller.signal.aborted||next.key!==currentQueryKey())return {ok:false,superseded:true};
+    if(seq!==loadSeq||controller.signal.aborted||intentRevision!==chartIntentRevision||next.key!==currentQueryKey())return {ok:false,superseded:true};
     if(restoringSelection){
       // UNKNOWN_SOURCE uses the static source registry; directory absence alone is insufficient.
       const clearSource=state.srcSolo!==null&&next.response.warnings.includes('UNKNOWN_SOURCE:'+state.srcSolo);
@@ -336,7 +373,7 @@ async function load(passive) {
         // A failed source can hide its models, even when that source is not selected.
         // Check all sources at this snapshot/cutoff without reusing cached coverage.
         const confirmation=await apiV2('query',{kind:'totals',query:{...next.query,window:{kind:'all'},sources:{mode:'all'},metric:'total',group_by:'none'}},controller.signal);
-        if(seq!==loadSeq||controller.signal.aborted||next.key!==currentQueryKey())return {ok:false,superseded:true};
+        if(seq!==loadSeq||controller.signal.aborted||intentRevision!==chartIntentRevision||next.key!==currentQueryKey())return {ok:false,superseded:true};
         verifyStamp(next.response,confirmation);
         clearModel=confirmation.source_coverage==='complete'&&confirmation.warnings.includes('ALL_SELECTED_MODELS_UNKNOWN');
       }
@@ -457,6 +494,11 @@ function renderStatus() {
   if(rescanBusy)details.push(t('st.manualScan'));
   const isolated=(v2Status?.sources||[]).reduce((n,s)=>n+BigInt(s.isolated_objects||'0'),0n);
   if(isolated)details.push(words(`${isolated} 个文件已隔离`,`${isolated} files isolated`));
+  for(const source of v2Status?.sources||[])if(source.accounting?.state==='partial'){
+    const count=source.accounting.unallocated_sessions||'0';
+    details.push(words(`${srcLabel(source.id)}：${count} 个会话存在未能归入请求的累计用量。`,
+      `${srcLabel(source.id)}: cumulative usage in ${count} sessions cannot be fully attributed to requests.`));
+  }
   const remaining=Math.max(0,Math.ceil((arfNextAt-Date.now())/1000));
   const refreshDetail=state.arf?t('st.arf',state.arf,remaining):t('st.arfOff');
   details.push(refreshDetail);
@@ -478,9 +520,10 @@ function renderStatus() {
 function dataNotes() {
   if(!v2View)return [];
   const r=v2View.response,d=r.payload.data,notes=[];
-  if(r.source_coverage==='partial')notes.push(words('部分来源暂未读完，当前统计可能不完整。','Some sources are incomplete; totals may be partial.'));
+  if(r.source_coverage==='partial')notes.push(words('当前统计未覆盖全部来源用量。','Totals do not cover all source usage.'));
   if(r.warnings.includes('LIVE_HISTORY_UNPROTECTED'))notes.push(words('部分来源仍依赖原始历史文件。','Some sources still depend on their original history files.'));
   if(r.warnings.includes('DAY_EVIDENCE_EXCLUDED'))notes.push(words('有时区或覆盖范围待确认的日汇总，暂未计入。','Daily records with unverified timezone or coverage are excluded.'));
+  if(r.warnings.includes('SESSION_USAGE_UNALLOCATED'))notes.push(words('部分会话累计无法完整归入请求；图表与排行只包含可归属的用量。','Some session totals cannot be fully attributed to requests; charts and rankings include attributable usage only.'));
   if(d.totals.coverage.grain==='day'||d.totals.coverage.grain==='mixed')notes.push(words('日汇总计入总量；小时图仅展示真实的小时记录。','Totals include daily records; hourly charts show only known hourly usage.'));
   if(d.series.compressed)notes.push(words('时间跨度较长，主图已按周或月合并显示。','The long date range is grouped by week or month.'));
   return notes;
@@ -489,6 +532,8 @@ function displayKey(key){return key.id==='__other__'?t('bucket.other'):key.label
 function chartColor(key,index){return state.group==='source'?srcColor(key.id):key.id==='__other__'?'#8b949e':mdlStableColor(key.id);}
 function drawSeries(id,series,onClick,presentation={}) {
   const keys=series?.keys||[],points=series?.points||[];
+  const ids=keys.map(key=>key.id),namespace=state.group,intentRevision=chartIntentRevision;
+  const hidden=hiddenBarSeries(id,namespace,ids);
   // Keys represent actual records; a zero metric must not hide their original legends.
   const used=keys.map((key,index)=>({key,index}));
   const datasets=used.map(({key,index},i)=>{
@@ -498,6 +543,12 @@ function drawSeries(id,series,onClick,presentation={}) {
       borderColor:color,borderWidth:1,borderRadius:2};
   });
   const options=stackOpts(t(METRICS[state.metric].labelKey));
+  options.plugins.legend.onClick=(event,item,legend)=>{
+    const chart=legend.chart;
+    if(chart!==charts[id]||chart.$intentRevision!==intentRevision||intentRevision!==chartIntentRevision)return;
+    Chart.defaults.plugins.legend.onClick(event,item,legend);
+    rememberBarVisibility(id,chart);
+  };
   options.plugins.tooltip.filter=it=>{const v=it.dataset.exactValues[it.dataIndex];return v.state!=='exact'||BigInt(v.known_value||'0')!==0n;};
   options.plugins.tooltip.callbacks.label=it=>it.dataset.label+': '+tooltipMetricText(it.dataset.exactValues[it.dataIndex]);
   options.plugins.tooltip.callbacks.title=items=>{
@@ -505,8 +556,9 @@ function drawSeries(id,series,onClick,presentation={}) {
     const total=sumMetricValues(items.map(it=>it.dataset.exactValues[it.dataIndex]));
     return items[0].label+' · '+t('sub.total',tooltipMetricText(total));
   };
-  if(onClick)options.onClick=(event,elements)=>{if(elements?.length)onClick(points[elements[0].index],elements[0].index);};
-  mkChart(id,{type:'bar',data:{labels:points.map(p=>presentation.label?presentation.label(p):p.label),datasets},options});
+  if(onClick)options.onClick=(event,elements)=>{if(intentRevision===chartIntentRevision&&elements?.length)onClick(points[elements[0].index],elements[0].index);};
+  mkChart(id,{type:'bar',$seriesIds:ids,$seriesNamespace:namespace,$intentRevision:intentRevision,$hiddenSeriesIds:hidden,
+    data:{labels:points.map(p=>presentation.label?presentation.label(p):p.label),datasets},options});
 }
 function daySeries(day) {
   return {keys:day?.keys||[],points:(day?.hours||Array.from({length:24},(_,hour)=>({hour,values:[]}))).map(h=>({label:String(h.hour).padStart(2,'0')+(h.state==='nonexistent'?' ∅':h.intervals?.length>1?' ↺':''),values:h.values}))};
@@ -553,7 +605,7 @@ function renderDoughnut() {
   for(const id of doughnutHiddenIds)if(!members.has(id))doughnutHiddenIds.delete(id);
   const datasets=[{data:rows.map(r=>r.value.known_value==null?null:Number(r.value.known_value)),exactValues:rows.map(r=>r.value),backgroundColor:rows.map((r,i)=>chartColor(r,i)+'dd'),borderColor:'#0b0e14',borderWidth:2}];
   const options={responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{boxWidth:10,boxHeight:10},onClick:(event,item,legend)=>{Chart.overrides.doughnut.plugins.legend.onClick(event,item,legend);rememberDoughnutVisibility(legend.chart);}},tooltip:{callbacks:{label:it=>tooltipMetricText(it.dataset.exactValues[it.dataIndex])}}}};
-  mkChart('#chartSource',{type:'doughnut',$entityIds:ids,$intentRevision:doughnutIntentRevision,$hiddenEntityIds:new Set(doughnutHiddenIds),data:{labels:rows.map(r=>`${displayKey(r)} ${ratioText(r.value,{state:d.complete?'exact':'partial',known_value:total.toString()})}`),datasets},options,plugins:[centerTextPlugin],$center:{v:formatInteger(total),l:t('dough.center',t(METRICS[state.metric].labelKey))}});
+  mkChart('#chartSource',{type:'doughnut',$entityIds:ids,$intentRevision:chartIntentRevision,$hiddenEntityIds:new Set(doughnutHiddenIds),data:{labels:rows.map(r=>`${displayKey(r)} ${ratioText(r.value,{state:d.complete?'exact':'partial',known_value:total.toString()})}`),datasets},options,plugins:[centerTextPlugin],$center:{v:formatInteger(total),l:t('dough.center',t(METRICS[state.metric].labelKey))}});
 }
 function renderModelTable(){renderDetailTable('model');}
 function renderSourceTable(){renderDetailTable('source');}

@@ -195,6 +195,7 @@ pub fn run(port: u16, refresh_secs: u64, collection_mode: CollectionMode, open: 
                 stale: true,
                 error: Some("LOADING".into()),
                 unaccounted_rows: 0,
+                unallocated_sessions: 0,
             },
         );
     }
@@ -315,10 +316,9 @@ pub fn run(port: u16, refresh_secs: u64, collection_mode: CollectionMode, open: 
                                     // A failed attempt must not make retained data look current.
                                     status.last_scanned_ms = previous_complete
                                         .and_then(|previous| previous.last_scanned_ms);
-                                    if source == "ccswitch-rollup" {
-                                        if let Some(previous) = previous_complete {
-                                            status.unaccounted_rows = previous.unaccounted_rows;
-                                        }
+                                    if let Some(previous) = previous_complete {
+                                        status.unaccounted_rows = previous.unaccounted_rows;
+                                        status.unallocated_sessions = previous.unallocated_sessions;
                                     }
                                     status.stale = true;
                                     status.error = Some("SOURCE_READ_FAILED".into());

@@ -18,7 +18,7 @@ use std::sync::{Mutex, OnceLock};
 /// 12:JSONL 读取/编码故障传播；旧 source_state 部分成功缓存必须失效。
 /// 11:OpenCode v2 fork 按边界剔除复制前缀，旧缓存不得继续贡献重复用量。
 /// 10:minimax 源 model 回填 + 模型名去 provider 前缀(8/9 为未发布中间版本)。
-pub const PARSER_VERSION: &str = "16";
+pub const PARSER_VERSION: &str = "17";
 const SCHEMA_VERSION: i32 = 2;
 const LOCK_PROTOCOL_VERSION: u32 = 1;
 

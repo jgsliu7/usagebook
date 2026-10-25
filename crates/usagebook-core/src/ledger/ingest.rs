@@ -28,6 +28,8 @@ pub struct RefreshSummary {
     pub files_seen: u64,
     pub files_read: u64,
     pub bytes_read: u64,
+    pub parsed_bytes: u64,
+    pub verification_bytes: u64,
     pub identity_probes: u64,
     pub identity_probe_bytes: u64,
     pub inserted: u64,
@@ -250,31 +252,6 @@ fn require_stamp(path: &Path, len: i64, mtime: Option<i64>) -> Result<()> {
     Ok(())
 }
 
-// A digest of every committed byte, not a sample of the beginning and end.
-// The stamp checks prevent certifying an ordinary concurrent rewrite as a
-// stable prefix. A missing or stale seal always falls back to full replay.
-fn hash_prefix(path: &Path, len: i64, mtime: Option<i64>, prefix_len: i64) -> Result<Vec<u8>> {
-    if prefix_len < 0 || prefix_len > len {
-        return Err(LedgerError::StaleObservation);
-    }
-    require_stamp(path, len, mtime)?;
-    let mut file = File::open(path).map_err(source_io)?;
-    let mut remaining = prefix_len as u64;
-    let mut hash = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    while remaining > 0 {
-        let limit = remaining.min(buf.len() as u64) as usize;
-        let n = file.read(&mut buf[..limit]).map_err(source_io)?;
-        if n == 0 {
-            return Err(LedgerError::StaleObservation);
-        }
-        hash.update(&buf[..n]);
-        remaining -= n as u64;
-    }
-    require_stamp(path, len, mtime)?;
-    Ok(hash.finalize().to_vec())
-}
-
 impl Ledger {
     /// New roots inherit the source's route and conservatively retain any pause.
     pub fn register_claude_root(&mut self, path: &Path) -> Result<String> {
@@ -336,7 +313,7 @@ impl Ledger {
         }
         let registered:Vec<(String,String,bool,Option<i64>)>=self.conn.prepare("SELECT root_id,locator,enabled,retry_after_ms FROM source_roots WHERE identity_family='claude' AND namespace_key='unknown:claude' ORDER BY root_id")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
         let mut summary = RefreshSummary::default();
-        self.conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS acquisition_seen(object_id INTEGER PRIMARY KEY,probe_attempted INTEGER NOT NULL DEFAULT 0); DELETE FROM acquisition_seen; CREATE TEMP TABLE IF NOT EXISTS acquisition_queue(object_id INTEGER PRIMARY KEY,root_id TEXT NOT NULL,turn INTEGER NOT NULL,audit INTEGER NOT NULL,deferred INTEGER NOT NULL DEFAULT 0);DELETE FROM acquisition_queue;CREATE INDEX IF NOT EXISTS temp.acquisition_queue_turn ON acquisition_queue(deferred,turn,root_id,object_id);")?;
+        self.conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS acquisition_seen(object_id INTEGER PRIMARY KEY,probe_attempted INTEGER NOT NULL DEFAULT 0); DELETE FROM acquisition_seen; CREATE TEMP TABLE IF NOT EXISTS acquisition_queue(object_id INTEGER PRIMARY KEY,root_id TEXT NOT NULL,turn INTEGER NOT NULL,audit INTEGER NOT NULL,deferred INTEGER NOT NULL DEFAULT 0);DELETE FROM acquisition_queue;CREATE TEMP TABLE IF NOT EXISTS acquisition_proofs(object_id INTEGER PRIMARY KEY,prefix_len INTEGER NOT NULL,digest BLOB NOT NULL,target_len INTEGER NOT NULL,target_mtime INTEGER);DELETE FROM acquisition_proofs;CREATE INDEX IF NOT EXISTS temp.acquisition_queue_turn ON acquisition_queue(deferred,turn,root_id,object_id);")?;
         for (root_id, locator, enabled, retry) in registered {
             if !enabled {
                 continue;
@@ -463,20 +440,17 @@ impl Ledger {
                         |r| r.get(0),
                     )?;
                     if let Some(seal) = seal {
-                        if hash_prefix(path, len, mtime, o.len)? == seal {
-                            self.conn.execute(
-                                "UPDATE source_objects SET byte_length=?2,mtime_ns=?3,object_revision=object_revision+1,target_generation=content_generation,target_end=?2,target_done=0,last_observed_ms=?4,error_code=NULL,retry_after_ms=NULL,quick_fingerprint=NULL WHERE object_id=?1",
-                                params![o.id, len, mtime, now_ms()],
-                            )?;
-                            super::db::bump(&self.conn)?;
-                            o.len = len;
-                            o.mtime = mtime;
-                            o.revision += 1;
-                            o.done = false;
-                            return Ok(o);
-                        }
+                        // Keep the durable old checkpoint untouched until a reader
+                        // proves it. A crash only loses this temporary plan.
+                        self.conn.execute(
+                            "INSERT INTO acquisition_proofs VALUES(?1,?2,?3,?4,?5)",
+                            params![o.id, o.len, seal, len, mtime],
+                        )?;
+                        o.done = false;
+                        return Ok(o);
                     }
                 }
+
                 let generation = new_epoch();
                 self.conn.execute("UPDATE source_objects SET content_generation=?2,byte_length=?3,mtime_ns=?4,object_revision=object_revision+1,state='ready',saved_offset=0,checkpoint_format=1,checkpoint=?5,target_generation=?2,target_end=?3,target_done=0,last_observed_ms=?6,error_code=NULL,retry_after_ms=NULL,quick_fingerprint=NULL WHERE object_id=?1",params![o.id,generation,len,mtime,checkpoint(&generation,0),now_ms()])?;
                 super::db::bump(&self.conn)?;
@@ -489,17 +463,15 @@ impl Ledger {
                 o.state = "ready".into();
                 o.retry = None;
             } else {
-                // Periodic audit for a sealed, unchanged file is a pure prefix
-                // hash check: no reparse and no reader job. A missing seal, a
-                // digest mismatch, or any read error falls through to the full
-                // re-read below, so in-place rewrites still re-enter the ledger.
-                let mut audit_verified = false;
+                // An unchanged sealed audit uses the same bounded worker proof.
+                // No source bytes are read while the discovery write lock is held.
                 if !full
                     && o.state == "ready"
                     && o.done
                     && o.offset == o.len
                     && o.len >= PREFIX_SEAL_MIN_BYTES
                     && o.audit_due <= now_ms()
+                    && (explicit || !o.retry.is_some_and(|t| t > now_ms()))
                 {
                     let seal: Option<Vec<u8>> = self.conn.query_row(
                         "SELECT quick_fingerprint FROM source_objects WHERE object_id=?1",
@@ -507,25 +479,20 @@ impl Ledger {
                         |r| r.get(0),
                     )?;
                     if let Some(seal) = seal {
-                        if let Ok(digest) = hash_prefix(path, len, mtime, o.len) {
-                            if digest == seal {
-                                let due = now_ms() + 86_400_000;
-                                self.conn.execute(
-                                    "UPDATE source_objects SET audit_completed_ms=?2,audit_due_ms=?3 WHERE object_id=?1",
-                                    params![o.id, now_ms(), due],
-                                )?;
-                                o.audit_due = due;
-                                audit_verified = true;
-                            }
-                        }
+                        self.conn.execute(
+                            "INSERT INTO acquisition_proofs VALUES(?1,?2,?3,?4,?5)",
+                            params![o.id, o.len, seal, len, mtime],
+                        )?;
+                        return Ok(o);
                     }
                 }
-                if !audit_verified
-                    && (full
-                        || (o.audit_due <= now_ms()
-                            && (explicit || !o.retry.is_some_and(|t| t > now_ms()))))
+                if full || (o.audit_due <= now_ms() && (explicit || !o.retry.is_some_and(|t| t > now_ms())))
+                    // In-memory SHA state cannot survive a crash/cancel. Replay a
+                    // partial large file instead of certifying an unproved prefix.
+                    || (!o.done && o.offset > 0 && o.len >= PREFIX_SEAL_MIN_BYTES
+                        && (explicit || !o.retry.is_some_and(|t| t > now_ms())))
                 {
-                    self.conn.execute("UPDATE source_objects SET object_revision=object_revision+1,saved_offset=0,checkpoint_format=1,checkpoint=?2,target_generation=content_generation,target_end=byte_length,target_done=0 WHERE object_id=?1",params![o.id,checkpoint(&o.generation,0)])?;
+                    self.conn.execute("UPDATE source_objects SET object_revision=object_revision+1,saved_offset=0,checkpoint_format=1,checkpoint=?2,target_generation=content_generation,target_end=byte_length,target_done=0,quick_fingerprint=NULL WHERE object_id=?1",params![o.id,checkpoint(&o.generation,0)])?;
                     super::db::bump(&self.conn)?;
                     o.offset = 0;
                     o.done = false;
@@ -613,7 +580,7 @@ impl Ledger {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM source_objects o JOIN source_roots r USING(root_id) JOIN ledger_meta m ON m.singleton=1 WHERE o.object_id=?1 AND o.object_revision=?2 AND o.content_generation=?3 AND m.epoch=?4 AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?5 AND o.parser_version=?5)",params![o.id,o.revision,o.generation,epoch,PARSER_VERSION],|r|r.get(0))?;
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM source_objects o JOIN source_roots r USING(root_id) JOIN ledger_meta m ON m.singleton=1 WHERE o.object_id=?1 AND o.object_revision=?2 AND o.content_generation=?3 AND m.epoch=?4 AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?5 AND o.parser_version=?5 AND o.saved_offset=?6 AND o.byte_length=?7 AND o.mtime_ns IS ?8)",params![o.id,o.revision,o.generation,epoch,PARSER_VERSION,o.offset,o.len,o.mtime],|r|r.get(0))?;
         if !valid {
             return Err(LedgerError::StaleObservation);
         }
@@ -664,33 +631,127 @@ impl Ledger {
         o.done = done;
         Ok(())
     }
-    fn complete_audit(&mut self, o: &Object, summary: &mut RefreshSummary) -> Result<()> {
+    fn complete_audit(
+        &mut self,
+        o: &Object,
+        epoch: &str,
+        summary: &mut RefreshSummary,
+    ) -> Result<()> {
         // Incremental in-memory hash covers every byte of this fixed target; restart begins at zero.
         // No partial audit is certified, and no second full-file pass delays other objects.
         if o.audit_hashed != o.len || o.audit_hash.is_none() {
             return Ok(());
         }
         let digest = o.audit_hash.as_ref().unwrap().clone().finalize().to_vec();
-        self.conn.execute("UPDATE source_objects SET audit_completed_ms=?2,audit_due_ms=?3,quick_fingerprint=?4 WHERE object_id=?1 AND target_done=1",params![o.id,now_ms(),now_ms()+86_400_000,digest])?;
-        summary.audit_completed += 1;
+        let changed = self.conn.execute("UPDATE source_objects SET audit_completed_ms=?2,audit_due_ms=?3,quick_fingerprint=?4 WHERE object_id=?1 AND target_done=1 AND object_revision=?5 AND content_generation=?6 AND saved_offset=?7 AND byte_length=?7 AND EXISTS(SELECT 1 FROM ledger_meta WHERE epoch=?8) AND EXISTS(SELECT 1 FROM source_roots r WHERE r.root_id=source_objects.root_id AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?9) AND parser_version=?9",params![o.id,now_ms(),now_ms()+86_400_000,digest,o.revision,o.generation,o.len,epoch,PARSER_VERSION])?;
+        summary.audit_completed += changed as u64;
         Ok(())
     }
 
-    fn seal_completed_prefix(&self, o: &Object) -> Result<()> {
-        if !o.done || o.offset != o.len || o.len < PREFIX_SEAL_MIN_BYTES {
-            return Ok(());
+    fn fail_read(&self, task: &ActiveRead, code: &str) -> Result<bool> {
+        let o = &task.object;
+        let failures: i64 = self
+            .conn
+            .query_row(
+                "SELECT failure_count+1 FROM source_objects WHERE object_id=?1",
+                [o.id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(1);
+        let changed = self.conn.execute("UPDATE source_objects SET state='error',error_code=?2,target_done=0,failure_count=failure_count+1,retry_after_ms=?3 WHERE object_id=?1 AND object_revision=?4 AND content_generation=?5 AND saved_offset=?6 AND EXISTS(SELECT 1 FROM ledger_meta WHERE epoch=?7) AND EXISTS(SELECT 1 FROM source_roots r WHERE r.root_id=source_objects.root_id AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?8) AND parser_version=?8", params![o.id,code,now_ms()+backoff(failures),o.revision,o.generation,o.offset,task.epoch,PARSER_VERSION])?;
+        Ok(changed == 1)
+    }
+    fn mark_identity_wait(&self, task: &ActiveRead) -> Result<bool> {
+        let o = &task.object;
+        Ok(self.conn.execute("UPDATE source_objects SET state='error',error_code='IDENTITY_LINK_NEEDS_REVIEW',target_done=0,retry_after_ms=NULL WHERE object_id=?1 AND object_revision=?2 AND content_generation=?3 AND saved_offset=?4 AND EXISTS(SELECT 1 FROM ledger_meta WHERE epoch=?5) AND EXISTS(SELECT 1 FROM source_roots r WHERE r.root_id=source_objects.root_id AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?6) AND parser_version=?6",params![o.id,o.revision,o.generation,o.offset,task.epoch,PARSER_VERSION])? == 1)
+    }
+    fn accept_prefix(&mut self, task: &mut ActiveRead) -> Result<()> {
+        let proof = task.proof.as_ref().ok_or(LedgerError::StaleObservation)?;
+        let o = &mut task.object;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM source_objects o JOIN source_roots r USING(root_id) JOIN ledger_meta m ON m.singleton=1 WHERE o.object_id=?1 AND o.object_revision=?2 AND o.content_generation=?3 AND m.epoch=?4 AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?5 AND o.parser_version=?5 AND o.saved_offset=?6 AND o.byte_length=?6 AND o.quick_fingerprint=?7 AND o.target_done=1)",params![o.id,o.revision,o.generation,task.epoch,PARSER_VERSION,proof.len,proof.digest],|r|r.get(0))?;
+        if !valid {
+            return Err(LedgerError::StaleObservation);
         }
-        // This is only a performance hint. A detected source change during
-        // hashing leaves it unsealed for a later full replay.
-        let digest = match hash_prefix(&o.path, o.len, o.mtime, o.len) {
-            Ok(digest) => digest,
-            Err(e) if is_source_error(&e) => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        self.conn.execute(
-            "UPDATE source_objects SET quick_fingerprint=?2 WHERE object_id=?1 AND content_generation=?3 AND saved_offset=byte_length AND target_done=1",
-            params![o.id, digest, o.generation],
-        )?;
+        if o.len != proof.len {
+            tx.execute("UPDATE source_objects SET byte_length=?2,mtime_ns=?3,object_revision=object_revision+1,target_generation=content_generation,target_end=?2,target_done=0,last_observed_ms=?4,error_code=NULL,retry_after_ms=NULL,quick_fingerprint=NULL WHERE object_id=?1",params![o.id,o.len,o.mtime,now_ms()])?;
+            super::db::bump(&tx)?;
+            o.revision += 1;
+            o.done = false;
+        }
+        // This plan proves one transition only. Keep the verified SHA state in
+        // its live reader; a later identity retry must not consume the old plan.
+        tx.execute("DELETE FROM acquisition_proofs WHERE object_id=?1", [o.id])?;
+        tx.commit()?;
+        task.proof_verified = true;
+        Ok(())
+    }
+    fn replay_rejected_prefix(&mut self, task: &mut ActiveRead) -> Result<()> {
+        // First verify ownership; a late result cannot reset a newer generation.
+        self.accept_prefix(task)?;
+        let o = &mut task.object;
+        let generation = new_epoch();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute("UPDATE source_objects SET content_generation=?2,object_revision=object_revision+1,saved_offset=0,checkpoint=?3,target_generation=?2,target_done=0,quick_fingerprint=NULL,state='ready' WHERE object_id=?1 AND object_revision=?4 AND content_generation=?5 AND EXISTS(SELECT 1 FROM ledger_meta WHERE epoch=?6)",params![o.id,generation,checkpoint(&generation,0),o.revision,o.generation,task.epoch])?;
+        if changed != 1 {
+            return Err(LedgerError::StaleObservation);
+        }
+        super::db::bump(&tx)?;
+        tx.commit()?;
+        o.generation = generation;
+        o.revision += 1;
+        o.offset = 0;
+        o.done = false;
+        Ok(())
+    }
+    fn restart_unproved_stream(&mut self, o: &mut Object, epoch: &str) -> Result<()> {
+        // A stopped reader's SHA state is gone, even if its safe checkpoint is
+        // nonzero. All redispatch paths (identity success/defer/helper Busy) pass
+        // here, so large files can only finish with a new complete proof.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute("UPDATE source_objects SET saved_offset=0,checkpoint_format=1,checkpoint=?2,object_revision=object_revision+1,target_generation=content_generation,target_end=byte_length,target_done=0,quick_fingerprint=NULL WHERE object_id=?1 AND object_revision=?3 AND content_generation=?4 AND saved_offset=?5 AND byte_length=?6 AND mtime_ns IS ?7 AND EXISTS(SELECT 1 FROM ledger_meta WHERE epoch=?8) AND EXISTS(SELECT 1 FROM source_roots r WHERE r.root_id=source_objects.root_id AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?9) AND parser_version=?9",params![o.id,checkpoint(&o.generation,0),o.revision,o.generation,o.offset,o.len,o.mtime,epoch,PARSER_VERSION])?;
+        if changed != 1 {
+            return Err(LedgerError::StaleObservation);
+        }
+        super::db::bump(&tx)?;
+        tx.commit()?;
+        o.offset = 0;
+        o.revision += 1;
+        o.done = false;
+        Ok(())
+    }
+    fn finish_stream(
+        &mut self,
+        task: &mut ActiveRead,
+        digest: &[u8],
+        summary: &mut RefreshSummary,
+    ) -> Result<()> {
+        let o = &mut task.object;
+        if o.offset != o.len || digest.len() != 32 {
+            return Err(LedgerError::StaleObservation);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute("UPDATE source_objects SET target_done=1,state='ready',error_code=NULL,failure_count=0,retry_after_ms=NULL,quick_fingerprint=?2,audit_completed_ms=CASE WHEN ?3 THEN ?4 ELSE audit_completed_ms END,audit_due_ms=CASE WHEN ?3 THEN ?4+86400000 ELSE audit_due_ms END WHERE object_id=?1 AND object_revision=?5 AND content_generation=?6 AND saved_offset=?7 AND byte_length=?7 AND mtime_ns IS ?8 AND EXISTS(SELECT 1 FROM ledger_meta WHERE epoch=?9) AND EXISTS(SELECT 1 FROM source_roots r WHERE r.root_id=source_objects.root_id AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?10) AND parser_version=?10",params![o.id,digest,task.audit,now_ms(),o.revision,o.generation,o.len,o.mtime,task.epoch,PARSER_VERSION])?;
+        if changed != 1 {
+            return Err(LedgerError::StaleObservation);
+        }
+        if !o.done {
+            super::db::bump(&tx)?;
+        }
+        tx.commit()?;
+        o.done = true;
+        if task.audit {
+            summary.audit_completed += 1;
+        }
         Ok(())
     }
 }
@@ -1380,6 +1441,9 @@ struct ActiveRead {
     identity: Option<(Observation, reader::IdentityPurpose)>,
     awaiting_identity: Option<(Observation, reader::IdentityPurpose)>,
     deferred_identity: bool,
+    stream: bool,
+    proof: Option<reader::PrefixProof>,
+    proof_verified: bool,
 }
 impl Ledger {
     fn requeue_object(
@@ -1412,7 +1476,7 @@ impl Ledger {
                 let can_probe = !identity_inflight
                     && (pool.helper_available()
                         || (!pool.has_quarantined_reader() && pool.available() > 0));
-                let queued:Option<(i64,bool)>=self.conn.query_row("SELECT q.object_id,q.audit FROM acquisition_queue q JOIN source_objects o USING(object_id) WHERE (q.audit=0 OR ?1 IS NULL OR q.object_id=?1) AND (?2 OR (o.error_code IS NOT 'SourceReadTimeout' AND ?3>0)) AND q.deferred<=?4 ORDER BY q.deferred,q.turn,q.root_id,q.object_id LIMIT 1",params![audit_state.as_ref().map(|s|s.0),pool.helper_available(),pool.available() as i64,can_probe],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                let queued:Option<(i64,bool)>=self.conn.query_row("SELECT q.object_id,q.audit FROM acquisition_queue q JOIN source_objects o USING(object_id) WHERE (q.audit=0 OR ?1 IS NULL OR q.object_id=?1) AND (?2 OR (o.error_code IS NOT 'SourceReadTimeout' AND ?3>0)) AND q.deferred<=?4 AND (o.byte_length<?5 OR ?6) ORDER BY q.deferred,q.turn,q.root_id,q.object_id LIMIT 1",params![audit_state.as_ref().map(|s|s.0),pool.helper_available(),pool.available() as i64,can_probe,PREFIX_SEAL_MIN_BYTES,!active.values().any(|t| t.stream)],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
                 let Some((id, audit)) = queued else {
                     break;
                 };
@@ -1421,15 +1485,25 @@ impl Ledger {
                 if use_helper && !pool.helper_available() {
                     break;
                 }
-                let object=self.conn.query_row("SELECT object_id,root_id,locator,content_generation,byte_length,mtime_ns,object_revision,COALESCE(saved_offset,0),target_done,state,retry_after_ms,audit_due_ms FROM source_objects WHERE object_id=?1",[id],object_row)?;
-                if audit && audit_state.is_none() {
-                    audit_state = Some((id, Sha256::new(), 0));
-                }
+                let mut object=self.conn.query_row("SELECT object_id,root_id,locator,content_generation,byte_length,mtime_ns,object_revision,COALESCE(saved_offset,0),target_done,state,retry_after_ms,audit_due_ms FROM source_objects WHERE object_id=?1",[id],object_row)?;
+                let plan: Option<(i64,Vec<u8>,i64,Option<i64>)> = self.conn.query_row("SELECT prefix_len,digest,target_len,target_mtime FROM acquisition_proofs WHERE object_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+                let proof = plan.map(|(len, digest, target_len, mtime)| {
+                    object.len = target_len;
+                    object.mtime = mtime;
+                    reader::PrefixProof { len, digest }
+                });
                 let epoch: String = self.conn.query_row(
                     "SELECT epoch FROM ledger_meta WHERE singleton=1",
                     [],
                     |r| r.get(0),
                 )?;
+                if object.len >= PREFIX_SEAL_MIN_BYTES && proof.is_none() && object.offset > 0 {
+                    self.restart_unproved_stream(&mut object, &epoch)?;
+                }
+                let stream = object.len >= PREFIX_SEAL_MIN_BYTES;
+                if audit && !stream && audit_state.is_none() {
+                    audit_state = Some((id, Sha256::new(), 0));
+                }
                 let task = new_epoch();
                 let job = reader::Job {
                     task: task.clone(),
@@ -1441,6 +1515,8 @@ impl Ledger {
                     mtime: object.mtime,
                     offset: object.offset,
                     audit,
+                    stream,
+                    proof: proof.clone(),
                     identity: None,
                     cancel: None,
                 };
@@ -1471,6 +1547,9 @@ impl Ledger {
                         identity: None,
                         awaiting_identity: None,
                         deferred_identity: false,
+                        stream,
+                        proof,
+                        proof_verified: false,
                     },
                 );
             }
@@ -1491,6 +1570,44 @@ impl Ledger {
                 task.last_activity = Instant::now();
                 match event {
                     reader::Event::Progress { .. } => {
+                        active.insert(key, task);
+                    }
+                    reader::Event::Prefix {
+                        accepted, version, ..
+                    } => {
+                        let result = reader::require_version(
+                            &task.object.path,
+                            task.object.len,
+                            task.object.mtime,
+                            &version,
+                        )
+                        .and_then(|_| {
+                            if accepted {
+                                self.accept_prefix(&mut task)
+                            } else {
+                                self.replay_rejected_prefix(&mut task)
+                            }
+                        });
+                        match result {
+                            Ok(()) if !accepted => {
+                                self.requeue_object(
+                                    &task.object,
+                                    task.audit,
+                                    false,
+                                    &mut next_turn,
+                                )?;
+                                task.failed = true;
+                            }
+                            Ok(()) => {}
+                            Err(LedgerError::StaleObservation) => {
+                                if self.fail_read(&task, "STALE_OBSERVATION")? {
+                                    summary.errors += 1;
+                                }
+                                task.failed = true;
+                                pool.cancel(&key)?;
+                            }
+                            Err(error) => return Err(error),
+                        }
                         active.insert(key, task);
                     }
                     reader::Event::Identity { proof, .. } => {
@@ -1526,6 +1643,7 @@ impl Ledger {
                         offset,
                         audit_bytes,
                         ignored,
+                        version,
                         ..
                     } => {
                         if task.failed {
@@ -1552,7 +1670,12 @@ impl Ledger {
                         if let Some((o, purpose)) = weak {
                             // Stop this payload reader at its previous safe cursor.
                             // No usages from the blocked batch enter the database.
-                            self.conn.execute("UPDATE source_objects SET state='error',error_code='IDENTITY_LINK_NEEDS_REVIEW',target_done=0,retry_after_ms=NULL WHERE object_id=?1", [task.object.id])?;
+                            if !self.mark_identity_wait(&task)? {
+                                task.failed = true;
+                                pool.cancel(&key)?;
+                                active.insert(key, task);
+                                continue;
+                            }
                             let attempted: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM acquisition_seen WHERE object_id=?1 AND probe_attempted=1)", [task.object.id], |r| r.get(0))?;
                             if !attempted {
                                 if !identity_inflight
@@ -1578,7 +1701,18 @@ impl Ledger {
                             continue;
                         }
                         let saved = (|| -> Result<()> {
-                            let done = offset == task.object.len;
+                            if task.proof.is_some() && !task.proof_verified {
+                                return Err(LedgerError::StaleObservation);
+                            }
+                            if let Some(version) = version {
+                                reader::require_version(
+                                    &task.object.path,
+                                    task.object.len,
+                                    task.object.mtime,
+                                    &version,
+                                )?;
+                            }
+                            let done = !task.stream && offset == task.object.len;
                             self.save_batch(
                                 &mut task.object,
                                 &task.epoch,
@@ -1604,9 +1738,18 @@ impl Ledger {
                                 self.publish_some(100)?;
                                 active.insert(key, task);
                             }
+                            Err(LedgerError::StaleObservation) => {
+                                if self.fail_read(&task, "STALE_OBSERVATION")? {
+                                    summary.errors += 1;
+                                }
+                                task.failed = true;
+                                pool.cancel(&key)?;
+                                active.insert(key, task);
+                            }
                             Err(e) if is_source_error(&e) => {
-                                summary.errors += 1;
-                                self.fail_object(task.object.id, &e)?;
+                                if self.fail_read(&task, e.code())? {
+                                    summary.errors += 1;
+                                }
                                 if task.audit {
                                     audit_state = None;
                                 }
@@ -1617,9 +1760,17 @@ impl Ledger {
                         }
                     }
                     reader::Event::Done {
-                        bytes, more, error, ..
+                        bytes,
+                        parsed_bytes,
+                        more,
+                        error,
+                        seal,
+                        version,
+                        ..
                     } => {
                         summary.bytes_read += bytes;
+                        summary.parsed_bytes += parsed_bytes;
+                        summary.verification_bytes += bytes.saturating_sub(parsed_bytes);
                         if task.deferred_identity {
                             self.requeue_object(&task.object, false, true, &mut next_turn)?;
                             continue;
@@ -1636,6 +1787,8 @@ impl Ledger {
                                 mtime: task.object.mtime,
                                 offset: task.object.offset,
                                 audit: false,
+                                stream: false,
+                                proof: None,
                                 cancel: None,
                                 identity: Some(reader::IdentityJob {
                                     ledger: self.path.clone(),
@@ -1690,30 +1843,40 @@ impl Ledger {
                             continue;
                         }
                         if let Some(code) = error {
-                            summary.errors += 1;
-                            self.fail_object(
-                                task.object.id,
-                                &LedgerError::InvalidInput(code.clone()),
-                            )?;
-                            self.conn.execute(
-                                "UPDATE source_objects SET error_code=?2 WHERE object_id=?1",
-                                params![task.object.id, code],
-                            )?;
+                            if self.fail_read(&task, &code)? {
+                                summary.errors += 1;
+                            }
                             if task.audit {
                                 audit_state = None;
                             }
                         } else if more {
                             self.requeue_object(&task.object, task.audit, false, &mut next_turn)?;
+                        } else if let Some(digest) = seal {
+                            let version = version.ok_or(LedgerError::StaleObservation)?;
+                            let result = reader::require_version(
+                                &task.object.path,
+                                task.object.len,
+                                task.object.mtime,
+                                &version,
+                            )
+                            .and_then(|_| self.finish_stream(&mut task, &digest, summary));
+                            match result {
+                                Ok(()) => {}
+                                Err(LedgerError::StaleObservation) => {
+                                    if self.fail_read(&task, "STALE_OBSERVATION")? {
+                                        summary.errors += 1;
+                                    }
+                                }
+                                Err(error) => return Err(error),
+                            }
                         } else if task.audit {
                             if let Some((id, hash, hashed)) = audit_state.take() {
                                 if id == task.object.id && task.object.done {
                                     task.object.audit_hash = Some(hash);
                                     task.object.audit_hashed = hashed;
-                                    self.complete_audit(&task.object, summary)?;
+                                    self.complete_audit(&task.object, &task.epoch, summary)?;
                                 }
                             }
-                        } else if task.object.done {
-                            self.seal_completed_prefix(&task.object)?;
                         }
                     }
                 }
@@ -1740,12 +1903,9 @@ impl Ledger {
                         summary.errors += 1;
                         continue;
                     }
-                    self.fail_object(
-                        task.object.id,
-                        &LedgerError::InvalidInput("SourceReadTimeout".into()),
-                    )?;
-                    self.conn.execute("UPDATE source_objects SET error_code='SourceReadTimeout' WHERE object_id=?1",[task.object.id])?;
-                    summary.errors += 1;
+                    if self.fail_read(&task, "SourceReadTimeout")? {
+                        summary.errors += 1;
+                    }
                     if task.audit {
                         audit_state = None;
                     }
@@ -1862,4 +2022,74 @@ pub fn identity_discovery_regression(
     }
     change(ledger)?;
     verify_identity_probe(&ledger.conn)
+}
+
+#[cfg(feature = "regression-hooks")]
+pub fn stream_reader_regression(
+    path: &Path,
+    prefix_len: i64,
+    digest: Vec<u8>,
+    callback: impl FnMut(&str) -> Result<bool>,
+) -> Result<serde_json::Value> {
+    reader::stream_reader_regression(path, prefix_len, digest, callback)
+}
+
+#[cfg(feature = "regression-hooks")]
+pub fn stream_guard_regression(
+    ledger: &mut Ledger,
+    stage: &str,
+    change: impl FnOnce(&mut Ledger) -> Result<()>,
+) -> Result<()> {
+    let object=ledger.conn.query_row("SELECT object_id,root_id,locator,content_generation,byte_length,mtime_ns,object_revision,COALESCE(saved_offset,0),target_done,state,retry_after_ms,audit_due_ms FROM source_objects LIMIT 1",[],object_row)?;
+    let digest: Vec<u8> = ledger.conn.query_row(
+        "SELECT quick_fingerprint FROM source_objects LIMIT 1",
+        [],
+        |r| r.get(0),
+    )?;
+    let epoch: String = ledger
+        .conn
+        .query_row("SELECT epoch FROM ledger_meta", [], |r| r.get(0))?;
+    let mut task = ActiveRead {
+        proof: Some(reader::PrefixProof {
+            len: object.len,
+            digest: digest.clone(),
+        }),
+        object,
+        epoch,
+        audit: true,
+        failed: false,
+        last_activity: Instant::now(),
+        identity: None,
+        awaiting_identity: None,
+        deferred_identity: false,
+        stream: true,
+        proof_verified: true,
+    };
+    change(ledger)?;
+    match stage {
+        "prefix" => ledger.accept_prefix(&mut task),
+        "batch" => {
+            let offset = task.object.offset;
+            ledger.save_batch(
+                &mut task.object,
+                &task.epoch,
+                &[],
+                offset,
+                true,
+                &mut RefreshSummary::default(),
+            )
+        }
+        "seal" => ledger.finish_stream(&mut task, &digest, &mut RefreshSummary::default()),
+        "restart" => ledger.restart_unproved_stream(&mut task.object, &task.epoch),
+        _ => Err(LedgerError::InvalidInput("bad regression stage".into())),
+    }
+}
+
+#[cfg(feature = "regression-hooks")]
+pub fn helper_stream_regression(
+    path: &Path,
+    prefix_len: i64,
+    digest: Vec<u8>,
+) -> Result<serde_json::Value> {
+    reader::helper_stream_regression(path, prefix_len, digest)
 }

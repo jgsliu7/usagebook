@@ -3,7 +3,7 @@
 //! (发现判据/五桶映射/减除/去重/锚定时间戳)。路径注入,不依赖本机安装。
 
 use rusqlite::Connection;
-use usagebook_core::sources::{goose, hermes, kilo, kiro, opencode, qoder};
+use usagebook_core::sources::{hermes, kilo, kiro, opencode, qoder};
 use usagebook_core::UsageSource;
 
 /// 进程唯一临时目录,测试结束best-effort 清理。
@@ -14,101 +14,7 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
     d
 }
 
-#[test]
-fn goose_sessions_db() {
-    let root = temp_root("goose");
-    let db = root.join("sessions.db");
-    let conn = Connection::open(&db).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE sessions(id TEXT PRIMARY KEY, model_config_json TEXT, provider_name TEXT, created_at TEXT,
-         total_tokens INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
-         accumulated_total_tokens INTEGER DEFAULT 0, accumulated_input_tokens INTEGER DEFAULT 0,
-         accumulated_output_tokens INTEGER DEFAULT 0);
-         INSERT INTO sessions VALUES('s1','{\"model_name\":\"claude-sonnet-4-5\"}','anthropic',
-           '2026-01-02 03:04:05',0,0,0,110,100,10);
-         INSERT INTO sessions VALUES('s2','{\"model_name\":\"gpt-5.2\"}','openai',
-           1750000000000,200,150,30,0,0,0);
-         INSERT INTO sessions VALUES('s3','','x','2026-01-02 03:04:05',0,0,0,0,0,0);",
-    )
-    .unwrap();
-    drop(conn);
-
-    let (records, stats) = goose::GooseSource.scan_roots(&[db], None);
-    assert_eq!(
-        records.len(),
-        2,
-        "空 config 行应跳过;实际 notes: {:?}",
-        stats.notes
-    );
-    let s1 = records.iter().find(|r| r.session_id == "s1").unwrap();
-    assert_eq!(s1.model, "claude-sonnet-4-5");
-    // 升级:input 已含 cache(本 fixture 无 cache 列 → 不减);reasoning 恒 0(§6.3)
-    assert_eq!(
-        (s1.input_uncached, s1.output, s1.reasoning_output),
-        (100, 10, 0)
-    );
-    assert_eq!(s1.ts_ms, 1767323045000, "naive created_at 按 UTC 解析(§2)");
-    let s2 = records.iter().find(|r| r.session_id == "s2").unwrap();
-    // 旧列回落 + reasoning 恒 0(total−in−out 公式已作废,§6.3)
-    assert_eq!(
-        (s2.input_uncached, s2.output, s2.reasoning_output),
-        (150, 30, 0)
-    );
-    assert_eq!(s2.ts_ms, 1750000000000, "毫秒 created_at 原样(§2)");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// 升级(§6.3):usage_ledger 逐请求通道 —— 五桶拆分(input 含 cache 子集)、
-/// compaction 跳过、provider_reported 成本、estimated 不落。
-#[test]
-fn goose_ledger_channel() {
-    let root = temp_root("goose-ledger");
-    let db = root.join("sessions.db");
-    let conn = Connection::open(&db).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE sessions(id TEXT PRIMARY KEY, model_config_json TEXT);
-         CREATE TABLE usage_ledger(id INTEGER PRIMARY KEY, session_id TEXT,
-           created_timestamp INTEGER, model TEXT, input_tokens INTEGER, output_tokens INTEGER,
-           total_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-           cost REAL, cost_source TEXT, is_compaction INTEGER DEFAULT 0);
-         INSERT INTO usage_ledger VALUES(1,'g1',1791338725,'deepseek-v4-pro',11266,153,11419,11136,0,
-           0.000633732,'estimated',0);
-         INSERT INTO usage_ledger VALUES(2,'g1',1791338726,'deepseek-v4-pro',100,50,150,0,0,
-           0.01,'provider_reported',0);
-         INSERT INTO usage_ledger VALUES(3,'g1',1791338727,'deepseek-v4-pro',9000,10,9010,0,0,
-           0.0,'estimated',1);",
-    )
-    .unwrap();
-    drop(conn);
-
-    let (records, stats) = goose::GooseSource.scan_roots(&[db], None);
-    assert_eq!(
-        records.len(),
-        2,
-        "compaction 行跳过;notes: {:?}",
-        stats.notes
-    );
-    let r1 = records.iter().find(|r| r.ts_ms == 1791338725000).unwrap();
-    // input 已含 cache → 拆分:11266 − 11136 = 130(§6.3)
-    assert_eq!(
-        (r1.input_uncached, r1.cache_read, r1.output),
-        (130, 11136, 153)
-    );
-    assert_eq!(r1.reasoning_output, 0, "ledger 无 reasoning 列(§6.3)");
-    assert_eq!(r1.cost_usd, None, "estimated 不落 cost_usd(model.rs 纪律)");
-    let r2 = records.iter().find(|r| r.ts_ms == 1791338726000).unwrap();
-    assert_eq!(
-        r2.cost_usd,
-        Some(0.01),
-        "provider_reported 视为官方实报(§6.3)"
-    );
-    assert!(
-        stats.notes.iter().any(|n| n.contains("compaction")),
-        "compaction 跳过应计数: {:?}",
-        stats.notes
-    );
-    let _ = std::fs::remove_dir_all(root);
-}
+// Goose reconciliation regression cases moved to root test/ledger/r6_goose.rs.
 
 /// 重写(§7.2):openclaw SQLite 正典通道 —— transcript_events 解析、
 /// exclusive 直取、reasoning 明细拆分、event_zstd 解压、全零行跳过。

@@ -5,7 +5,7 @@
 //!   usagebook serve      本地看板(自动刷新,曲线/来源/模型)
 //!   usagebook doctor     本机数据源自检(哪些源会生效/在哪/多大)
 
-use clap::{Parser, Subcommand};
+use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser, Subcommand};
 use usagebook_core::registered_sources;
 
 mod ledger_cli;
@@ -49,13 +49,13 @@ enum Command {
 #[derive(Parser)]
 #[command(name = "usagebook", version, about = "本地 AI 编程工具 token 用量统计")]
 struct Args {
-    /// 只统计指定数据源(源 id 见 usagebook doctor;仅终端报表生效,看板恒为全部)
+    /// 快捷报表的数据源(显式 report 时请将此参数放在 report 后)
     #[arg(long, default_value = "all")]
     source: String,
-    /// 只看最近 N 天
+    /// 快捷报表只看最近 N 天(显式 report 时请放在 report 后)
     #[arg(long)]
     days: Option<usize>,
-    /// 抽样调试:每源最多解析 N 个文件
+    /// 已停用的报表抽样参数；诊断扫描请使用 doctor --check
     #[arg(long)]
     max_files: Option<usize>,
     /// 以 JSON 输出(与终端报表同口径,便于脚本消费)
@@ -123,7 +123,35 @@ const LOG_ENV_OVERRIDES: &[&str] = &[
 ];
 
 fn main() {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // Reject unsupported/misplaced filters before logging, opening any ledger,
+    // discovering sources or writing caches. Explicit defaults count as input.
+    if args.max_files.is_some()
+        || matches!(&args.command, Some(Command::Report(report)) if report.max_files.is_some())
+    {
+        ledger_cli::fail(
+            "Reports do not support --max-files; use doctor --check for diagnostic scans",
+            2,
+        )
+    }
+    if args.command.is_some()
+        && ["source", "days"]
+            .iter()
+            .any(|name| matches.value_source(name) == Some(ValueSource::CommandLine))
+    {
+        let message = if matches!(&args.command, Some(Command::Report(_))) {
+            "Place --source and --days after report when using the report subcommand"
+        } else {
+            "Top-level --source and --days are only valid for the shortcut report (no subcommand)"
+        };
+        ledger_cli::fail(message, 2)
+    }
+    if args.days == Some(0)
+        || matches!(&args.command, Some(Command::Report(report)) if report.days == Some(0))
+    {
+        ledger_cli::fail("invalid days: expected a positive number", 2)
+    }
     logging_setup::init(args.verbose);
     match args.command {
         Some(Command::LedgerReader) => {
@@ -140,15 +168,9 @@ fn main() {
             collection_mode,
             open,
         }) => {
-            if args.source != "all" || args.days.is_some() || args.max_files.is_some() {
-                ledger_cli::fail("serve does not accept report filters", 2)
-            }
             ledger_http::run(port, refresh_secs, collection_mode, open);
         }
         None => {
-            if args.max_files.is_some() {
-                ledger_cli::fail("Use doctor --check for diagnostic scans; limited scans cannot represent a ledger report",2)
-            }
             ledger_cli::report(
                 ledger_cli::ReportArgs {
                     source: if args.source == "all" {

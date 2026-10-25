@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Instant,
 };
 
@@ -22,14 +25,99 @@ const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 const GROUP_LIMIT: usize = 20_000;
 const CATALOG_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
-/// One bounded directory shared by HTTP readers. Published facts remain on disk.
+/// Global spelling counts, shared by ordinary queries and the catalog. The budget
+/// includes the builder and entries retained by an in-flight request after eviction.
 #[derive(Default)]
-pub struct ModelCatalogCache(Mutex<Option<CachedCatalog>>);
-struct CachedCatalog {
+pub struct ModelCatalogCache {
+    slot: Mutex<Option<Arc<CachedLabels>>>,
+    catalog: Mutex<Option<CachedCatalog>>,
+    bytes: Arc<AtomicUsize>,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct LabelKey {
     stamp: Stamp,
     routing_hash: String,
+}
+impl LabelKey {
+    fn heap_bytes(&self) -> usize {
+        let s = &self.stamp;
+        s.ledger_uuid.capacity()
+            + s.epoch.capacity()
+            + s.commit_seq.capacity()
+            + s.report_timezone.capacity()
+            + s.derived_version.capacity()
+            + s.legacy_generation.as_ref().map_or(0, String::capacity)
+            + self.routing_hash.capacity()
+    }
+}
+struct LabelCount {
+    key: String,
+    label: String,
+    count: i64,
+}
+struct CacheReservation {
+    counter: Arc<AtomicUsize>,
+    bytes: usize,
+}
+impl Drop for CacheReservation {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+struct CachedLabels {
+    key: LabelKey,
+    rows: Vec<LabelCount>,
+    _reservation: CacheReservation,
+}
+impl ModelCatalogCache {
+    fn lookup(&self, key: &LabelKey) -> Option<Arc<CachedLabels>> {
+        let mut slot = self.slot.try_lock().ok()?;
+        if slot.as_ref().is_some_and(|entry| entry.key == *key) {
+            return slot.clone();
+        }
+        // Old readers keep their reservation until their Arc is released.
+        *slot = None;
+        None
+    }
+    fn reserve(&self) -> Option<CacheReservation> {
+        // Reserve all remaining space: at most one builder, including catalog
+        // construction. Existing and still-referenced old entries remain charged.
+        let used = self.bytes.load(Ordering::Acquire);
+        if used >= CATALOG_CACHE_BYTES {
+            return None;
+        }
+        self.bytes
+            .compare_exchange(
+                used,
+                CATALOG_CACHE_BYTES,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(CacheReservation {
+            counter: Arc::clone(&self.bytes),
+            bytes: CATALOG_CACHE_BYTES - used,
+        })
+    }
+    #[cfg(feature = "regression-hooks")]
+    pub fn retained_cache_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Acquire)
+    }
+}
+struct CachedCatalog {
+    key: LabelKey,
     search: String,
-    rows: Arc<Vec<CatalogModel>>,
+    rows: Arc<CatalogRows>,
+}
+struct CatalogRows {
+    rows: Vec<CatalogModel>,
+    _reservation: Option<CacheReservation>,
+}
+impl std::ops::Deref for CatalogRows {
+    type Target = Vec<CatalogModel>;
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
 }
 struct CatalogModel {
     id: String,
@@ -44,6 +132,7 @@ pub struct QueryService<'a> {
     model_labels: std::cell::RefCell<BTreeMap<String, String>>,
     all_labels: std::cell::Cell<Option<bool>>,
     catalog_cache: Option<&'a ModelCatalogCache>,
+    label_key: std::cell::RefCell<Option<LabelKey>>,
 }
 #[derive(Clone)]
 struct Fact {
@@ -464,6 +553,7 @@ impl<'a> QueryService<'a> {
             model_labels: std::cell::RefCell::new(BTreeMap::new()),
             all_labels: std::cell::Cell::new(None),
             catalog_cache: None,
+            label_key: std::cell::RefCell::new(None),
         }
     }
     pub fn with_catalog_cache(mut self, cache: &'a ModelCatalogCache) -> Self {
@@ -496,6 +586,7 @@ impl<'a> QueryService<'a> {
     ) -> QueryResult<(SnapshotGuard<'_>, Context)> {
         self.model_labels.borrow_mut().clear();
         self.all_labels.set(None);
+        *self.label_key.borrow_mut() = None;
         self.conn.create_scalar_function(
             "usagebook_local_day",
             2,
@@ -550,6 +641,10 @@ impl<'a> QueryService<'a> {
             incomplete: BTreeSet::new(),
             excluded_days: std::cell::Cell::new(false),
         };
+        *self.label_key.borrow_mut() = Some(LabelKey {
+            stamp: ctx.stamp.clone(),
+            routing_hash: ctx.routing_hash.clone(),
+        });
         Ok((guard, ctx))
     }
     fn load_selectors(&self, sources: &mut Selector, models: &mut Selector) -> QueryResult<()> {
@@ -962,6 +1057,14 @@ impl<'a> QueryService<'a> {
             } else {
                 live.and_then(|s| s.last_scanned_ms).map(|n| n.to_string())
             });
+            if id == "goose" && !durable {
+                let count = live.map_or(0, |s| s.unallocated_sessions);
+                source["accounting"] = json!({
+                    "state": if count > 0 { "partial" } else { "complete" },
+                    "unallocated_sessions": count.to_string(),
+                    "reason": if count > 0 { Some("SESSION_USAGE_UNALLOCATED") } else { None }
+                });
+            }
             if id == "ccswitch-rollup" && !durable {
                 let count = live.map_or(0, |s| s.unaccounted_rows);
                 source["accounting"] = json!({
@@ -984,6 +1087,10 @@ impl<'a> QueryService<'a> {
             if !routes.get(info.id).is_some_and(|r| r == "ledger") {
                 ctx.warnings.insert("LIVE_HISTORY_UNPROTECTED".into());
                 let live = self.legacy.and_then(|l| l.sources.get(info.id));
+                if live.is_some_and(|s| s.unallocated_sessions > 0) {
+                    ctx.incomplete.insert(info.id.into());
+                    ctx.warnings.insert("SESSION_USAGE_UNALLOCATED".into());
+                }
                 if live.is_none_or(|s| s.stale || s.error.is_some()) {
                     ctx.incomplete.insert(info.id.into());
                     ctx.warnings.insert("SOURCE_READ_GAP".into());
@@ -1137,6 +1244,7 @@ fn legacy_fact(entry: &LegacyEntry) -> QueryResult<Fact> {
         | LegacyEntry::SessionTotal {
             record,
             known_fields,
+            ..
         } => {
             // Bind optional native/account metadata only on request records.
             let (native, ns) = match entry {
@@ -1162,12 +1270,23 @@ fn legacy_fact(entry: &LegacyEntry) -> QueryResult<Fact> {
                 native,
                 model: model_key(&record.model),
                 session: (!record.session_id.is_empty()).then(|| record.session_id.clone()),
-                time: Some(record.ts_ms),
+                time: if matches!(entry, LegacyEntry::SessionTotal { record, .. } if record.source == "goose")
+                {
+                    None
+                } else {
+                    Some(record.ts_ms)
+                },
                 date: None,
                 timezone: None,
                 start: None,
                 end: None,
-                metrics: legacy_metrics(record)?,
+                metrics: match entry {
+                    LegacyEntry::SessionTotal {
+                        projection: Some(metrics),
+                        ..
+                    } => *metrics,
+                    _ => legacy_metrics(record)?,
+                },
                 cost_state: if legacy_money(record.cost_usd).is_some() {
                     "known"
                 } else {
@@ -2357,48 +2476,61 @@ impl QueryService<'_> {
             json!({"stamp":ctx.stamp,"items":out,"next_cursor":next,"total_count":total.to_string()}),
         )
     }
-    fn catalog_models(&self, search: &str, ctx: &Context) -> QueryResult<Arc<Vec<CatalogModel>>> {
-        let Some(cache) = self.catalog_cache else {
-            return self.build_catalog_models(search, ctx);
+    fn catalog_models(&self, search: &str, ctx: &Context) -> QueryResult<Arc<CatalogRows>> {
+        let key = LabelKey {
+            stamp: ctx.stamp.clone(),
+            routing_hash: ctx.routing_hash.clone(),
         };
-        // Never wait behind a different request's directory rebuild.
-        let mut slot = cache
-            .0
-            .try_lock()
-            .map_err(|_| QueryError::new("BUSY", "model catalog is being refreshed"))?;
-        if let Some(cached) = slot.as_ref() {
-            if cached.stamp == ctx.stamp
-                && cached.routing_hash == ctx.routing_hash
-                && cached.search == search
-            {
-                return Ok(Arc::clone(&cached.rows));
+        if let Some(cache) = self.catalog_cache {
+            if let Ok(mut slot) = cache.catalog.try_lock() {
+                if let Some(entry) = slot.as_ref() {
+                    if entry.key == key && entry.search == search {
+                        return Ok(Arc::clone(&entry.rows));
+                    }
+                }
+                *slot = None;
             }
         }
-        // Evict the previous version before building; failed builds publish nothing.
-        *slot = None;
+        self.populate_model_labels()?;
+        let mut reservation = self.catalog_cache.and_then(ModelCatalogCache::reserve);
         let rows = self.build_catalog_models(search, ctx)?;
-        let bytes: usize = rows
-            .iter()
-            .map(|row| {
-                std::mem::size_of::<CatalogModel>() + row.id.capacity() + row.label.capacity()
-            })
-            .sum();
-        // Oversized directories retain the existing query behavior without being cached.
-        if bytes <= CATALOG_CACHE_BYTES {
-            *slot = Some(CachedCatalog {
-                stamp: ctx.stamp.clone(),
-                routing_hash: ctx.routing_hash.clone(),
-                search: search.into(),
-                rows: Arc::clone(&rows),
-            });
+        let bytes = std::mem::size_of::<CatalogRows>()
+            + std::mem::size_of::<CachedCatalog>()
+            + 2 * std::mem::size_of::<usize>()
+            + key.heap_bytes()
+            + search.len()
+            + rows.capacity() * std::mem::size_of::<CatalogModel>()
+            + rows
+                .iter()
+                .map(|r| r.id.capacity() + r.label.capacity())
+                .sum::<usize>();
+        if let Some(r) = reservation.as_mut() {
+            if bytes <= r.bytes {
+                r.counter.fetch_sub(r.bytes - bytes, Ordering::AcqRel);
+                r.bytes = bytes;
+            } else {
+                reservation = None;
+            }
+        }
+        let cached = reservation.is_some();
+        let rows = Arc::new(CatalogRows {
+            rows,
+            _reservation: reservation,
+        });
+        if cached {
+            if let Some(cache) = self.catalog_cache {
+                if let Ok(mut slot) = cache.catalog.try_lock() {
+                    *slot = Some(CachedCatalog {
+                        key,
+                        search: search.into(),
+                        rows: Arc::clone(&rows),
+                    });
+                }
+            }
         }
         Ok(rows)
     }
-    fn build_catalog_models(
-        &self,
-        search: &str,
-        ctx: &Context,
-    ) -> QueryResult<Arc<Vec<CatalogModel>>> {
+    fn build_catalog_models(&self, search: &str, ctx: &Context) -> QueryResult<Vec<CatalogModel>> {
         self.populate_model_labels()?;
         let mut items = BTreeMap::<String, String>::new();
         let mut color_indices = BTreeMap::<String, usize>::new();
@@ -2447,16 +2579,14 @@ impl QueryService<'_> {
             }
         }
         ctx.budget()?;
-        Ok(Arc::new(
-            items
-                .into_iter()
-                .map(|(id, label)| CatalogModel {
-                    color_index: color_indices[&id],
-                    id,
-                    label,
-                })
-                .collect(),
-        ))
+        Ok(items
+            .into_iter()
+            .map(|(id, label)| CatalogModel {
+                color_index: color_indices[&id],
+                id,
+                label,
+            })
+            .collect())
     }
     fn catalog_usage_sources(&self, ctx: &Context) -> QueryResult<BTreeSet<String>> {
         let mut sources = BTreeSet::new();
@@ -2678,7 +2808,10 @@ impl QueryService<'_> {
                 let f = legacy_fact(e)?;
                 if routes.get(&f.source).is_some_and(|r| r == "ledger")
                     || !sources.allows(&f.source)
-                    || !models.allows(&model_id(&f.model))
+                    || (!models.allows(&model_id(&f.model))
+                        && !(f.source == "goose"
+                            && f.model.is_empty()
+                            && matches!(models, Selector::Include { ids } if !ids.is_empty())))
                 {
                     continue;
                 }
@@ -2686,7 +2819,18 @@ impl QueryService<'_> {
                 if c.as_ref().is_some_and(|c| key <= c.last_id) {
                     continue;
                 }
-                out.insert(key, session_row(&f)?);
+                let mut row = session_row(&f)?;
+                if let LegacyEntry::SessionTotal {
+                    reason: Some(reason),
+                    ..
+                } = e
+                {
+                    row["reason"] = json!(reason);
+                    row["time_precision"] = json!("unknown");
+                    row["model_precision"] = json!("unknown");
+                    row["scope"] = json!("uncovered_history");
+                }
+                out.insert(key, row);
                 if out.len() > page.limit + 1 {
                     out.pop_last();
                 }
@@ -2922,6 +3066,22 @@ impl QueryService<'_> {
         if self.all_labels.get() == Some(true) {
             return Ok(());
         }
+        let key = self.label_key.borrow().clone();
+        if let (Some(cache), Some(key)) = (self.catalog_cache, key.as_ref()) {
+            if let Some(labels) = cache.lookup(key) {
+                let mut insert = self
+                    .conn
+                    .prepare("INSERT INTO temp.query_labels VALUES(?1,?2,?3)")?;
+                for row in &labels.rows {
+                    insert.execute(params![row.key, row.label, row.count])?;
+                }
+                self.all_labels.set(Some(true));
+                return Ok(());
+            }
+        }
+        // Reserve before building. A miss, busy cache, or an oversized directory
+        // keeps the original SQL path and never changes query availability.
+        let reservation = self.catalog_cache.and_then(ModelCatalogCache::reserve);
         // This covering projection avoids reading large immutable candidate payloads. Its
         // spelling counts are global within the current routes, independent of UI filters.
         self.conn.execute("INSERT INTO temp.query_labels(model_key,label,n) SELECT e.model_key,COALESCE(e.model_display,''),COUNT(*) FROM usage_events e INDEXED BY events_model_display WHERE e.state='active' AND e.fact_kind IN('request','day','session_total') AND e.report_source IN(SELECT report_source FROM source_roots WHERE route='ledger') GROUP BY e.model_key,e.model_display ON CONFLICT(model_key,label) DO UPDATE SET n=n+excluded.n",[])?;
@@ -2948,7 +3108,75 @@ impl QueryService<'_> {
             }
         }
         self.all_labels.set(Some(true));
+        if let (Some(cache), Some(key), Some(reservation)) = (self.catalog_cache, key, reservation)
+        {
+            // Caching is optional: SQL results remain usable if allocation or
+            // cache publication fails. Build from this exact read snapshot.
+            if let Ok(Some(labels)) = self.copy_label_counts(key, reservation) {
+                if let Ok(mut slot) = cache.slot.try_lock() {
+                    *slot = Some(Arc::new(labels));
+                }
+            }
+        }
         Ok(())
+    }
+    fn copy_label_counts(
+        &self,
+        key: LabelKey,
+        mut reservation: CacheReservation,
+    ) -> QueryResult<Option<CachedLabels>> {
+        const ENTRY_LIMIT: usize = 100_000;
+        let mut rows = Vec::<LabelCount>::new();
+        let mut heap = key.heap_bytes()
+            + std::mem::size_of::<CachedLabels>()
+            + 2 * std::mem::size_of::<usize>();
+        if heap > reservation.bytes {
+            return Ok(None);
+        }
+        let mut st = self.conn.prepare("SELECT model_key,label,n,length(CAST(model_key AS BLOB)),length(CAST(label AS BLOB)) FROM temp.query_labels ORDER BY model_key,label")?;
+        let mut result = st.query([])?;
+        while let Some(row) = result.next()? {
+            let key_len = row.get::<_, i64>(3)? as usize;
+            let label_len = row.get::<_, i64>(4)? as usize;
+            let capacity = if rows.len() == rows.capacity() {
+                (rows.capacity().max(64) * 2).min(ENTRY_LIMIT)
+            } else {
+                rows.capacity()
+            };
+            if rows.len() >= ENTRY_LIMIT
+                || heap
+                    .saturating_add(key_len)
+                    .saturating_add(label_len)
+                    .saturating_add(capacity * std::mem::size_of::<LabelCount>())
+                    > reservation.bytes
+            {
+                return Ok(None);
+            }
+            if capacity > rows.capacity() && rows.try_reserve_exact(capacity - rows.len()).is_err()
+            {
+                return Ok(None);
+            }
+            let item = LabelCount {
+                key: row.get(0)?,
+                label: row.get(1)?,
+                count: row.get(2)?,
+            };
+            heap += item.key.capacity() + item.label.capacity();
+            if heap + rows.capacity() * std::mem::size_of::<LabelCount>() > reservation.bytes {
+                return Ok(None);
+            }
+            rows.push(item);
+        }
+        let bytes = heap + rows.capacity() * std::mem::size_of::<LabelCount>();
+        reservation
+            .counter
+            .fetch_sub(reservation.bytes - bytes, Ordering::AcqRel);
+        reservation.bytes = bytes;
+        Ok(Some(CachedLabels {
+            key,
+            rows,
+            _reservation: reservation,
+        }))
     }
     fn distribution(
         &self,

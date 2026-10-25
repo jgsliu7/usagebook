@@ -5,7 +5,7 @@ use usagebook_core::ledger::{
     db,
     legacy::{LegacySnapshot, LegacySourceStatus},
     maintenance::{ForgetScope, Maintenance},
-    query::QueryService,
+    query::{ModelCatalogCache, QueryService},
     query_types::*,
     types::{new_epoch, now_ms},
     Ledger, LedgerError,
@@ -94,6 +94,10 @@ impl Confirm {
 }
 #[derive(Args, Default)]
 pub struct ReportArgs {
+    // Accepted only to return the same explicit diagnostic as the shortcut.
+    // main rejects this before any report I/O; sampling is not supported.
+    #[arg(long, hide = true)]
+    pub max_files: Option<usize>,
     #[arg(long,conflicts_with_all=["days","query_file"])]
     pub from: Option<String>,
     #[arg(long,conflicts_with_all=["days","query_file"])]
@@ -276,6 +280,7 @@ pub fn load_legacy(conn: &rusqlite::Connection) -> QueryResult<LegacySnapshot> {
                             stale: true,
                             error: Some("SOURCE_READ_FAILED".into()),
                             unaccounted_rows: 0,
+                            unallocated_sessions: 0,
                         },
                     );
                 }
@@ -287,6 +292,7 @@ pub fn load_legacy(conn: &rusqlite::Connection) -> QueryResult<LegacySnapshot> {
                         stale: false,
                         error: None,
                         unaccounted_rows: 0,
+                        unallocated_sessions: 0,
                     },
                 );
             }
@@ -296,7 +302,7 @@ pub fn load_legacy(conn: &rusqlite::Connection) -> QueryResult<LegacySnapshot> {
         let roots = adapter.discover_roots();
         snapshot.observe_input_containers(source, adapter.input_containers(&roots));
         let (records, stats) = usagebook_core::common::scan_source_cached(adapter.as_ref(), &roots);
-        let normalization = snapshot.push_records(source, records, now_ms());
+        let normalization = snapshot.push_records_with_stats(source, records, &stats, now_ms());
         if let Err(error) = &normalization {
             // push_records only validates this adapter's records and commits
             // atomically. Keep DB/routing failures outside this source boundary.
@@ -311,6 +317,7 @@ pub fn load_legacy(conn: &rusqlite::Connection) -> QueryResult<LegacySnapshot> {
                     stale: true,
                     error: Some("SOURCE_READ_FAILED".into()),
                     unaccounted_rows: 0,
+                    unallocated_sessions: 0,
                 },
             );
         }
@@ -397,7 +404,8 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
         );
     }
     let snapshot = load_legacy(conn).map_err(|e| (e.to_string(), 3))?;
-    let service = QueryService::new(conn, Some(&snapshot));
+    let cache = ModelCatalogCache::default();
+    let service = QueryService::new(conn, Some(&snapshot)).with_catalog_cache(&cache);
     if let Some(path) = args.query_file {
         let bytes = read_query_file(&path).map_err(|e| (e.to_string(), 2))?;
         let request = QueryRequest::from_json(&bytes).map_err(|e| (e.to_string(), 2))?;
