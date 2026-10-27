@@ -296,8 +296,30 @@ fn scan_db(
     stats: &mut ScanStats,
 ) -> Result<bool, String> {
     let conn = crate::common::open_sqlite_readonly(db).map_err(|_| "DATABASE_OPEN")?;
+    scan_connection(&conn, db, domain, records, seen, stats)
+}
+fn scan_connection(
+    conn: &rusqlite::Connection,
+    db: &Path,
+    domain: &str,
+    records: &mut Vec<UsageRecord>,
+    seen: &mut HashSet<String>,
+    stats: &mut ScanStats,
+) -> Result<bool, String> {
     conn.execute_batch("BEGIN DEFERRED")
         .map_err(|_| "DATABASE_SNAPSHOT")?;
+    let result = scan_snapshot(conn, db, domain, records, seen, stats);
+    let _ = conn.execute_batch("ROLLBACK");
+    result
+}
+fn scan_snapshot(
+    conn: &rusqlite::Connection,
+    db: &Path,
+    domain: &str,
+    records: &mut Vec<UsageRecord>,
+    seen: &mut HashSet<String>,
+    stats: &mut ScanStats,
+) -> Result<bool, String> {
     let mut recognized = false;
     // Within one database, preserve the existing v2 > v1 > aggregate authority.
     // Old-table residue must not resurrect sessions deleted from the v2 authority.
@@ -342,7 +364,7 @@ fn scan_db(
         }
         let has_seq = v2 && columns.contains("seq");
         let fork_boundaries = if has_seq {
-            copied_prefix_boundaries(&conn, stats)
+            copied_prefix_boundaries(conn, stats)
         } else {
             HashMap::new()
         };
@@ -963,4 +985,140 @@ impl crate::model::PreparedSourceScan for DatabaseInputs {
         stats.failed |= stats.lines_bad_json > 0;
         (records, stats)
     }
+}
+
+/// Reuse the original SQL/parser against body-free saved rows. Directory-only
+/// JSON fallback discovery does not open upstream databases.
+pub(crate) fn scan_saved(
+    conn: &rusqlite::Connection,
+    roots: &[PathBuf],
+) -> (Vec<UsageRecord>, ScanStats) {
+    let mut stats = ScanStats::default();
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    let dbs = match crate::ledger::source_projection::saved_databases(conn, "opencode") {
+        Ok(d) => d,
+        Err(e) => {
+            stats.failed = true;
+            stats.notes.push(format!("opencode saved {}", e.code()));
+            return (records, stats);
+        }
+    };
+    let mut populated = HashSet::new();
+    let mut counts = HashMap::<PathBuf, usize>::new();
+    for db in &dbs {
+        if let Some(parent) = db.original_path.parent() {
+            *counts.entry(parent.into()).or_default() += 1;
+        }
+    }
+    for db in dbs {
+        let Some(domain) = db.reader_domain else {
+            stats.failed = true;
+            continue;
+        };
+        let parent = db
+            .original_path
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_path_buf();
+        if db
+            .original_path
+            .file_name()
+            .is_some_and(|n| n == "opencode-next.db")
+            && counts.get(&parent).copied().unwrap_or(0) > 1
+        {
+            stats.failed = true;
+            continue;
+        }
+        stats.files_seen += 1;
+        match scan_connection(
+            &db.connection,
+            &db.original_path,
+            &domain,
+            &mut records,
+            &mut seen,
+            &mut stats,
+        ) {
+            Ok(true) => {
+                populated.insert(parent);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                stats.failed = true;
+                stats.notes.push(format!("opencode saved {e}"));
+            }
+        }
+    }
+    if stats.failed {
+        return (records, stats);
+    }
+    let fallback_roots = roots
+        .iter()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .filter(|root| !populated.contains(root))
+        .collect::<Vec<_>>();
+    let (more, other) = crate::common::scan_source_cached(&SavedJsonFallback, &fallback_roots);
+    records.extend(more);
+    stats.files_seen += other.files_seen;
+    stats.files_parsed += other.files_parsed;
+    stats.lines_total += other.lines_total;
+    stats.lines_bad_json += other.lines_bad_json;
+    stats.lines_unknown_type += other.lines_unknown_type;
+    stats.failed |= other.failed;
+    stats.notes.extend(other.notes);
+    (records, stats)
+}
+
+// Keep the existing source cache and deletion domain; only fallback discovery is
+// specialized so the background saved reader never probes an upstream database.
+struct SavedJsonFallback;
+impl UsageSource for SavedJsonFallback {
+    fn id(&self) -> &'static str {
+        "opencode"
+    }
+    fn discover_roots(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+    fn prepare_scan(&self, roots: &[PathBuf]) -> Option<Box<dyn crate::model::PreparedSourceScan>> {
+        Some(Box::new(saved_json_inputs(roots)))
+    }
+    fn scan_roots(&self, roots: &[PathBuf], _: Option<usize>) -> (Vec<UsageRecord>, ScanStats) {
+        use crate::model::PreparedSourceScan;
+        saved_json_inputs(roots).scan()
+    }
+}
+fn saved_json_inputs(roots: &[PathBuf]) -> DatabaseInputs {
+    let mut input = DatabaseInputs {
+        roots: Vec::new(),
+        blocked: HashSet::new(),
+        fingerprint: Vec::new(),
+        stats: ScanStats::default(),
+    };
+    for root in roots {
+        input
+            .fingerprint
+            .push((root.clone(), crate::common::FileStamp::membership()));
+        let directory = root.join("storage/message");
+        let _ = crate::common::take_walk_error();
+        let json = if directory.is_dir() {
+            walk_with(&directory, None, &|p| {
+                p.extension().is_some_and(|e| e == "json")
+            })
+        } else {
+            Vec::new()
+        };
+        if crate::common::take_walk_error() {
+            input.failure("JSON_DISCOVERY");
+        }
+        for path in &json {
+            input.stamp(path);
+        }
+        input.roots.push(RootInput {
+            databases: Vec::new(),
+            json,
+            json_selected: true,
+            incomplete: false,
+        });
+    }
+    input
 }

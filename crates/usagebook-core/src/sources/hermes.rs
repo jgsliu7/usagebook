@@ -189,6 +189,16 @@ const COLUMNS: [&str; 15] = [
 ];
 fn read_database(db: &Path, domain: &str, stats: &mut ScanStats) -> Result<Vec<UsageRecord>, ()> {
     let conn = crate::common::open_sqlite_readonly(db).map_err(|_| ())?;
+    read_connection(&conn, db, domain, stats)
+}
+fn read_connection(
+    conn: &rusqlite::Connection,
+    db: &Path,
+    domain: &str,
+    stats: &mut ScanStats,
+) -> Result<Vec<UsageRecord>, ()> {
+    #[cfg(not(feature = "regression-hooks"))]
+    let _ = db;
     conn.execute_batch("BEGIN DEFERRED").map_err(|_| ())?;
     let exists: bool = conn
         .query_row(
@@ -484,4 +494,32 @@ impl UsageSource for HermesSource {
     ) -> (Vec<UsageRecord>, ScanStats) {
         Inputs::discover(roots).scan()
     }
+}
+
+/// Run the unchanged sessions/chain reader over the saved white-listed tables.
+/// File identity was captured by the collector; this function never stats or
+/// opens the original source database.
+pub fn scan_saved(conn: &rusqlite::Connection) -> (Vec<UsageRecord>, ScanStats) {
+    let mut stats = ScanStats::default();
+    let mut records = Vec::new();
+    match crate::ledger::source_projection::saved_databases(conn, "hermes") {
+        Ok(databases) => {
+            for db in databases {
+                stats.files_seen += 1;
+                let Some(domain) = db.reader_domain.as_deref() else {
+                    failure(&mut stats, "已保存数据库缺少来源身份");
+                    continue;
+                };
+                match read_connection(&db.connection, &db.original_path, domain, &mut stats) {
+                    Ok(rows) => {
+                        stats.files_parsed += 1;
+                        records.extend(rows);
+                    }
+                    Err(()) => failure(&mut stats, "已保存数据库读取失败"),
+                }
+            }
+        }
+        Err(_) => failure(&mut stats, "已保存数据库尚未完整"),
+    }
+    (records, stats)
 }

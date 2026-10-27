@@ -50,6 +50,15 @@ fn scan_ide_db(
     }
     let _ = conn.pragma_update(None, "query_only", true);
 
+    scan_ide_connection(db, &conn, records, seen, stats);
+}
+fn scan_ide_connection(
+    db: &std::path::Path,
+    conn: &rusqlite::Connection,
+    records: &mut Vec<UsageRecord>,
+    seen: &mut HashSet<String>,
+    stats: &mut ScanStats,
+) {
     let has_table = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='chat_message'",
@@ -279,4 +288,33 @@ impl UsageSource for QoderSource {
         }
         (records, stats)
     }
+}
+
+/// Preserve the CLI JSONL fallback, while IDE rows come solely from SQLite's
+/// saved source projection. Callers pass directory roots for the CLI channel.
+pub fn scan_saved(
+    conn: &rusqlite::Connection,
+    json_roots: &[PathBuf],
+) -> (Vec<UsageRecord>, ScanStats) {
+    let (mut records, mut stats) = crate::common::scan_source_cached(&QoderSource, json_roots);
+    let mut seen: HashSet<String> = records.iter().map(|row| row.dedup_key.clone()).collect();
+    match crate::ledger::source_projection::saved_databases(conn, "qoder") {
+        Ok(databases) => {
+            for db in databases {
+                stats.files_seen += 1;
+                scan_ide_connection(
+                    &db.original_path,
+                    &db.connection,
+                    &mut records,
+                    &mut seen,
+                    &mut stats,
+                );
+            }
+        }
+        Err(_) => {
+            stats.failed = true;
+            stats.notes.push("Qoder 已保存数据库尚未完整".into());
+        }
+    }
+    (records, stats)
 }

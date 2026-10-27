@@ -124,7 +124,7 @@ struct CatalogModel {
     label: String,
     color_index: usize,
 }
-const FACT_COLUMNS:&str="o.observation_id,o.identity_family,o.namespace_key,e.identity_key,o.fact_kind,o.report_source,o.native_tool,o.model_key,o.model_display,o.session_key,o.occurred_ms,o.native_date,o.native_timezone,o.day_start_ms,o.day_end_ms,o.input_uncached,o.cache_read,o.cache_write,o.output_normal,o.output_reasoning,o.input_total,o.output_total,o.total_tokens,o.cache_write_1h,o.request_count,o.cost_state,o.cost_units,o.cost_scale,o.cost_currency";
+const FACT_COLUMNS:&str="o.observation_id,o.identity_family,o.namespace_key,e.identity_key,o.fact_kind,o.report_source,o.native_tool,o.model_key,o.model_display,o.session_key,o.occurred_ms,o.native_date,o.native_timezone,o.day_start_ms,o.day_end_ms,o.input_uncached,o.cache_read,o.cache_write,o.output_normal,o.output_reasoning,o.input_total,o.output_total,o.total_tokens,o.cache_write_1h,o.request_count,o.cost_state,o.cost_units,o.cost_scale,o.cost_currency,o.parser_version='reported-history-v1'";
 
 pub struct QueryService<'a> {
     conn: &'a Connection,
@@ -133,19 +133,21 @@ pub struct QueryService<'a> {
     all_labels: std::cell::Cell<Option<bool>>,
     catalog_cache: Option<&'a ModelCatalogCache>,
     label_key: std::cell::RefCell<Option<LabelKey>>,
+    live_state: std::cell::RefCell<Option<super::read_model::State>>,
+    live_facts: std::cell::RefCell<Option<Vec<super::read_model::LiveFact>>>,
 }
-#[derive(Clone)]
-struct Fact {
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct Fact {
     id: i64,
     family: String,
     namespace: String,
     key: String,
-    kind: String,
-    source: String,
+    pub(super) kind: String,
+    pub(super) source: String,
     native: String,
-    model: String,
+    pub(super) model: String,
     session: Option<String>,
-    time: Option<i64>,
+    pub(super) time: Option<i64>,
     date: Option<String>,
     timezone: Option<String>,
     start: Option<i64>,
@@ -156,7 +158,9 @@ struct Fact {
     cost_scale: Option<i64>,
     currency: Option<String>,
     live: bool,
+    reported: bool,
     known_fields: u16,
+    #[serde(skip)]
     summary: Option<[Cell; 10]>,
 }
 impl Fact {
@@ -187,6 +191,7 @@ impl Fact {
             cost_scale: r.get(27)?,
             currency: r.get(28)?,
             live: false,
+            reported: r.get(29)?,
             known_fields: 1023,
             summary: None,
         })
@@ -244,6 +249,7 @@ struct Aggregate {
     excluded: i64,
     costs: BTreeMap<String, (i128, u32, i64)>,
     cost_unknown: i64,
+    reported_cost: bool,
     session_costs: Vec<Value>,
 }
 impl Aggregate {
@@ -258,9 +264,9 @@ impl Aggregate {
         }
         let mut vals =
             evaluate(&f.metrics).map_err(|e| QueryError::new(e.code(), e.to_string()))?;
-        if f.live {
+        if f.live || f.reported {
             for (i, v) in vals.iter_mut().enumerate() {
-                if f.known_fields & (1 << i) == 0 && v.known_value.is_some() {
+                if (f.reported || f.known_fields & (1 << i) == 0) && v.known_value.is_some() {
                     v.state = ValueState::Partial;
                 }
             }
@@ -276,6 +282,7 @@ impl Aggregate {
     }
     fn add(&mut self, f: &Fact) -> QueryResult<()> {
         self.add_usage(f)?;
+        self.reported_cost |= f.reported;
         if f.summary.is_some() {
             return Ok(());
         }
@@ -321,7 +328,7 @@ impl Aggregate {
         } else {
             json!({"state":"partial","known_value":(self.sessions.len() as i64+self.ledger_sessions).to_string()})
         };
-        let mut costs:Vec<Value>=self.costs.iter().map(|(c,(units,scale,_))|json!({"kind":"reported_request","currency":c,"amount":decimal(*units,*scale),"state":if self.cost_unknown==0&&!self.live{"exact"}else{"partial"},"scope":"filtered","reason":null,"pricing_version":null})).collect();
+        let mut costs:Vec<Value>=self.costs.iter().map(|(c,(units,scale,_))|json!({"kind":"reported_request","currency":c,"amount":decimal(*units,*scale),"state":if self.cost_unknown==0&&!self.live&&!self.reported_cost{"exact"}else{"partial"},"scope":"filtered","reason":null,"pricing_version":null})).collect();
         costs.extend(self.session_costs.iter().cloned());
         json!({"metrics":metrics,"sessions":sessions,"costs":costs,"coverage":{"protection":match(self.ledger,self.live){(true,true)=>"mixed",(true,false)=>"ledger",_=>"unprotected"},"grain":match(self.requests,self.days){(true,true)=>"mixed",(true,false)=>"request",(false,true)=>"day",_=>"none"},"undated_count":"0","excluded_day_count":self.excluded.to_string(),"incomplete_sources":[]}})
     }
@@ -503,12 +510,26 @@ impl Cursor {
 }
 // Query selectors are sorted by snapshot/load_selectors before execution.
 fn allows_normalized(selector: &Selector, id: &str) -> bool {
+    if id == "m1:u"
+        && matches!(selector,Selector::Exclude{ids} if !ids.is_empty())
+        && !selector.ids().iter().any(|v| v == id)
+    {
+        return false;
+    }
+    allows_sorted(selector, id)
+}
+// Selectors are normalized before any query. Keep the legacy plain-membership
+// behavior at call sites that intentionally do not apply unknown-model policy.
+fn allows_sorted(selector: &Selector, id: &str) -> bool {
     match selector {
         Selector::All => true,
         Selector::Include { ids } => ids.binary_search_by(|v| v.as_str().cmp(id)).is_ok(),
-        Selector::Exclude { ids } => ids.binary_search_by(|v| v.as_str().cmp(id)).is_err(),
+        Selector::Exclude { ids } | Selector::ExcludeExact { ids } => {
+            ids.binary_search_by(|v| v.as_str().cmp(id)).is_err()
+        }
     }
 }
+#[derive(Clone)]
 struct Context {
     stamp: Stamp,
     tz: Tz,
@@ -554,6 +575,8 @@ impl<'a> QueryService<'a> {
             all_labels: std::cell::Cell::new(None),
             catalog_cache: None,
             label_key: std::cell::RefCell::new(None),
+            live_state: std::cell::RefCell::new(None),
+            live_facts: std::cell::RefCell::new(None),
         }
     }
     pub fn with_catalog_cache(mut self, cache: &'a ModelCatalogCache) -> Self {
@@ -587,6 +610,8 @@ impl<'a> QueryService<'a> {
         self.model_labels.borrow_mut().clear();
         self.all_labels.set(None);
         *self.label_key.borrow_mut() = None;
+        *self.live_facts.borrow_mut() = None;
+        *self.live_state.borrow_mut() = None;
         self.conn.create_scalar_function(
             "usagebook_local_day",
             2,
@@ -627,6 +652,15 @@ impl<'a> QueryService<'a> {
             }
             stamp.legacy_generation = Some(l.generation.clone());
         }
+        let persisted = if let Some(legacy) = self.legacy {
+            Some(super::read_model::State::from_snapshot(legacy))
+        } else {
+            super::read_model::state(self.conn)?
+        };
+        if let Some(state) = &persisted {
+            stamp.legacy_generation = Some(state.generation.clone());
+        }
+        *self.live_state.borrow_mut() = persisted;
         let tz = stamp
             .report_timezone
             .parse()
@@ -647,9 +681,37 @@ impl<'a> QueryService<'a> {
         });
         Ok((guard, ctx))
     }
+    fn live_facts(&self) -> QueryResult<std::cell::Ref<'_, Vec<super::read_model::LiveFact>>> {
+        if self.live_facts.borrow().is_none() {
+            let rows = if let Some(snapshot) = self.legacy {
+                let routes = self.source_routes()?;
+                snapshot
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        !routes
+                            .get(entry.report_source())
+                            .is_some_and(|route| route == "ledger")
+                    })
+                    .map(super::read_model::LiveFact::from_entry)
+                    .collect::<QueryResult<Vec<_>>>()?
+            } else {
+                super::read_model::facts(self.conn)?
+            };
+            *self.live_facts.borrow_mut() = Some(rows);
+        }
+        Ok(std::cell::Ref::map(self.live_facts.borrow(), |rows| {
+            rows.as_ref().unwrap()
+        }))
+    }
     fn load_selectors(&self, sources: &mut Selector, models: &mut Selector) -> QueryResult<()> {
+        if matches!(&*sources, Selector::ExcludeExact { .. }) {
+            return Err(QueryError::invalid(
+                "exclude_exact is only supported for models",
+            ));
+        }
         sources.normalize(128, 256)?;
-        models.normalize(10000, 1400)?;
+        models.normalize(MAX_MODEL_SELECTOR_IDS, 1400)?;
         let mut insert = self
             .conn
             .prepare("INSERT INTO query_sources(id) VALUES(?)")?;
@@ -681,15 +743,8 @@ impl<'a> QueryService<'a> {
             let mut unknown: BTreeSet<String> = st
                 .query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
-            if let Some(l) = self.legacy {
-                for e in &l.entries {
-                    let key = match e {
-                        LegacyEntry::Request { record, .. }
-                        | LegacyEntry::SessionTotal { record, .. } => model_key(&record.model),
-                        LegacyEntry::Day(d) => d.model_key.clone(),
-                    };
-                    unknown.remove(&key);
-                }
+            for row in self.live_facts()?.iter() {
+                unknown.remove(&row.fact.model);
             }
             if !unknown.is_empty() {
                 ctx.warnings
@@ -738,6 +793,16 @@ impl<'a> QueryService<'a> {
                 format!("EXISTS(SELECT 1 FROM temp.{table} s WHERE s.id={column})")
             }
             Selector::Exclude { .. } => {
+                if table == "query_models"
+                    && !selector.ids().is_empty()
+                    && !selector.ids().iter().any(|id| id == "m1:u")
+                {
+                    format!("{column}<>'' AND NOT EXISTS(SELECT 1 FROM temp.{table} s WHERE s.id={column})")
+                } else {
+                    format!("NOT EXISTS(SELECT 1 FROM temp.{table} s WHERE s.id={column})")
+                }
+            }
+            Selector::ExcludeExact { .. } => {
                 format!("NOT EXISTS(SELECT 1 FROM temp.{table} s WHERE s.id={column})")
             }
         }
@@ -851,6 +916,7 @@ impl<'a> QueryService<'a> {
                         cost_scale: None,
                         currency: None,
                         live: false,
+                        reported: false,
                         known_fields: 1023,
                         summary: Some(cells),
                     },
@@ -877,49 +943,35 @@ impl<'a> QueryService<'a> {
             callback(f, usable)?;
             ctx.budget()?;
         }
-        if let Some(legacy) = self.legacy {
-            for e in &legacy.entries {
-                seen += 1;
-                if seen % 512 == 0 {
-                    ctx.budget()?;
+        for row in self.live_facts()?.iter() {
+            seen += 1;
+            if seen % 512 == 0 {
+                ctx.budget()?;
+            }
+            let f = &row.fact;
+            if !allows_normalized(&q.sources, &f.source)
+                || !allows_normalized(&q.models, &model_id(&f.model))
+            {
+                continue;
+            }
+            if f.kind == "request" {
+                if f.time.is_some_and(|t| t >= start && t < end) {
+                    callback(f.clone(), true)?;
                 }
-                let (source, model) = match e {
-                    LegacyEntry::Request { record, .. }
-                    | LegacyEntry::SessionTotal { record, .. } => (
-                        record.source,
-                        std::borrow::Cow::Owned(model_key(&record.model)),
-                    ),
-                    LegacyEntry::Day(day) => (
-                        day.report_source.as_str(),
-                        std::borrow::Cow::Borrowed(day.model_key.as_str()),
-                    ),
-                };
-                if routes.get(source).is_some_and(|r| r == "ledger")
-                    || !allows_normalized(&q.sources, source)
-                    || !allows_normalized(&q.models, &model_id(&model))
-                {
+            } else if f.kind == "day" {
+                if self.day_covered(f, &routes)? {
                     continue;
                 }
-                let f = legacy_fact(e)?;
-                if f.kind == "request" {
-                    if f.time.is_some_and(|t| t >= start && t < end) {
-                        callback(f, true)?;
+                let relevant = match (f.start, f.end) {
+                    (Some(s), Some(e)) => e > start && s < end,
+                    _ => true,
+                };
+                if relevant {
+                    let usable = self.day_usable(f, start, end, ctx)?;
+                    if !usable {
+                        ctx.excluded_days.set(true);
                     }
-                } else if f.kind == "day" {
-                    if self.day_covered(&f, &routes)? {
-                        continue;
-                    }
-                    let relevant = match (f.start, f.end) {
-                        (Some(s), Some(e)) => e > start && s < end,
-                        _ => true,
-                    };
-                    if relevant {
-                        let usable = self.day_usable(&f, start, end, ctx)?;
-                        if !usable {
-                            ctx.excluded_days.set(true);
-                        }
-                        callback(f, usable)?;
-                    }
+                    callback(f.clone(), usable)?;
                 }
             }
         }
@@ -937,21 +989,98 @@ impl<'a> QueryService<'a> {
         {
             return Ok(false);
         }
+        if !f.live {
+            return Ok(true);
+        }
         let d = local_date(ctx.tz, s)?;
         let next = d
             .succ_opt()
             .ok_or_else(|| QueryError::invalid("day overflow"))?;
         Ok(midnight(ctx.tz, d)? == s && midnight(ctx.tz, next)? == e)
     }
-    fn day_covered(&self, f: &Fact, routes: &BTreeMap<String, String>) -> QueryResult<bool> {
+    fn adopted_quality(&self, q: &Query, ctx: &Context) -> QueryResult<Value> {
+        let (a, b) = bounds(&q.window, ctx.tz)?;
+        let b = b.min(ctx.asof.saturating_add(1));
+        let sc = Self::condition(&q.sources, "e.report_source", "query_sources");
+        let mc = Self::condition(&q.models, "e.model_key", "query_models");
+        let sql=format!("SELECT {FACT_COLUMNS} FROM adoption_items i JOIN adoption_policies p USING(policy_id) JOIN usage_events e ON e.selected_observation_id=i.selected_observation_id JOIN usage_observations o ON o.observation_id=i.selected_observation_id WHERE p.status='active' AND e.state='active' AND {sc} AND {mc}");
+        let mut st = self.conn.prepare(&sql)?;
+        let mut rows = st.query([])?;
+        let mut total = Aggregate::default();
+        let mut requests = 0i64;
+        let mut day_count = Cell::default();
+        while let Some(row) = rows.next()? {
+            let f = Fact::from_row(row)?;
+            let matches = if f.kind == "day" {
+                self.day_usable(&f, a, b, ctx)?
+            } else {
+                f.time.is_some_and(|t| t >= a && t < b)
+            };
+            if matches {
+                total.add_usage(&f)?;
+                if f.kind == "request" {
+                    requests = add(requests, 1)?;
+                } else {
+                    day_count.add(
+                        &evaluate(&f.metrics)
+                            .map_err(|e| QueryError::new(e.code(), e.to_string()))?[9],
+                    )?;
+                }
+            }
+            ctx.budget()?;
+        }
+        Ok(
+            json!({"source_reported_total":total.cells[7].value(),"source_reported_requests":requests.to_string(),"aggregate_reported_count":day_count.value(),"historical_finality":"not_verified"}),
+        )
+    }
+    fn membership_unknown(&self, q: &Query, ctx: &Context) -> QueryResult<Value> {
+        let model_unknown = matches!(&q.models,Selector::Exclude{ids} if !ids.is_empty() && !ids.iter().any(|id|id=="m1:u"));
+        let mut probe = q.clone();
+        if model_unknown {
+            probe.models = Selector::All;
+        }
+        let mut uncertain = Aggregate::default();
+        let mut records = 0i64;
+        if model_unknown || ctx.excluded_days.get() {
+            self.visit(&probe, ctx, true, |f, usable| {
+                let unknown_model = model_unknown && f.model.is_empty();
+                let selected_model = allows_normalized(&q.models, &model_id(&f.model));
+                if unknown_model || !usable && selected_model {
+                    uncertain.add_usage(&f)?;
+                    records = add(records, f.summary.as_ref().map_or(1, |v| v[7].count))?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(
+            json!({"records":records.to_string(),"potential_metrics":uncertain.bundle()["metrics"],"included_in_total":false}),
+        )
+    }
+    fn day_aligned(&self, f: &Fact, ctx: &Context) -> QueryResult<bool> {
+        if f.kind != "day" {
+            return Ok(true);
+        }
+        let (Some(a), Some(b)) = (f.start, f.end) else {
+            return Ok(false);
+        };
+        let day = local_date(ctx.tz, a)?;
+        let next = day
+            .succ_opt()
+            .ok_or_else(|| QueryError::invalid("day overflow"))?;
+        Ok(a >= midnight(ctx.tz, day)? && b <= midnight(ctx.tz, next)? && b > a)
+    }
+    fn day_covered(&self, f: &Fact, _routes: &BTreeMap<String, String>) -> QueryResult<bool> {
         let (Some(start), Some(end)) = (f.start, f.end) else {
             return Ok(false);
         };
         if f.namespace.is_empty() {
             return Ok(false);
         }
+        let owned = !f.live
+            && super::coverage::owns_day(self.conn, &f.family, &f.namespace, &f.key)
+                .map_err(|e| QueryError::new(e.code(), e.to_string()))?;
         let native:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM usage_events e WHERE e.state='active' AND e.fact_kind='request' AND e.native_tool=? AND e.namespace_key=? AND e.occurred_ms>=? AND e.occurred_ms<? AND EXISTS(SELECT 1 FROM source_roots r WHERE r.report_source=e.report_source AND r.route='ledger'))",params![f.native,f.namespace,start,end],|r|r.get(0))?;
-        if native {
+        if native && !owned {
             return Ok(true);
         }
         // A source rule protects that provider. Cross-provider backfill is protected only
@@ -960,24 +1089,15 @@ impl<'a> QueryService<'a> {
         if suppressed {
             return Ok(true);
         }
-        if let Some(l) = self.legacy {
-            for e in &l.entries {
-                if let LegacyEntry::Request {
-                    record,
-                    native_tool,
-                    namespace,
-                    ..
-                } = e
-                {
-                    if !routes.get(record.source).is_some_and(|r| r == "ledger")
-                        && native_tool == &f.native
-                        && namespace.as_deref() == Some(f.namespace.as_str())
-                        && record.ts_ms >= start
-                        && record.ts_ms < end
-                    {
-                        return Ok(true);
-                    }
-                }
+        for row in self.live_facts()?.iter() {
+            let request = &row.fact;
+            if !owned
+                && request.kind == "request"
+                && request.native == f.native
+                && request.namespace == f.namespace
+                && request.time.is_some_and(|time| time >= start && time < end)
+            {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -988,6 +1108,8 @@ impl<'a> QueryService<'a> {
     }
     fn status_inner(&self, ctx: &Context) -> QueryResult<Status> {
         let mut sources = Vec::new();
+        let imports = super::durable::import_status(self.conn)
+            .map_err(|e| QueryError::new(e.code(), e.to_string()))?;
         let mut last_saved = None::<i64>;
         let routes = self.source_routes()?;
         let mut saved_counts = BTreeMap::<String, (i64, Option<i64>)>::new();
@@ -995,6 +1117,24 @@ impl<'a> QueryService<'a> {
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
             saved_counts.insert(r.get(0)?, (r.get(1)?, r.get(2)?));
+        }
+        drop(rows);
+        drop(st);
+        let mut pending_candidates = BTreeMap::<String, i64>::new();
+        let mut st=self.conn.prepare("WITH adopted AS MATERIALIZED(SELECT DISTINCT ai.source_observation_id FROM adoption_items ai JOIN adoption_policies ap USING(policy_id) WHERE ap.status='active') SELECT o.report_source,COUNT(*) FROM usage_observations o LEFT JOIN adopted ai ON ai.source_observation_id=o.observation_id LEFT JOIN identity_alias a ON a.identity_family=o.identity_family AND a.namespace_key=o.namespace_key AND a.alias_key=o.identity_key LEFT JOIN usage_events e ON e.identity_family=o.identity_family AND e.namespace_key=o.namespace_key AND e.identity_key=COALESCE(a.canonical_key,o.identity_key) AND e.state='active' WHERE o.eligibility<>'identity_only' AND ai.source_observation_id IS NULL AND e.identity_key IS NULL GROUP BY o.report_source")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            pending_candidates.insert(r.get(0)?, r.get(1)?);
+        }
+        drop(rows);
+        drop(st);
+        let mut confirmed_events = BTreeMap::<String, i64>::new();
+        let mut reported_events = BTreeMap::<String, i64>::new();
+        let mut st=self.conn.prepare("SELECT e.report_source,SUM(o.parser_version<>'reported-history-v1'),SUM(o.parser_version='reported-history-v1') FROM usage_events e JOIN usage_observations o ON o.observation_id=e.selected_observation_id WHERE e.state='active' GROUP BY e.report_source")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            confirmed_events.insert(r.get(0)?, r.get(1)?);
+            reported_events.insert(r.get(0)?, r.get(2)?);
         }
         drop(rows);
         drop(st);
@@ -1016,7 +1156,7 @@ impl<'a> QueryService<'a> {
         drop(st);
         for info in crate::SOURCE_CATALOG {
             if routes.get(info.id).is_some_and(|r| r == "ledger") {
-                let(root_count,enabled,root_errors,unenumerated,retry,error):(i64,i64,i64,i64,Option<i64>,Option<String>)=self.conn.query_row("SELECT COUNT(*),COALESCE(SUM(enabled),0),COALESCE(SUM(error_code IS NOT NULL),0),COALESCE(SUM(enumeration_done=0),0),MIN(retry_after_ms),MAX(error_code) FROM source_roots WHERE report_source=?",[info.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+                let(root_count,enabled,root_errors,unenumerated,retry,error):(i64,i64,i64,i64,Option<i64>,Option<String>)=self.conn.query_row("SELECT COUNT(*),COALESCE(SUM(enabled),0),COALESCE(SUM(error_code IS NOT NULL),0),COALESCE(SUM(enumeration_done=0),0),MIN(retry_after_ms),MAX(error_code) FROM source_roots WHERE report_source=? AND collector_key<>'reported-history-v1'",[info.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
                 let(isolated,incomplete,blocked,objretry,audit,objerror):(i64,i64,i64,Option<i64>,Option<i64>,Option<String>)=self.conn.query_row("SELECT COALESCE(SUM(o.state IN('missing','error','replay_required')),0),COALESCE(SUM(o.target_done=0),0),COALESCE(SUM(o.error_code IN('IdentityLinkNeedsReview','IDENTITY_LINK_NEEDS_REVIEW')),0),MIN(o.retry_after_ms),MIN(o.audit_completed_ms),MAX(o.error_code) FROM source_objects o JOIN source_roots r USING(root_id) WHERE r.report_source=?",[info.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
                 let (saved, saved_at) = saved_counts.get(info.id).copied().unwrap_or((0, None));
                 let (conflict, pending) = unresolved.get(info.id).copied().unwrap_or((0, 0));
@@ -1041,32 +1181,87 @@ impl<'a> QueryService<'a> {
                 };
                 sources.push(json!({"id":info.id,"route":"ledger","state":state,"pending_identities":pending.to_string(),"conflicted_identities":conflict.to_string(),"saved_candidates":saved.to_string(),"identity_link_blocked_objects":blocked.to_string(),"source_readable":root_errors+isolated==0,"isolated_objects":isolated.to_string(),"failed_roots":root_errors.to_string(),"incomplete_objects":incomplete.to_string(),"next_retry_at_ms":retry.map(|n|n.to_string()),"last_published_at_ms":last_pub.map(|n|n.to_string()),"publishing":publishing,"audit_last_completed_ms":audit.map(|n|n.to_string()),"audit_overdue":overdue,"last_saved_at_ms":saved_at.map(|n|n.to_string()),"error":error.or(objerror)}));
             } else {
-                let state = self.legacy.and_then(|l| l.sources.get(info.id));
-                sources.push(json!({"id":info.id,"route":"live","state":if state.is_some_and(|s|s.error.as_deref()==Some("LOADING")){"collecting"}else if state.is_some_and(|s|s.stale){"stale"}else if state.is_some_and(|s|s.error.is_some()){"error"}else if state.is_some(){"ready"}else{"collecting"},"pending_identities":"0","conflicted_identities":"0","saved_candidates":"0","identity_link_blocked_objects":"0","source_readable":state.is_some_and(|s|s.error.is_none()),"isolated_objects":"0","failed_roots":"0","incomplete_objects":"0","next_retry_at_ms":null,"last_published_at_ms":null,"publishing":false,"audit_last_completed_ms":null,"audit_overdue":false,"last_saved_at_ms":state.and_then(|s|s.last_scanned_ms).map(|n|n.to_string()),"error":state.and_then(|s|s.error.clone())}));
+                let state = self
+                    .live_state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|l| l.sources.get(info.id))
+                    .cloned();
+                sources.push(json!({"id":info.id,"route":"live","state":if state.as_ref().is_some_and(|s|s.error.as_deref()==Some("LOADING")){"collecting"}else if state.as_ref().is_some_and(|s|s.stale){"stale"}else if state.as_ref().is_some_and(|s|s.error.is_some()){"error"}else if state.is_some(){"ready"}else{"collecting"},"pending_identities":"0","conflicted_identities":"0","saved_candidates":"0","identity_link_blocked_objects":"0","source_readable":state.as_ref().is_some_and(|s|s.error.is_none()),"isolated_objects":"0","failed_roots":"0","incomplete_objects":"0","next_retry_at_ms":null,"last_published_at_ms":null,"publishing":false,"audit_last_completed_ms":null,"audit_overdue":false,"last_saved_at_ms":state.as_ref().and_then(|s|s.last_scanned_ms).map(|n|n.to_string()),"error":state.as_ref().and_then(|s|s.error.clone())}));
             }
         }
         for source in &mut sources {
             let id = source["id"].as_str().unwrap_or_default().to_owned();
             let durable = source["route"] == "ledger";
-            let live = self.legacy.and_then(|l| l.sources.get(&id));
+            let live = self
+                .live_state
+                .borrow()
+                .as_ref()
+                .and_then(|l| l.sources.get(&id))
+                .cloned();
+            let (saved, saved_at) = saved_counts.get(&id).copied().unwrap_or((0, None));
+            let jobs: Vec<_> = imports.iter().filter(|job| job.source == id).collect();
+            source["initial_import"] = json!({
+                "discovered": !jobs.is_empty(),
+                "enumeration_done": !jobs.is_empty() && jobs.iter().all(|j|j.enumeration_done),
+                "initial_pass_finished": !jobs.is_empty() && jobs.iter().all(|j|j.initial_pass_finished),
+                "target_objects": jobs.iter().map(|j|j.target_objects).sum::<i64>().to_string(),
+                "saved_objects": jobs.iter().map(|j|j.saved_objects).sum::<i64>().to_string(),
+                "gap_objects": jobs.iter().map(|j|j.gap_objects).sum::<i64>().to_string(),
+                "remaining_objects": jobs.iter().map(|j|j.remaining_objects).sum::<i64>().to_string(),
+                "saved_observation_id": jobs.iter().map(|j|j.saved_observation_id).max().unwrap_or(0).to_string(),
+                "published_observation_id": jobs.iter().map(|j|j.published_observation_id).max().unwrap_or(0).to_string()
+            });
+            source["saved_candidates"] = json!(saved.to_string());
+            source["saved_pending_candidates"] = json!(pending_candidates
+                .get(&id)
+                .copied()
+                .unwrap_or(0)
+                .to_string());
+            source["confirmed_events"] =
+                json!(confirmed_events.get(&id).copied().unwrap_or(0).to_string());
+            source["verified_events"] = source["confirmed_events"].clone();
+            source["source_reported_events"] =
+                json!(reported_events.get(&id).copied().unwrap_or(0).to_string());
+            source["adopted_events"] = json!((confirmed_events.get(&id).copied().unwrap_or(0)
+                + reported_events.get(&id).copied().unwrap_or(0))
+            .to_string());
+            if saved_at.is_some() {
+                source["last_saved_at_ms"] = json!(saved_at.map(|n| n.to_string()));
+                last_saved = last_saved.into_iter().chain(saved_at).max();
+            }
             source["durable_supported"] =
                 json!(super::DURABLE_SUPPORTED_SOURCES.contains(&id.as_str()));
-            source["history_protection"] = json!(if durable { "durable" } else { "unprotected" });
+            source["evidence_supported"] =
+                json!(super::DURABLE_EVIDENCE_SOURCES.contains(&id.as_str()));
+            source["history_protection"] = json!(if durable {
+                "durable"
+            } else if saved > 0 {
+                "evidence_saved"
+            } else {
+                "unprotected"
+            });
             source["last_scanned_at_ms"] = json!(if durable {
                 None
             } else {
-                live.and_then(|s| s.last_scanned_ms).map(|n| n.to_string())
+                live.as_ref()
+                    .and_then(|s| s.last_scanned_ms)
+                    .map(|n| n.to_string())
             });
             if id == "goose" && !durable {
-                let count = live.map_or(0, |s| s.unallocated_sessions);
+                let count = live.as_ref().map_or(0, |s| s.unallocated_sessions);
                 source["accounting"] = json!({
                     "state": if count > 0 { "partial" } else { "complete" },
                     "unallocated_sessions": count.to_string(),
                     "reason": if count > 0 { Some("SESSION_USAGE_UNALLOCATED") } else { None }
                 });
             }
-            if id == "ccswitch-rollup" && !durable {
-                let count = live.map_or(0, |s| s.unaccounted_rows);
+            if id == "ccswitch-rollup" {
+                let count = if durable {
+                    pending_candidates.get(&id).copied().unwrap_or(0) as u64
+                } else {
+                    live.as_ref().map_or(0, |s| s.unaccounted_rows) as u64
+                };
                 source["accounting"] = json!({
                     "state":if count > 0 {"not_included"} else {"no_evidence"},
                     "unaccounted_rows":count.to_string(),
@@ -1074,24 +1269,85 @@ impl<'a> QueryService<'a> {
                 });
             }
         }
+        let runtime = super::collection::runtime_status(self.conn)
+            .map_err(|e| QueryError::new(e.code(), e.to_string()))?;
+        // Repair progress belongs to the status endpoint. Ordinary chart
+        // coverage reads must not count all historical repair candidates.
+        let time_repair = super::time_repair::status(self.conn)
+            .map_err(|e| QueryError::new(e.code(), e.to_string()))?;
+        for source in &mut sources {
+            let id = source["id"].as_str().unwrap_or_default().to_owned();
+            let phases = &runtime["sources"][&id];
+            source["persistence"] = phases.clone();
+            source["migration"] = runtime["reconciliation"][&id].clone();
+            source["continuation"] = runtime["continuation"][&id].clone();
+            if let Some(error) = runtime["continuation"][&id]["error"].as_str() {
+                source["error"] = json!(error);
+                source["state"] = json!("publish_error");
+            } else if runtime["continuation"][&id]["state"] == "recovery_unverified" {
+                source["error"] = json!("RECOVERY_UNVERIFIED");
+                source["state"] = json!("recovery_unverified");
+            }
+            for (stage, state) in [
+                ("save", "save_error"),
+                ("publish", "publish_error"),
+                ("source_read", "read_error"),
+            ] {
+                if let Some(error) = phases[stage]["error"].as_str() {
+                    source["error"] = json!(error);
+                    source["state"] = json!(state);
+                    break;
+                }
+                if phases[stage]["state"] == "recovery_unverified" {
+                    source["error"] = json!("RECOVERY_UNVERIFIED");
+                    source["state"] = json!("recovery_unverified");
+                    break;
+                }
+            }
+        }
         Ok(
-            json!({"stamp":ctx.stamp,"ready":routes.values().any(|r|r=="ledger")||self.legacy.is_some_and(|l|l.sources.values().any(|s|s.last_scanned_ms.is_some())),"refreshing":sources.iter().any(|s|s["publishing"]==true||s["state"]=="collecting"),"last_saved_at_ms":last_saved.map(|n|n.to_string()),"sources":sources}),
+            json!({"stamp":ctx.stamp,"ready":routes.values().any(|r|r=="ledger")||self.live_state.borrow().as_ref().is_some_and(|l|l.sources.values().any(|s|s.last_scanned_ms.is_some())),"refreshing":sources.iter().any(|s|s["publishing"]==true||s["state"]=="collecting"),"last_saved_at_ms":last_saved.map(|n|n.to_string()),"sources":sources,"time_repair":time_repair}),
         )
     }
     fn coverage(&self, selection: &Selector, ctx: &mut Context) -> QueryResult<()> {
         let routes = self.source_routes()?;
+        // A healthy source file does not prove that the latest values were saved or
+        // adopted. Keep retained totals usable while exposing a failed continuation.
+        let runtime = super::collection::runtime_status(self.conn)
+            .map_err(|e| QueryError::new(e.code(), e.to_string()))?;
+        for info in crate::SOURCE_CATALOG {
+            if !selection.allows(info.id) {
+                continue;
+            }
+            let phases = &runtime["sources"][info.id];
+            let continuation = &runtime["continuation"][info.id];
+            if ["source_read", "save", "publish"].iter().any(|stage| {
+                phases[*stage]["error"].is_string()
+                    || phases[*stage]["state"] == "recovery_unverified"
+            }) || continuation["error"].is_string()
+                || continuation["state"] == "recovery_unverified"
+            {
+                ctx.incomplete.insert(info.id.into());
+                ctx.warnings.insert("PERSISTENCE_GAP".into());
+            }
+        }
         for info in crate::SOURCE_CATALOG {
             if !selection.allows(info.id) {
                 continue;
             }
             if !routes.get(info.id).is_some_and(|r| r == "ledger") {
                 ctx.warnings.insert("LIVE_HISTORY_UNPROTECTED".into());
-                let live = self.legacy.and_then(|l| l.sources.get(info.id));
-                if live.is_some_and(|s| s.unallocated_sessions > 0) {
+                let live = self
+                    .live_state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|l| l.sources.get(info.id))
+                    .cloned();
+                if live.as_ref().is_some_and(|s| s.unallocated_sessions > 0) {
                     ctx.incomplete.insert(info.id.into());
                     ctx.warnings.insert("SESSION_USAGE_UNALLOCATED".into());
                 }
-                if live.is_none_or(|s| s.stale || s.error.is_some()) {
+                if live.as_ref().is_none_or(|s| s.stale || s.error.is_some()) {
                     ctx.incomplete.insert(info.id.into());
                     ctx.warnings.insert("SOURCE_READ_GAP".into());
                 }
@@ -1107,7 +1363,7 @@ impl<'a> QueryService<'a> {
             ctx.incomplete.insert("claude".into());
             ctx.warnings.insert("IDENTITY_PENDING".into());
         }
-        let mut st=self.conn.prepare("SELECT DISTINCT r.report_source FROM source_roots r WHERE r.route='ledger' AND(r.enabled=0 OR r.error_code IS NOT NULL OR r.enumeration_done=0 OR EXISTS(SELECT 1 FROM source_objects o WHERE o.root_id=r.root_id AND(o.state<>'ready' OR o.target_done=0)))")?;
+        let mut st=self.conn.prepare("SELECT DISTINCT r.report_source FROM source_roots r WHERE r.route='ledger' AND r.collector_key<>'reported-history-v1' AND(r.enabled=0 OR r.error_code IS NOT NULL OR r.enumeration_done=0 OR EXISTS(SELECT 1 FROM source_objects o WHERE o.root_id=r.root_id AND(o.state<>'ready' OR o.target_done=0)))")?;
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
             let id: String = r.get(0)?;
@@ -1149,7 +1405,7 @@ impl<'a> QueryService<'a> {
         }
         drop(rows);
         drop(st);
-        let mut st=self.conn.prepare("SELECT DISTINCT o.report_source FROM usage_observations o WHERE o.eligibility IN('identity_unknown','time_unknown','inconsistent') AND NOT EXISTS(SELECT 1 FROM usage_events e WHERE e.identity_family=o.identity_family AND e.namespace_key=o.namespace_key AND e.identity_key=COALESCE((SELECT a.canonical_key FROM identity_alias a WHERE a.identity_family=o.identity_family AND a.namespace_key=o.namespace_key AND a.alias_key=o.identity_key),o.identity_key) AND e.state<>'unresolved')")?;
+        let mut st=self.conn.prepare("SELECT DISTINCT o.report_source FROM usage_observations o WHERE o.eligibility IN('identity_unknown','time_unknown','inconsistent','pending_finality') AND NOT EXISTS(SELECT 1 FROM usage_events e WHERE e.identity_family=o.identity_family AND e.namespace_key=o.namespace_key AND e.identity_key=COALESCE((SELECT a.canonical_key FROM identity_alias a WHERE a.identity_family=o.identity_family AND a.namespace_key=o.namespace_key AND a.alias_key=o.identity_key),o.identity_key) AND e.state<>'unresolved')")?;
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
             let id: String = r.get(0)?;
@@ -1234,7 +1490,7 @@ impl<'a> QueryService<'a> {
         .encode()
     }
 }
-fn legacy_fact(entry: &LegacyEntry) -> QueryResult<Fact> {
+pub(super) fn legacy_fact(entry: &LegacyEntry) -> QueryResult<Fact> {
     match entry {
         LegacyEntry::Request {
             record,
@@ -1297,6 +1553,7 @@ fn legacy_fact(entry: &LegacyEntry) -> QueryResult<Fact> {
                 cost_scale: legacy_money(record.cost_usd).map(|v| v.1),
                 currency: record.cost_usd.map(|_| "USD".into()),
                 live: true,
+                reported: false,
                 known_fields: *known_fields,
                 summary: None,
             })
@@ -1322,6 +1579,7 @@ fn legacy_fact(entry: &LegacyEntry) -> QueryResult<Fact> {
             cost_scale: None,
             currency: None,
             live: true,
+            reported: false,
             known_fields: 1023,
             summary: None,
         }),
@@ -1346,7 +1604,7 @@ impl QueryService<'_> {
             } => (sources, models),
         };
         let (_guard, mut ctx) = self.snapshot(Some(selectors))?;
-        let payload = match &mut request {
+        let mut payload = match &mut request {
             QueryRequest::Totals { query } => {
                 self.normalize_query(query, &mut ctx, None)?;
                 self.coverage(&query.sources, &mut ctx)?;
@@ -1393,8 +1651,36 @@ impl QueryService<'_> {
                     ctx.warnings.insert("DAY_EVIDENCE_EXCLUDED".into());
                 }
 
+                // Initial rendering must not combine independently committed
+                // snapshots. The global visibility threshold shares this
+                // transaction and cutoff, without widening the selected
+                // report's coverage or warnings.
+                let global_metrics = if matches!(query.window, Window::All)
+                    && matches!(query.sources, Selector::All)
+                    && matches!(query.models, Selector::All)
+                {
+                    totals["metrics"].clone()
+                } else {
+                    let mut global_query = query.clone();
+                    global_query.window = Window::All;
+                    global_query.sources = Selector::All;
+                    global_query.models = Selector::All;
+                    global_query.metric = Metric::Total;
+                    global_query.group_by = GroupBy::None;
+                    let global_ctx = ctx.clone();
+                    self.aggregate_usage(&global_query, &global_ctx, GroupBy::None)?
+                        .0
+                        .bundle()["metrics"]
+                        .clone()
+                };
+
+                // Detail rankings always use total tokens, independently of
+                // the chart metric. Returning them here avoids a second stamp.
+                let mut detail_query = query.clone();
+                detail_query.metric = Metric::Total;
+
                 let source_table = self.table(
-                    query,
+                    &detail_query,
                     Dimension::Source,
                     Scope::Facet,
                     &Page {
@@ -1405,7 +1691,7 @@ impl QueryService<'_> {
                 )?;
 
                 let model_table = self.table(
-                    query,
+                    &detail_query,
                     Dimension::Model,
                     Scope::Facet,
                     &Page {
@@ -1434,10 +1720,26 @@ impl QueryService<'_> {
                     }
                     None => None,
                 };
+                let selected_day = match &query.window {
+                    Window::Calendar {
+                        start_date,
+                        end_date_exclusive,
+                    } if parse_date(end_date_exclusive)?
+                        .signed_duration_since(parse_date(start_date)?)
+                        .num_days()
+                        == 1 =>
+                    {
+                        match &latest_day {
+                            Some(day) if day["date"] == *start_date => Some(day.clone()),
+                            _ => Some(self.day(query, start_date, &ctx)?),
+                        }
+                    }
+                    _ => None,
+                };
 
                 let (identified, unidentified) = self.undated(query)?;
 
-                json!({"kind":"dashboard","data":{"totals":totals,"series":series,"distribution":distribution,"source_table":source_table,"model_table":model_table,"comparison":comparison,"trend":trend,"latest_day":latest_day,"date_extent":{"first":extent.0.map(|d|d.to_string()),"last":extent.1.map(|d|d.to_string())},"undated":{"identified_count":identified.to_string(),"unidentified_candidate_count":unidentified.to_string()}}})
+                json!({"kind":"dashboard","data":{"totals":totals,"global_metrics":global_metrics,"series":series,"distribution":distribution,"source_table":source_table,"model_table":model_table,"detail_tables_metric":"total","comparison":comparison,"trend":trend,"latest_day":latest_day,"selected_day":selected_day,"date_extent":{"first":extent.0.map(|d|d.to_string()),"last":extent.1.map(|d|d.to_string())},"undated":{"identified_count":identified.to_string(),"unidentified_candidate_count":unidentified.to_string()}}})
             }
             QueryRequest::Table {
                 query,
@@ -1502,6 +1804,25 @@ impl QueryService<'_> {
                 self.session_totals(sources, models, page, &ctx)?
             }
         };
+        if let QueryRequest::Totals { query } | QueryRequest::Dashboard { query, .. } = &request {
+            let quality = self.adopted_quality(query, &ctx)?;
+            if payload["kind"] == "totals" {
+                payload["data"]["quality"] = quality;
+            } else {
+                payload["data"]["totals"]["quality"] = quality;
+            }
+        }
+        if let QueryRequest::Totals { query }
+        | QueryRequest::Dashboard { query, .. }
+        | QueryRequest::Table { query, .. }
+        | QueryRequest::Day { query, .. } = &request
+        {
+            let membership = self.membership_unknown(query, &ctx)?;
+            if membership["records"] != "0" {
+                ctx.warnings.insert("MEMBERSHIP_UNKNOWN".into());
+            }
+            payload["data"]["membership_unknown"] = membership;
+        }
         ctx.budget()?;
         if ctx.excluded_days.get() {
             ctx.warnings.insert("DAY_EVIDENCE_EXCLUDED".into());
@@ -1520,7 +1841,10 @@ impl QueryService<'_> {
             as_of_ms: ctx.asof.to_string(),
             query_key,
             payload,
-            source_coverage: if ctx.incomplete.is_empty() && !excluded {
+            source_coverage: if ctx.incomplete.is_empty()
+                && !excluded
+                && !ctx.warnings.contains("MEMBERSHIP_UNKNOWN")
+            {
                 "complete"
             } else {
                 "partial"
@@ -1615,8 +1939,13 @@ impl QueryService<'_> {
         let mut model_sources = BTreeMap::<String, BTreeSet<String>>::new();
         let mut source_pairs = 0;
         let mut denominator = Cell::default();
+        let mut grouping_unallocated = Aggregate::default();
         self.visit(&actual, ctx, true, |f, usable| {
             if !usable {
+                return Ok(());
+            }
+            if dimension == Dimension::Day && !self.day_aligned(&f, ctx)? {
+                grouping_unallocated.add_usage(&f)?;
                 return Ok(());
             }
             let id = match dimension {
@@ -1715,7 +2044,7 @@ impl QueryService<'_> {
             let cell = &a.cells[q.metric.index()];
             let mut bundle = a.bundle();
             self.decorate_bundle(&mut bundle, ctx);
-            let mut row = json!({"id":id,"label":if dimension==Dimension::Model{self.preferred_model_label(&id)?}else{if dimension==Dimension::Source{source_label(&id)}else{id.clone()}},"bundle":bundle,"selected":selected.allows(&id),"share":share(cell,&denominator)});
+            let mut row = json!({"id":id,"label":if dimension==Dimension::Model{self.preferred_model_label(&id)?}else{if dimension==Dimension::Source{source_label(&id)}else{id.clone()}},"bundle":bundle,"selected":allows_sorted(selected, &id),"share":share(cell,&denominator)});
             if dimension == Dimension::Model {
                 row["sources"] = json!(model_sources.remove(&id).unwrap_or_default());
             }
@@ -1728,7 +2057,9 @@ impl QueryService<'_> {
         } else {
             None
         };
-        Ok(json!({"rows":rows,"next_cursor":next,"total_groups":count.to_string()}))
+        Ok(
+            json!({"rows":rows,"next_cursor":next,"total_groups":count.to_string(),"grouping_unallocated":grouping_unallocated.cells[q.metric.index()].value()}),
+        )
     }
     fn extent(
         &self,
@@ -1759,36 +2090,25 @@ impl QueryService<'_> {
             }
             ctx.budget()?;
         }
-        if let Some(l) = self.legacy {
-            for e in &l.entries {
-                if let LegacyEntry::Request { record, .. } = e {
-                    if record.ts_ms <= ctx.asof
-                        && q.sources.allows(record.source)
-                        && q.models.allows(&model_id(&model_key(&record.model)))
-                        && !routes.get(record.source).is_some_and(|r| r == "ledger")
-                    {
-                        lo = Some(lo.map_or(record.ts_ms, |v| v.min(record.ts_ms)));
-                        hi = Some(hi.map_or(record.ts_ms, |v| v.max(record.ts_ms)));
-                    }
-                } else if let LegacyEntry::Day(day) = e {
-                    if q.sources.allows(&day.report_source)
-                        && q.models.allows(&model_id(&day.model_key))
-                        && !routes
-                            .get(&day.report_source)
-                            .is_some_and(|route| route == "ledger")
-                    {
-                        let fact = legacy_fact(e)?;
-                        if self.day_usable(&fact, start, end, ctx)?
-                            && !self.day_covered(&fact, &routes)?
-                        {
-                            let timestamp = fact.start.unwrap();
-                            lo = Some(lo.map_or(timestamp, |value| value.min(timestamp)));
-                            hi = Some(hi.map_or(timestamp, |value| value.max(timestamp)));
-                        }
-                    }
+        for row in self.live_facts()?.iter() {
+            let f = &row.fact;
+            if q.sources.allows(&f.source) && allows_sorted(&q.models, &model_id(&f.model)) {
+                let time = if f.kind == "request" {
+                    f.time.filter(|t| *t <= ctx.asof)
+                } else if f.kind == "day"
+                    && self.day_usable(f, start, end, ctx)?
+                    && !self.day_covered(f, &routes)?
+                {
+                    f.start
+                } else {
+                    None
+                };
+                if let Some(time) = time {
+                    lo = Some(lo.map_or(time, |v| v.min(time)));
+                    hi = Some(hi.map_or(time, |v| v.max(time)));
                 }
-                ctx.budget()?;
             }
+            ctx.budget()?;
         }
         Ok((
             lo.map(|n| local_date(ctx.tz, n)).transpose()?,
@@ -1798,7 +2118,7 @@ impl QueryService<'_> {
     fn undated(&self, q: &Query) -> QueryResult<(i64, i64)> {
         let sc = Self::condition(&q.sources, "o.report_source", "query_sources");
         let mc = Self::condition(&q.models, "o.model_key", "query_models");
-        let sql=format!("SELECT COUNT(DISTINCT CASE WHEN identity_key IS NOT NULL THEN identity_family||':'||namespace_key||':'||identity_key END),COALESCE(SUM(identity_key IS NULL),0) FROM usage_observations o WHERE eligibility IN('identity_unknown','time_unknown','inconsistent') AND eligibility<>'inconsistent' AND {sc} AND {mc}");
+        let sql=format!("SELECT COUNT(DISTINCT CASE WHEN identity_key IS NOT NULL THEN identity_family||':'||namespace_key||':'||identity_key END),COALESCE(SUM(identity_key IS NULL),0) FROM usage_observations o WHERE eligibility IN('identity_unknown','time_unknown','inconsistent','pending_finality') AND eligibility<>'inconsistent' AND {sc} AND {mc}");
         Ok(self
             .conn
             .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))?)
@@ -2092,6 +2412,7 @@ impl QueryService<'_> {
             }
         };
         let mut cells = vec![vec![Cell::default(); keys.len()]; intervals.len()];
+        let mut unallocated = Cell::default();
         let keymap: BTreeMap<_, _> = keys
             .iter()
             .enumerate()
@@ -2114,6 +2435,12 @@ impl QueryService<'_> {
             if ts >= intervals[idx].1 {
                 return Ok(());
             }
+            if f.kind == "day" && f.end.is_none_or(|e| e > intervals[idx].1) {
+                let mut aggregate = Aggregate::default();
+                aggregate.add_usage(&f)?;
+                unallocated.merge(&aggregate.cells[q.metric.index()])?;
+                return Ok(());
+            }
             let id = match q.group_by {
                 GroupBy::Source => f.source.clone(),
                 GroupBy::Model => model_id(&f.model),
@@ -2130,8 +2457,7 @@ impl QueryService<'_> {
                 }
                 let mut values =
                     evaluate(&f.metrics).map_err(|e| QueryError::new(e.code(), e.to_string()))?;
-                if f.live
-                    && f.known_fields & (1 << q.metric.index()) == 0
+                if (f.reported || f.live && f.known_fields & (1 << q.metric.index()) == 0)
                     && values[q.metric.index()].known_value.is_some()
                 {
                     values[q.metric.index()].state = ValueState::Partial;
@@ -2142,7 +2468,7 @@ impl QueryService<'_> {
         })?;
         let points:Vec<_>=intervals.iter().zip(cells).map(|((s,e,label),row)|json!({"start_ms":s.to_string(),"end_ms_exclusive":e.to_string(),"label":label,"values":row.iter().map(Cell::value).collect::<Vec<_>>()})).collect();
         Ok(
-            json!({"unit":actual,"keys":keys.iter().map(|(id,label)|json!({"id":id,"label":label})).collect::<Vec<_>>(),"points":points,"compressed":unit==SeriesUnit::Auto&&actual!="day"}),
+            json!({"unit":actual,"keys":keys.iter().map(|(id,label)|json!({"id":id,"label":label})).collect::<Vec<_>>(),"points":points,"compressed":unit==SeriesUnit::Auto&&actual!="day","grouping_unallocated":unallocated.value()}),
         )
     }
     fn recorded_day_series(
@@ -2166,6 +2492,7 @@ impl QueryService<'_> {
             .map(|(index, key)| (key.0.as_str(), index))
             .collect();
         let mut days = BTreeMap::<NaiveDate, Vec<Cell>>::new();
+        let mut unallocated = Cell::default();
         self.visit(q, ctx, true, |fact, usable| {
             if !usable
                 || fact
@@ -2173,6 +2500,12 @@ impl QueryService<'_> {
                     .as_ref()
                     .is_some_and(|summary| summary[7].count == 0)
             {
+                return Ok(());
+            }
+            if !self.day_aligned(&fact, ctx)? {
+                let mut aggregate = Aggregate::default();
+                aggregate.add_usage(&fact)?;
+                unallocated.merge(&aggregate.cells[q.metric.index()])?;
                 return Ok(());
             }
             let id = match q.group_by {
@@ -2207,8 +2540,7 @@ impl QueryService<'_> {
                 let mut values = evaluate(&fact.metrics)
                     .map_err(|e| QueryError::new(e.code(), e.to_string()))?;
                 let value = &mut values[q.metric.index()];
-                if fact.live
-                    && fact.known_fields & (1 << q.metric.index()) == 0
+                if (fact.reported || fact.live && fact.known_fields & (1 << q.metric.index()) == 0)
                     && value.known_value.is_some()
                 {
                     value.state = ValueState::Partial;
@@ -2234,35 +2566,112 @@ impl QueryService<'_> {
             "unit":"day",
             "keys":keys.iter().map(|(id,label)|json!({"id":id,"label":label})).collect::<Vec<_>>(),
             "points":points,
-            "compressed":false
+            "compressed":false,
+            "grouping_unallocated":unallocated.value()
         }))
+    }
+    /// Return only an auditable intraday projection. This is not a new usage
+    /// contribution: callers continue to aggregate the frozen parent exactly once.
+    fn day_time_allocation(
+        &self,
+        fact: &Fact,
+        metric: Metric,
+        intervals: &[Vec<(i64, i64)>],
+        ctx: &Context,
+    ) -> QueryResult<Option<Vec<(usize, Cell)>>> {
+        if fact.live || !fact.reported || fact.id <= 0 || fact.kind != "day" {
+            return Ok(None);
+        }
+        let values =
+            evaluate(&fact.metrics).map_err(|e| QueryError::new(e.code(), e.to_string()))?;
+        let mut parent_value = values[metric.index()].clone();
+        if parent_value.known_value.is_some() {
+            parent_value.state = ValueState::Partial;
+        }
+        // A repaired distribution is saved evidence too: queries never rebuild
+        // it from a current source capture. The original adoption-time evidence
+        // takes precedence and both paths preserve the parent's amount/quality.
+        let members = super::time_allocation::load(self.conn, fact.id)
+            .and_then(|original| match original {
+                Some(members) => Ok(Some(members)),
+                None => super::time_repair::load(self.conn, fact.id),
+            })
+            .map_err(|error| match error {
+                super::types::LedgerError::Sql(error) => QueryError::from(error),
+                other => QueryError::new(other.code(), other.to_string()),
+            })?;
+        if let Some(members) = members {
+            let mut hours = vec![Cell::default(); 24];
+            let mut allocated = Cell::default();
+            for (index, member) in members.iter().enumerate() {
+                let Some(hour) = intervals.iter().position(|ranges| {
+                    ranges.iter().any(|(start, end)| {
+                        member.occurred_ms >= *start && member.occurred_ms < *end
+                    })
+                }) else {
+                    return Err(QueryError::invalid(
+                        "reported time member falls outside selected day",
+                    ));
+                };
+                let mut value = evaluate(&member.metrics)
+                    .map_err(|e| QueryError::new(e.code(), e.to_string()))?[metric.index()]
+                .clone();
+                if value.known_value.is_some() {
+                    value.state = ValueState::Partial;
+                }
+                hours[hour].add(&value)?;
+                allocated.add(&value)?;
+                if index % 512 == 0 {
+                    ctx.budget()?;
+                }
+            }
+            // Legacy aggregation can lose a known subtotal when another member
+            // has an unknown component. Do not silently increase the chart's
+            // known amount beyond the frozen parent's selected metric.
+            let projected = allocated.value();
+            let expected = parent_value.known_value.map(|n| n.to_string());
+            if projected["known_value"].as_str() != expected.as_deref() {
+                return Ok(None);
+            }
+            ctx.budget()?;
+            return Ok(Some(
+                hours
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, cell)| cell.count > 0)
+                    .collect(),
+            ));
+        }
+        let (Some(start), Some(end)) = (fact.start, fact.end) else {
+            return Ok(None);
+        };
+        if start >= end {
+            return Ok(None);
+        }
+        let adopted: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM adoption_items a JOIN adoption_policies p USING(policy_id) WHERE a.selected_observation_id=?1 AND p.kind='legacy_snapshot' AND p.status='active' AND p.start_ms<=?2 AND p.end_ms>=?3)",
+            params![fact.id, start, end], |row| row.get(0),
+        )?;
+        if !adopted {
+            return Ok(None);
+        }
+        // A half-open interval wholly inside one real hour proves its hour
+        // without inventing any request timestamp. Repeated DST hours retain
+        // separate real intervals and cannot be combined to satisfy this test.
+        if let Some(hour) = intervals
+            .iter()
+            .position(|ranges| ranges.iter().any(|(a, b)| start >= *a && end <= *b))
+        {
+            let mut cell = Cell::default();
+            cell.add(&parent_value)?;
+            return Ok(Some(vec![(hour, cell)]));
+        }
+        Ok(None)
     }
     fn day(&self, q: &Query, date: &str, ctx: &Context) -> QueryResult<Value> {
         let d = parse_date(date)?;
         let (start, end) = bounds(&calendar_day(d)?, ctx.tz)?;
         let (total, _) = self.aggregate(q, ctx, GroupBy::None)?;
-        // Daily evidence contributes to the day total, but cannot rank or
-        // displace request models in an hourly chart. Complete request days
-        // can use their existing rollups for this small ranking pass.
-        let mut request_groups = BTreeMap::<String, Aggregate>::new();
-        self.visit(q, ctx, true, |fact, usable| {
-            if !usable || fact.kind != "request" {
-                return Ok(());
-            }
-            let id = match q.group_by {
-                GroupBy::Source => fact.source.clone(),
-                GroupBy::Model => model_id(&fact.model),
-                GroupBy::None => "__total__".into(),
-            };
-            if request_groups.len() >= GROUP_LIMIT && !request_groups.contains_key(&id) {
-                return Err(QueryError::limit("hourly model budget exceeded"));
-            }
-            request_groups.entry(id).or_default().add_usage(&fact)
-        })?;
-        let keys = self.series_keys(q.group_by, &request_groups, q.metric)?;
-        if keys.len() * 24 > 20_000 {
-            return Err(QueryError::limit("hour cell budget exceeded"));
-        }
         // Sweep real UTC minutes. Repeated wall hours retain separate intervals; unusual half-hour
         // transitions split at their true boundary instead of assuming 24 physical hours.
         let mut intervals: Vec<Vec<(i64, i64)>> = vec![Vec::new(); 24];
@@ -2295,20 +2704,87 @@ impl QueryService<'_> {
             }
             t = next;
         }
+        // Timestamped reported members and whole-hour interval evidence retain
+        // their original quality. They rank alongside requests for this chart,
+        // but the frozen parent remains the sole owner of the recorded totals.
+        let mut request_groups = BTreeMap::<String, Aggregate>::new();
+        let mut allocated_ids = BTreeSet::new();
+        let mut allocated_cells = BTreeMap::<String, Vec<Cell>>::new();
+        self.visit(q, ctx, true, |fact, usable| {
+            if !usable {
+                return Ok(());
+            }
+            let allocation = if fact.kind == "day" {
+                self.day_time_allocation(&fact, q.metric, &intervals, ctx)?
+            } else {
+                None
+            };
+            if fact.kind != "request" && allocation.is_none() {
+                return Ok(());
+            }
+            let id = match q.group_by {
+                GroupBy::Source => fact.source.clone(),
+                GroupBy::Model => model_id(&fact.model),
+                GroupBy::None => "__total__".into(),
+            };
+            if request_groups.len() >= GROUP_LIMIT && !request_groups.contains_key(&id) {
+                return Err(QueryError::limit("hourly model budget exceeded"));
+            }
+            request_groups
+                .entry(id.clone())
+                .or_default()
+                .add_usage(&fact)?;
+            if let Some(allocation) = allocation {
+                allocated_ids.insert(fact.id);
+                let row = allocated_cells
+                    .entry(id)
+                    .or_insert_with(|| vec![Cell::default(); 24]);
+                for (hour, value) in allocation {
+                    row[hour].merge(&value)?;
+                }
+            }
+            Ok(())
+        })?;
+        let keys = self.series_keys(q.group_by, &request_groups, q.metric)?;
+        if keys.len() * 24 > 20_000 {
+            return Err(QueryError::limit("hour cell budget exceeded"));
+        }
         let mut cells = vec![vec![Cell::default(); keys.len()]; 24];
         let mut requests = Aggregate::default();
         let mut daily = Aggregate::default();
+        let mut timed_reported = Aggregate::default();
+        let mut daily_groups = BTreeMap::<String, Aggregate>::new();
         let keymap: BTreeMap<_, _> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| (k.0.as_str(), i))
             .collect();
+        for (id, row) in allocated_cells {
+            if let Some(key) = keymap.get(id.as_str()).or_else(|| keymap.get("__other__")) {
+                for (hour, value) in row.iter().enumerate() {
+                    cells[hour][*key].merge(value)?;
+                }
+            }
+        }
         self.visit(q, ctx, false, |f, usable| {
             if !usable {
                 return Ok(());
             }
             if f.kind == "day" {
+                if allocated_ids.contains(&f.id) {
+                    timed_reported.add(&f)?;
+                    return Ok(());
+                }
                 daily.add(&f)?;
+                let id = match q.group_by {
+                    GroupBy::Source => f.source.clone(),
+                    GroupBy::Model => model_id(&f.model),
+                    GroupBy::None => "__total__".into(),
+                };
+                if daily_groups.len() >= GROUP_LIMIT && !daily_groups.contains_key(&id) {
+                    return Err(QueryError::limit("daily-only model budget exceeded"));
+                }
+                daily_groups.entry(id).or_default().add_usage(&f)?;
                 return Ok(());
             }
             requests.add(&f)?;
@@ -2333,8 +2809,7 @@ impl QueryService<'_> {
             {
                 let mut v =
                     evaluate(&f.metrics).map_err(|e| QueryError::new(e.code(), e.to_string()))?;
-                if f.live
-                    && f.known_fields & (1 << q.metric.index()) == 0
+                if (f.reported || f.live && f.known_fields & (1 << q.metric.index()) == 0)
                     && v[q.metric.index()].known_value.is_some()
                 {
                     v[q.metric.index()].state = ValueState::Partial;
@@ -2347,9 +2822,30 @@ impl QueryService<'_> {
         let recorded: Vec<_> = (0..keys.len())
             .filter(|key| cells.iter().any(|hour| hour[*key].count > 0))
             .collect();
+        // Keep unknown intraday allocation separate from the 24 real hours.
+        // Its own model ranking cannot displace a timed request's hourly key.
+        let daily_keys = self.series_keys(q.group_by, &daily_groups, q.metric)?;
+        let daily_keymap: BTreeMap<_, _> = daily_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.0.as_str(), index))
+            .collect();
+        let mut daily_cells = vec![Cell::default(); daily_keys.len()];
+        for (id, group) in &daily_groups {
+            if let Some(index) = daily_keymap
+                .get(id.as_str())
+                .or_else(|| daily_keymap.get("__other__"))
+            {
+                daily_cells[*index].merge(&group.cells[q.metric.index()])?;
+            }
+        }
+        let day_only_series = json!({
+            "keys":daily_keys.iter().map(|(id,label)|json!({"id":id,"label":label})).collect::<Vec<_>>(),
+            "values":daily_cells.iter().map(Cell::value).collect::<Vec<_>>()
+        });
         let hours:Vec<_>=(0..24).map(|h|json!({"hour":h,"state":if intervals[h].is_empty(){"nonexistent"}else{"present"},"intervals":intervals[h].iter().map(|(s,e)|json!({"start_ms":s.to_string(),"end_ms_exclusive":e.to_string()})).collect::<Vec<_>>(),"values":recorded.iter().map(|key|cells[h][*key].value()).collect::<Vec<_>>()})).collect();
         Ok(
-            json!({"date":date,"keys":recorded.iter().map(|index|{let(id,label)=&keys[*index];json!({"id":id,"label":label})}).collect::<Vec<_>>(),"hours":hours,"total":total.bundle(),"request_total":requests.bundle(),"day_only_total":daily.bundle()}),
+            json!({"date":date,"keys":recorded.iter().map(|index|{let(id,label)=&keys[*index];json!({"id":id,"label":label})}).collect::<Vec<_>>(),"hours":hours,"total":total.bundle(),"request_total":requests.bundle(),"timed_reported_total":timed_reported.bundle(),"day_only_total":daily.bundle(),"day_only_series":day_only_series}),
         )
     }
 }
@@ -2619,25 +3115,20 @@ impl QueryService<'_> {
             }
             ctx.budget()?;
         }
-        if let Some(legacy) = self.legacy {
-            for entry in &legacy.entries {
-                let fact = legacy_fact(entry)?;
-                if !routes
-                    .get(&fact.source)
-                    .is_some_and(|route| route == "ledger")
-                    && !sources.contains(&fact.source)
-                    && (fact.kind == "request" && fact.time.is_some_and(|time| time <= ctx.asof)
-                        || fact.kind == "day"
-                            && self.day_usable(&fact, start, end, ctx)?
-                            && !self.day_covered(&fact, &routes)?)
-                {
-                    sources.insert(fact.source);
-                }
-                if sources.len() > GROUP_LIMIT {
-                    return Err(QueryError::limit("catalog source budget exceeded"));
-                }
-                ctx.budget()?;
+        for row in self.live_facts()?.iter() {
+            let fact = &row.fact;
+            if !sources.contains(&fact.source)
+                && (fact.kind == "request" && fact.time.is_some_and(|time| time <= ctx.asof)
+                    || fact.kind == "day"
+                        && self.day_usable(fact, start, end, ctx)?
+                        && !self.day_covered(fact, &routes)?)
+            {
+                sources.insert(fact.source.clone());
             }
+            if sources.len() > GROUP_LIMIT {
+                return Err(QueryError::limit("catalog source budget exceeded"));
+            }
+            ctx.budget()?;
         }
         Ok(sources)
     }
@@ -2697,9 +3188,9 @@ impl QueryService<'_> {
             ])?;
             while let Some(r) = rows.next()? {
                 let f = Fact::from_row(r)?;
-                let state: Option<String> = r.get(29)?;
-                let conflict: Option<bool> = r.get(30)?;
-                let selected: Option<i64> = r.get(31)?;
+                let state: Option<String> = r.get(30)?;
+                let conflict: Option<bool> = r.get(31)?;
+                let selected: Option<i64> = r.get(32)?;
                 let formal = state.as_deref() == Some("active") && selected == Some(f.id);
                 let status = if formal {
                     "formal"
@@ -2713,25 +3204,22 @@ impl QueryService<'_> {
                 let bundle = diagnostic_bundle(&f)?;
                 out.insert(key,json!({"source":source,"native_tool":f.native,"model":model_id(&f.model),"row_key":row_key,"date":f.date,"timezone":f.timezone,"start_ms":f.start.map(|n|n.to_string()),"end_ms_exclusive":f.end.map(|n|n.to_string()),"status":status,"candidate_id":f.id.to_string(),"bundle":bundle,"selected":formal,"reason":if formal{None}else{Some(if status=="conflict"{"EVIDENCE_CONFLICT"}else{"DAY_NOT_PUBLISHED"})}}));
             }
-        } else if let Some(l) = self.legacy {
-            for e in &l.entries {
-                let LegacyEntry::Day(d) = e else {
-                    continue;
-                };
-                if d.report_source != source
-                    || d.native_date.as_str() < start
-                    || d.native_date.as_str() >= end
-                    || !models.allows(&model_id(&d.model_key))
+        } else {
+            for row in self.live_facts()?.iter() {
+                let f = &row.fact;
+                if f.kind != "day"
+                    || f.source != source
+                    || f.date.as_deref().is_none_or(|d| d < start || d >= end)
+                    || !allows_sorted(models, &model_id(&f.model))
                 {
                     continue;
                 }
-                let key = format!("{}\0live\0{}", d.native_date, d.row_key);
+                let key = format!("{}\0live\0{}", f.date.as_deref().unwrap_or(""), f.key);
                 if c.as_ref().is_some_and(|c| key <= c.last_id) {
                     continue;
                 }
-                let f = legacy_fact(e)?;
-                let bundle = diagnostic_bundle(&f)?;
-                out.insert(key,json!({"source":source,"native_tool":d.native_tool,"model":model_id(&d.model_key),"row_key":d.row_key,"date":d.native_date,"timezone":d.timezone,"start_ms":d.start_ms.map(|n|n.to_string()),"end_ms_exclusive":d.end_ms.map(|n|n.to_string()),"status":"pending","candidate_id":null,"bundle":bundle,"selected":false,"reason":"LEGACY_DAY_COVERAGE_UNKNOWN"}));
+                let bundle = diagnostic_bundle(f)?;
+                out.insert(key,json!({"source":source,"native_tool":f.native,"model":model_id(&f.model),"row_key":f.key,"date":f.date,"timezone":f.timezone,"start_ms":f.start.map(|n|n.to_string()),"end_ms_exclusive":f.end.map(|n|n.to_string()),"status":"pending","candidate_id":null,"bundle":bundle,"selected":false,"reason":"LEGACY_DAY_COVERAGE_UNKNOWN"}));
                 if out.len() > page.limit + 1 {
                     out.pop_last();
                 }
@@ -2800,15 +3288,15 @@ impl QueryService<'_> {
             }
         }
         let routes = self.source_routes()?;
-        if let Some(l) = self.legacy {
-            for e in &l.entries {
-                if !matches!(e, LegacyEntry::SessionTotal { .. }) {
+        {
+            for entry in self.live_facts()?.iter() {
+                if entry.fact.kind != "session_total" {
                     continue;
                 }
-                let f = legacy_fact(e)?;
+                let f = &entry.fact;
                 if routes.get(&f.source).is_some_and(|r| r == "ledger")
                     || !sources.allows(&f.source)
-                    || (!models.allows(&model_id(&f.model))
+                    || (!allows_sorted(models, &model_id(&f.model))
                         && !(f.source == "goose"
                             && f.model.is_empty()
                             && matches!(models, Selector::Include { ids } if !ids.is_empty())))
@@ -2819,12 +3307,8 @@ impl QueryService<'_> {
                 if c.as_ref().is_some_and(|c| key <= c.last_id) {
                     continue;
                 }
-                let mut row = session_row(&f)?;
-                if let LegacyEntry::SessionTotal {
-                    reason: Some(reason),
-                    ..
-                } = e
-                {
+                let mut row = session_row(f)?;
+                if let Some(reason) = &entry.reason {
                     row["reason"] = json!(reason);
                     row["time_precision"] = json!("unknown");
                     row["model_precision"] = json!("unknown");
@@ -2935,7 +3419,7 @@ impl QueryService<'_> {
             Some(Dimension::Day) => "usagebook_local_day(e.occurred_ms,?3)",
             None => "'__total__'",
         };
-        let sql=format!("SELECT {group},o.cost_state,o.cost_currency,o.cost_scale,SUM(o.cost_units),COUNT(*) FROM usage_events e JOIN usage_observations o ON o.observation_id=e.selected_observation_id WHERE e.state='active' AND e.fact_kind='request' AND e.occurred_ms>=?1 AND e.occurred_ms<?2 AND {sc} AND {mc} AND EXISTS(SELECT 1 FROM source_roots r WHERE r.report_source=e.report_source AND r.route='ledger') GROUP BY {group},o.cost_state,o.cost_currency,o.cost_scale");
+        let sql=format!("SELECT {group},o.cost_state,o.cost_currency,o.cost_scale,SUM(o.cost_units),COUNT(*),MAX(o.parser_version='reported-history-v1') FROM usage_events e JOIN usage_observations o ON o.observation_id=e.selected_observation_id WHERE e.state='active' AND e.fact_kind='request' AND e.occurred_ms>=?1 AND e.occurred_ms<?2 AND {sc} AND {mc} AND EXISTS(SELECT 1 FROM source_roots r WHERE r.report_source=e.report_source AND r.route='ledger') GROUP BY {group},o.cost_state,o.cost_currency,o.cost_scale");
         let mut st = self.conn.prepare(&sql)?;
         let mut rows = if dim == Some(Dimension::Day) {
             st.query(params![start, end, ctx.stamp.report_timezone])?
@@ -2954,6 +3438,7 @@ impl QueryService<'_> {
             };
             let state: String = r.get(1)?;
             let count: i64 = r.get(5)?;
+            a.reported_cost |= r.get::<_, bool>(6)?;
             if state == "known" {
                 let currency: String = r.get(2)?;
                 let scale: u32 = r.get(3)?;
@@ -3085,26 +3570,10 @@ impl QueryService<'_> {
         // This covering projection avoids reading large immutable candidate payloads. Its
         // spelling counts are global within the current routes, independent of UI filters.
         self.conn.execute("INSERT INTO temp.query_labels(model_key,label,n) SELECT e.model_key,COALESCE(e.model_display,''),COUNT(*) FROM usage_events e INDEXED BY events_model_display WHERE e.state='active' AND e.fact_kind IN('request','day','session_total') AND e.report_source IN(SELECT report_source FROM source_roots WHERE route='ledger') GROUP BY e.model_key,e.model_display ON CONFLICT(model_key,label) DO UPDATE SET n=n+excluded.n",[])?;
-        let routes = self.source_routes()?;
-        if let Some(l) = self.legacy {
+        {
             let mut upsert=self.conn.prepare("INSERT INTO temp.query_labels VALUES(?1,?2,1) ON CONFLICT(model_key,label) DO UPDATE SET n=n+1")?;
-            for e in &l.entries {
-                let (source, model, label) = match e {
-                    LegacyEntry::Request { record, .. }
-                    | LegacyEntry::SessionTotal { record, .. } => (
-                        record.source,
-                        model_key(&record.model),
-                        record.model.as_str(),
-                    ),
-                    LegacyEntry::Day(d) => (
-                        d.report_source.as_str(),
-                        d.model_key.clone(),
-                        d.model_display.as_str(),
-                    ),
-                };
-                if !routes.get(source).is_some_and(|r| r == "ledger") {
-                    upsert.execute(params![model, label])?;
-                }
+            for entry in self.live_facts()?.iter() {
+                upsert.execute(params![entry.fact.model, entry.label])?;
             }
         }
         self.all_labels.set(Some(true));

@@ -155,6 +155,27 @@
   #grid2 .chart-box { height: 320px; }
   #chartDaily { height: 320px; }
   #chartHourly { height: 320px; }
+  #daily-view { flex: 0 0 auto; }
+  #daily-view button { min-width: 54px; }
+  #daily3d-tools { display: inline-flex; gap: 4px; align-items: center; }
+  #daily3d-tools[hidden] { display: none; }
+  #daily3d-tools .hbtn { min-width: 29px; padding: 3px 7px; }
+  #daily3d { position: relative; }
+  #daily3d-stage { height: 378px; position: relative; overflow: hidden; background: radial-gradient(ellipse at 50% 55%,rgba(44,74,110,.13),transparent 62%); }
+  #daily3d-stage canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  #daily3d-stage canvas:active { cursor: grabbing; }
+  .daily3d-legend { min-height: 32px; padding-top: 8px; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 4px 10px; color: var(--muted); font-size: 12px; }
+  .daily3d-legend button { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-height: 32px; padding: 4px 6px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: inherit; font: inherit; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+  .daily3d-legend button:hover { color: var(--fg); background: var(--panel2); }
+  .daily3d-legend button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .daily3d-legend button[aria-pressed="false"] { opacity: .5; text-decoration: line-through; }
+  .daily3d-legend i { flex: 0 0 8px; width: 8px; height: 8px; border-radius: 2px; }
+  .daily3d-tooltip { position: fixed; z-index: 100; min-width: min(138px,calc(100vw - 16px)); max-width: calc(100vw - 16px); box-sizing: border-box; overflow-wrap: anywhere; padding: 9px 11px; pointer-events: none; border: 1px solid #3b526b; border-radius: 7px; background: rgba(18,25,36,.97); box-shadow: 0 10px 30px rgba(0,0,0,.45); }
+  .daily3d-tooltip span { display: block; color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+  .daily3d-tooltip strong { display: flex; align-items: center; gap: 6px; color: var(--fg); font-size: 12px; font-weight: 500; }
+  .daily3d-tooltip strong i { flex: 0 0 7px; width: 7px; height: 7px; border-radius: 2px; }
+  .daily3d-tooltip b { display: block; color: var(--accent); font-size: 18px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  @media (max-width: 640px) { #daily3d-stage { height: 328px; } .daily3d-legend button { min-height: 40px; } }
 
   .grid2 { display: grid; grid-template-columns: 1.6fr 1fr; gap: 16px; }
   .grid2.single { grid-template-columns: 1fr; }
@@ -208,16 +229,17 @@
     </span>
     <span class="arf-wrap"><span data-i18n="lbl.arf">页面更新</span>
       <span class="seg" id="seg-arf">
-        <button data-v="10">10s</button>
+        <button data-v="20">20s</button>
         <button data-v="30" class="on">30s</button><button data-v="60" data-i18n="arf.1m">1分</button>
         <button data-v="0" data-i18n="arf.off">关</button>
       </span>
     </span>
     <button id="btn-refresh" data-i18n="btn.refresh">↻ 立即刷新</button>
+    <button id="clear-model-filter" class="hbtn" hidden></button>
     </div>
   </header>
 
-  <div id="scanning" aria-live="polite"><span id="scanning-txt" data-i18n="scan.first">首次全量扫描中,数据量大时约 10–30 秒</span><span class="dot-loading"></span></div>
+  <div id="scanning" aria-live="polite"><span id="scanning-txt" data-i18n="data.loading">正在读取统计…</span><span class="dot-loading"></span></div>
   <div id="app" hidden>
     <div class="cards" id="cards"></div>
     <div id="ledger-note" class="st-warn" role="status" hidden style="color:#f2cc60;margin:0 0 12px;font-size:12px"></div>
@@ -262,6 +284,18 @@
         <!-- data-i18n 仅为首帧兜底;真实标题由 renderDaily/renderDayView/renderPeriodTrend 按模式覆写,勿据此推断语义 -->
         <h2><span id="daily-h2" data-i18n="h2.daily">每日 Token 消耗</span><small id="daily-sub"></small></h2>
         <span class="p-tools">
+          <span class="seg" id="daily-view" aria-label="视图">
+            <button data-v="3d">3D</button><button data-v="standard" class="on" data-i18n="view.standard">标准</button>
+          </span>
+          <span id="daily3d-tools" hidden>
+            <button class="hbtn" id="daily3d-reset" data-i18n-title="view.reset" title="默认视角">◎</button>
+            <button class="hbtn" id="daily3d-top" data-i18n-title="view.top" title="俯视"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><path d="M3 3h10v10H3zM3 8h10M8 3v10"/></svg></button>
+            <button class="hbtn" id="daily3d-left" data-i18n-title="view.left" title="向左旋转">‹</button>
+            <button class="hbtn" id="daily3d-right" data-i18n-title="view.right" title="向右旋转">›</button>
+            <button class="hbtn" id="daily3d-zoom-in" data-i18n-title="view.zoomIn" title="放大">+</button>
+            <button class="hbtn" id="daily3d-zoom-out" data-i18n-title="view.zoomOut" title="缩小">−</button>
+            <button class="hbtn" id="daily3d-auto" data-i18n-title="view.auto" title="自动巡游">▶</button>
+          </span>
           <span class="day-entry" id="dayview-bar">
             <button class="hbtn" id="day-back" hidden>‹ <span data-i18n="btn.backToday">返回今天</span></button>
             <button class="hbtn" id="day-prev" hidden>‹</button>
@@ -270,7 +304,7 @@
           </span>
         </span>
       </div>
-      <div class="chart-box"><canvas id="chartDaily" aria-hidden="true"></canvas></div>
+      <div class="chart-box"><canvas id="chartDaily" aria-hidden="true"></canvas><div id="daily3d" hidden><div id="daily3d-stage"></div><div id="daily3d-legend" class="daily3d-legend"></div></div></div>
     </div>
 
     <div class="grid2" id="grid2">
@@ -313,6 +347,7 @@
   </div>
 </div>
 
+<script src="/dashboard_3d.bundle.js"></script>
 <script>
 'use strict';
 /* 原看板的布局、控件与 Chart.js 生命周期。
@@ -352,7 +387,7 @@ const METRICS = {
    srcSolo/mdlSolo: 固定单项的目标；null=普通选择，沿用新实体自动加入策略
    arf: 自动刷新间隔秒,0=关 */
 const state = { win: 'today', rs: null, re: null, metric: 'total', group: 'source',
-  srcSel: null, mdlSel: null, srcSolo: null, mdlSolo: null, arf: 30, unit: 'zh', lang: 'zh-CN' };
+  srcSel: null, mdlSel: null, srcSolo: null, mdlSolo: null, arf: 30, unit: 'zh', lang: 'zh-CN', view: 'standard', autoRotate: false };
 let DATA = null;
 const charts = {};
 let chartLibOk = typeof Chart !== 'undefined';
@@ -408,12 +443,12 @@ function setLang(lang) {
   lsSet(LANG_LS_KEY, lang);
   if (lsGet(UNIT_LS_KEY) === null) { state.unit = langDefaultUnit(lang); setUnitUi(); }
   applyStaticI18n();
-  /* 未就绪期切语言:静态替换会把 #scanning-txt 覆写回首扫文案,按当前态重设
+  /* 未就绪期切语言:静态替换会把 #scanning-txt 覆写回加载文案,按当前态重设
      (失败/重试文案的语义不能丢) */
   if (!DATA || !DATA.ready) setScanningText(
     (!DATA && loadFailed) ? t('status.connFailScan')
     : (DATA && DATA.last_scan_failed) ? t('status.scanFailRetry')
-    : t('scan.first'));
+    : t('data.loading'));
   if (DATA && DATA.ready) render();
 }
 function setLangUi() { segSync('#seg-lang', v => v === state.lang); }
@@ -439,8 +474,8 @@ const mdlColor = i => {   // 修:原 hsl(空格语法) 拼 'dd'/'cc' 透明度�
 
 /* 筛选只保存选择与目录，不保存历史明细。null=全部；Set=显式包含，exclude Set=全部中排除。 */
 let daysAll = [], renderedDay = '', loadFailed = false, loadSeq = 0;
-let arfTimer = null, arfNextAt = 0, rescanBusy = false, arfGen = 0;
-let rescanTimedOut = false, rescanTimedOutGen = 0;
+let arfTimer = null, arfNextAt = 0, refreshBusy = false, arfGen = 0;
+let refreshTimedOut = false;
 const _selKey = sel => sel ? JSON.stringify([sel.exclude ? 'exclude' : 'include', [...sel].sort()]) : '*';
 function allSrcIds() { return catalogItems('source').map(x => x.id); }
 function allMdlIds() { return catalogItems('model').map(x => x.id); }
@@ -546,13 +581,17 @@ function chartShapeKey(cfg) {
 }
 function mkChart(id, cfg) {
   if (!chartLibOk) {
-    /* 库缺失降级统一收口:替换 canvas 为提示块,一次即成
-       (canvas 消失后本函数恒在此返回,不再触碰 DOM);图表数据仍可看下方表格 */
     const el = $(id);
-    if (el && el.tagName === 'CANVAS') el.replaceWith(Object.assign(document.createElement('div'),
-      { className: 'chart-fallback', textContent: t('chart.fallback') }));
+    if (el && el.tagName === 'CANVAS') {
+      const fallbackId=el.id+'-fallback';
+      let fallback=document.getElementById(fallbackId);
+      if(!fallback){fallback=document.createElement('div');fallback.id=fallbackId;fallback.className='chart-fallback';el.insertAdjacentElement('afterend',fallback);}
+      fallback.textContent=t('chart.fallback');fallback.hidden=false;el.hidden=true;
+    }
     return null;
   }
+  const fallback=document.getElementById(id.slice(1)+'-fallback');if(fallback)fallback.hidden=true;
+  const canvas=$(id);if(canvas)canvas.hidden=false;
   const c = charts[id];
   const key = chartShapeKey(cfg);
   const restoreVisibility = chart => {
@@ -682,30 +721,38 @@ function setTableHTML(elId, html) {
 
 /* ---------------- 多选下拉(来源/模型同款交互) ---------------- */
 function persist(k, sel, solo = null) {
-  const selector=sel?{mode:sel.exclude?'exclude':'include',ids:[...sel]}:{mode:'all'};
+  const exact=k===MDL_LS_KEY&&!!sel?.exclude;
+  const selector=sel?{mode:sel.exclude?(exact?'exclude_exact':'exclude'):'include',ids:[...sel]}:{mode:'all'};
   const intent=solo===null?{mode:'ordinary'}:{mode:'solo',id:solo};
-  try { localStorage.setItem(k, JSON.stringify({version:1,selector,intent})); } catch (e) {}
+  try { localStorage.setItem(k, JSON.stringify({version:exact?2:1,selector,intent})); return true; } catch (e) {return false;}
 }
 function setSelection(dim, sel, solo = null, userChange = false) {
+  if(sel!==null&&typeof validateSelection==='function'&&!validateSelection(dim,sel))return false;
   const before=userChange?queryIntentKey():null,source=dim==='source';
   state[source?'srcSel':'mdlSel']=sel;
   state[source?'srcSolo':'mdlSolo']=solo;
-  persist(source?SRC_LS_KEY:MDL_LS_KEY,sel,solo);
+  if(!persist(source?SRC_LS_KEY:MDL_LS_KEY,sel,solo)&&typeof showSelectionIssue==='function')showSelectionIssue('storage',dim);
+  else if(typeof clearSelectionIssue==='function'){
+    clearSelectionIssue('storage',dim);
+    if(userChange){clearSelectionIssue('protocol',dim);clearSelectionIssue('limit',dim);}
+  }
   if(userChange&&before!==queryIntentKey())resetChartIntent();
+  return true;
 }
 function restoreSelection(dim) {
   const source=dim==='source',value=JSON.parse(lsGet(source?SRC_LS_KEY:MDL_LS_KEY)||'null');
   let stored=value,solo=null;
   const versioned=value&&Object.prototype.hasOwnProperty.call(value,'version');
   if(versioned){
-    if(value.version!==1||!value.selector||!value.intent||!['ordinary','solo'].includes(value.intent.mode))return;
+    if(![1,2].includes(value.version)||!value.selector||!value.intent||!['ordinary','solo'].includes(value.intent.mode))return;
     stored=value.selector;
   }else if(Array.isArray(value))stored={mode:'include',ids:value};
   if(stored===null)return;
-  if(!stored||!['all','include','exclude'].includes(stored.mode))return;
+  if(!stored||!['all','include','exclude','exclude_exact'].includes(stored.mode)||source&&stored.mode==='exclude_exact')return;
+  if(versioned&&(value.version===2&&stored.mode!=='exclude_exact'||value.version===1&&stored.mode==='exclude_exact'))return;
   if(stored.mode!=='all'&&(!Array.isArray(stored.ids)||!stored.ids.every(id=>typeof id==='string')))return;
   const sel=stored.mode==='all'?null:new Set(stored.ids);
-  if(sel)sel.exclude=stored.mode==='exclude';
+  if(sel)sel.exclude=stored.mode==='exclude'||stored.mode==='exclude_exact';
   if(versioned&&value.intent.mode==='solo'){
     if(typeof value.intent.id!=='string'||!sel||sel.exclude||sel.size!==1||!sel.has(value.intent.id))return;
     solo=value.intent.id;
@@ -714,18 +761,19 @@ function restoreSelection(dim) {
   state[source?'srcSolo':'mdlSolo']=solo;
 }
 /* 单项切换:勾满全部 → 回"全部";取消到空集 → 显式保持空(配合"全不选",便于再挑一两个) */
-function toggleSel(sel, ids, v) {
-  if (!sel) sel = new Set(ids);
-  else if(sel.exclude) sel = new Set(ids.filter(id=>!sel.has(id)));
+function toggleSel(sel, ids, v, complete=false) {
+  if(!sel){const next=new Set([v]);next.exclude=true;return next;}
+  if(sel.exclude){const next=new Set(sel);next.exclude=true;next.has(v)?next.delete(v):next.add(v);return next.size?next:null;}
+  sel=new Set(sel);
   sel.has(v) ? sel.delete(v) : sel.add(v);
-  return ids.length && ids.every(id=>sel.has(id)) ? null : sel;
+  return complete&&ids.length&&sel.size===ids.length&&ids.every(id=>sel.has(id)) ? null : sel;
 }
 function toggleSrc(s) {
-  setSelection('source',toggleSel(state.srcSel, allSrcIds(), s),null,true);
+  setSelection('source',toggleSel(state.srcSel, allSrcIds(), s, catalogComplete('source')),null,true);
   render();   // 打开中的面板由 render 末尾的 refreshOpenPanels 按焦点策略刷新
 }
 function toggleMdl(m) {
-  setSelection('model',toggleSel(state.mdlSel, allMdlIds(), m),null,true);
+  setSelection('model',toggleSel(state.mdlSel, allMdlIds(), m, catalogComplete('model')),null,true);
   render();
 }
 /* 表行 solo(2026-10-19 交互改版):点行=只看该模型;再点同一行(或它已是唯一选中)恢复全部。
@@ -836,8 +884,7 @@ $('#seg-lang').addEventListener('click', e => {
 function applyArf() {
   const gen = ++arfGen;
   clearTimeout(arfTimer);
-  /* 注意不动 rescanBusy:它是手动重扫 op 的派生状态,复位权归 op.finish 独占
-     (此处强写 false 会在重扫中切"关"时造成状态栏与按钮互相矛盾) */
+  /* 手动读库的忙碌状态由自身操作收尾，切换自动刷新不取消正在读取的结果。 */
   if (!state.arf) { arfNextAt = 0; renderStatus(); return; }
   const schedule = () => {
     if (gen !== arfGen) return;   // 幽灵链防线:切档后旧链到此为止
@@ -847,9 +894,9 @@ function applyArf() {
       if (gen !== arfGen) return;
       // Hidden tabs skip ordinary reads. The server's configured collection
       // interval is independent; returning to the page fetches its latest data.
-      // A manual scan owns its final read; ordinary ticks must not cancel it
+      // A manual refresh owns its database read; ordinary ticks must not cancel it
       // when multiple individually bounded queries outlast this interval.
-      if (document.hidden || rescanBusy) { schedule(); return; }
+      if (document.hidden || refreshBusy) { schedule(); return; }
       await load();
       schedule();   // schedule 入口再查 gen:await 挂起期间切档,链在此断掉
     }, Math.max(1000, state.arf * 1000));   // 下限 1s 兜底,任何路径都不会 0ms 自旋
@@ -860,7 +907,7 @@ function setArfUi() { segSync('#seg-arf', v => Number(v) === state.arf); }
 // 回前台/页面唤醒 → 立即补拉一次(修:hidden 暂停 tick 后,回前台若 arf=关或
 // serve 曾重启,页面会停在旧快照"看起来没数据";无论 arf 档位,可见性恢复即拉最新)
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) return;
+  if (document.hidden) { if(typeof cancelWakeConfirmation==='function')cancelWakeConfirmation(); return; }
   /* 链死亡自愈(2026-10-17 修):挂死 fetch 等历史原因可能已让 arf 定时链停摆
      (唯一现场症状:状态栏倒计时卡住不动)。回前台无条件重建定时链——
      arfGen 代际守卫保证旧链(即使还活着)被安全取代,不会双链 */
@@ -876,10 +923,12 @@ document.addEventListener('visibilitychange', () => {
     for (const k in charts) { try { charts[k].resize(); } catch (e) {} }
   });
 });
+window.addEventListener('pagehide', () => { if(typeof cancelWakeConfirmation==='function')cancelWakeConfirmation(); });
 window.addEventListener('pageshow', e => { if (e.persisted && !document.hidden) resumeDashboard(); });
 
 
 segBind('#seg-arf', 'arf', Number, () => {
+  if(typeof cancelWakeConfirmation==='function')cancelWakeConfirmation();
   lsSet(ARF_LS_KEY, state.arf);
   setArfUi();
   applyArf();
@@ -890,10 +939,15 @@ segBind('#seg-arf', 'arf', Number, () => {
   }
 });
 
-/* 手动刷新:触发重扫并轮询,直到数据时间戳变化(或超时)。
-   按钮的禁用/文案统一由 op 生命周期管理(进入置、finish 复位),handler 只负责触发
-   ——程序化重入时旧 op 的收尾不再把新 op 的按钮状态翻错(2026-10-17 二轮) */
-$('#btn-refresh').addEventListener('click', () => rescanUntilNew());
+/* 手动刷新只重读已保存的统计；采集周期由后台独立管理。 */
+$('#btn-refresh').addEventListener('click', () => {
+  if(typeof refreshSavedView==='function')refreshSavedView();
+  else retryDashboardAdapter(true);
+});
+$('#clear-model-filter').addEventListener('click', () => {
+  const dim=typeof selectionIssueDimension==='string'?selectionIssueDimension:'model';
+  if(setSelection(dim,null,null,true))render();
+});
 
 
 /* ---------------- 启动 ---------------- */
@@ -904,19 +958,45 @@ safe(() => restoreSelection('model'));
 safe(() => {  // 刷新间隔:键缺失时 Number(null)=0 会误命中"关"档——显式判空保默认 30s
   const aRaw = lsGet(ARF_LS_KEY);
   const a = aRaw === null ? NaN : Number(aRaw);
-  if (a === 5) { state.arf = 10; } else if ([10, 30, 60, 0].includes(a)) state.arf = a;
+  if (a === 5 || a === 10) { state.arf = 20; } else if ([20, 30, 60, 0].includes(a)) state.arf = a;
 });
 safe(() => {  // 单位制:有显式存储值(用户点过开关)则恢复;否则跟随语言默认(zh→万/亿,en→K/M)
   const u = lsGet(UNIT_LS_KEY);
   if (u === 'zh' || u === 'en') state.unit = u;
   else state.unit = langDefaultUnit(state.lang);
 });
+/* 图表模式不恢复:每次开页使用标准图,3D 由用户在当前页手动开启。 */
 /* 时间窗不恢复:刷新永远默认"今天"(用户决策;单日钻取本就是临时态,档位选择也不跨会话) */
 applyStaticI18n();   // 首帧前替换静态文案 + 同步 <html lang> 与 <title>
 setLangUi();
 setArfUi();
 setUnitUi();
 if (chartLibOk) chartBase();
+// This loader belongs to the small base UI, so an absent adapter cannot leave
+// the initial loading screen indefinitely. Never re-evaluate a parsed adapter:
+// its top-level lexical bindings are not safe to define twice.
+let adapterRetryCount=0,adapterRetryTimer=null,adapterRetryPending=false;
+function retryDashboardAdapter(manual=false) {
+  if(typeof load==='function')return;
+  if(manual){adapterRetryCount=0;clearTimeout(adapterRetryTimer);adapterRetryTimer=null;}
+  if(adapterRetryPending||adapterRetryTimer!==null)return;
+  const failed=adapterRetryCount>=3;
+  $('#status').textContent=(failed?t('status.scriptFailed'):t('status.scriptRetry'));
+  $('#status').title=t('status.scriptHint');
+  $('#scanning-txt').textContent=(failed?t('status.scriptFailed'):t('status.scriptRetry'));
+  if(failed)return;
+  adapterRetryTimer=setTimeout(()=>{
+    adapterRetryTimer=null;
+    if(typeof load==='function')return;
+    adapterRetryCount++;adapterRetryPending=true;
+    const script=document.createElement('script');
+    script.src='/dashboard_v2.js?retry='+adapterRetryCount;script.async=true;
+    const settled=()=>{adapterRetryPending=false;script.remove();retryDashboardAdapter();};
+    script.onload=settled;script.onerror=settled;
+    document.body.appendChild(script);
+  },[1000,3000,10000][adapterRetryCount]);
+}
+window.addEventListener('load',()=>retryDashboardAdapter());
 </script>
 <script src="/dashboard_v2.js"></script>
 </body>

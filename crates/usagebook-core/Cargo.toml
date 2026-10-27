@@ -20,9 +20,9 @@ uuid = { version = "=1.18.1", features = ["v4"] }
 base64 = "0.22"
 zstd.workspace = true
 rayon.workspace = true
-sha2.workspace = true
+sha2 = { workspace = true, features = ["compress"] }
 tracing.workspace = true
-rusqlite = { version = "0.40.2", features = ["bundled", "backup", "hooks", "functions"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup", "hooks", "functions", "blob"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

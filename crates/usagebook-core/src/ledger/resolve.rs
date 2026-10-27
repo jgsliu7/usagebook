@@ -152,9 +152,39 @@ fn valid_publish_cursor(family: &str, key: &str) -> bool {
 
 /// Freeze new evidence, or one complete v3 replay of a legacy Claude namespace.
 fn next_run(c: &Connection) -> Result<Option<FrozenRun>> {
+    let cursor: Option<String> = c
+        .query_row(
+            "SELECT value FROM ledger_scheduler WHERE key='publisher'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let (last_family, last_namespace): (String, String) = cursor
+        .as_deref()
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+    // A busy namespace never monopolizes either new or already-frozen runs.
+    // The cursor is durable; restarting the process does not reset priority.
+    let domain: Option<(String,String)> = c.query_row(
+        "WITH domains AS (
+           SELECT identity_family,namespace_key FROM ingest_runs WHERE state='publishing'
+           UNION
+           SELECT o.identity_family,o.namespace_key FROM usage_observations o
+           GROUP BY o.identity_family,o.namespace_key
+           HAVING MAX(o.observation_id)>COALESCE((SELECT MAX(r.upper_observation_id) FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done'),0)
+             OR (o.identity_family='claude' AND NOT EXISTS(SELECT 1 FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done' AND r.resolver_version=?3))
+         ) SELECT identity_family,namespace_key FROM domains
+         ORDER BY CASE WHEN (identity_family,namespace_key)>(?1,?2) THEN 0 ELSE 1 END,identity_family,namespace_key LIMIT 1",
+        params![last_family,last_namespace,RESOLVER_VERSION], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((family_filter, namespace_filter)) = domain else {
+        return Ok(None);
+    };
+    let cursor = serde_json::to_string(&(&family_filter, &namespace_filter))
+        .map_err(|_| LedgerError::CorruptLedger)?;
+    c.execute("INSERT INTO ledger_scheduler(key,value) VALUES('publisher',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[cursor])?;
     #[allow(clippy::type_complexity)]
     let active:Option<(i64,String,String,i64,i64,Option<String>,String,String,i64)>=c.query_row(
-        "SELECT run_id,identity_family,namespace_key,lower_observation_id,upper_observation_id,last_publish_key,epoch,resolver_version,identity_version FROM ingest_runs WHERE state='publishing' ORDER BY run_id LIMIT 1",[],
+        "SELECT run_id,identity_family,namespace_key,lower_observation_id,upper_observation_id,last_publish_key,epoch,resolver_version,identity_version FROM ingest_runs WHERE state='publishing' AND identity_family=?1 AND namespace_key=?2 ORDER BY run_id LIMIT 1",params![family_filter,namespace_filter],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
     let (epoch, iv): (String, i64) = c.query_row(
         "SELECT epoch,identity_version FROM ledger_meta WHERE singleton=1",
@@ -196,13 +226,13 @@ fn next_run(c: &Connection) -> Result<Option<FrozenRun>> {
         }));
     }
     let repair:Option<(String,String,i64,i64)>=c.query_row(
-        "SELECT o.identity_family,o.namespace_key,0,MAX(MAX(o.observation_id),COALESCE((SELECT MAX(r.upper_observation_id) FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done'),0)) FROM usage_observations o WHERE o.identity_family='claude' AND NOT EXISTS(SELECT 1 FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done' AND r.resolver_version=?1) GROUP BY o.identity_family,o.namespace_key ORDER BY o.namespace_key LIMIT 1", [RESOLVER_VERSION],
+        "SELECT o.identity_family,o.namespace_key,0,MAX(MAX(o.observation_id),COALESCE((SELECT MAX(r.upper_observation_id) FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done'),0)) FROM usage_observations o WHERE o.identity_family='claude' AND o.identity_family=?2 AND o.namespace_key=?3 AND NOT EXISTS(SELECT 1 FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done' AND r.resolver_version=?1) GROUP BY o.identity_family,o.namespace_key ORDER BY o.namespace_key LIMIT 1", params![RESOLVER_VERSION,family_filter,namespace_filter],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let next = if repair.is_some() {
         repair
     } else {
         c.query_row(
-        "SELECT o.identity_family,o.namespace_key,COALESCE((SELECT MAX(r.upper_observation_id) FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done'),0) AS lower,MAX(o.observation_id) AS upper FROM usage_observations o GROUP BY o.identity_family,o.namespace_key HAVING upper>lower ORDER BY o.identity_family,o.namespace_key LIMIT 1",[],
+        "SELECT o.identity_family,o.namespace_key,COALESCE((SELECT MAX(r.upper_observation_id) FROM ingest_runs r WHERE r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key AND r.state='done'),0) AS lower,MAX(o.observation_id) AS upper FROM usage_observations o WHERE o.identity_family=?1 AND o.namespace_key=?2 GROUP BY o.identity_family,o.namespace_key HAVING upper>lower ORDER BY o.identity_family,o.namespace_key LIMIT 1",params![family_filter,namespace_filter],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?
     };
     if let Some((family, namespace, lower, upper)) = next {
@@ -238,7 +268,7 @@ pub(crate) fn invalidate_run_units(c: &Connection) -> Result<()> {
 }
 
 fn make_run_units(c: &Connection, r: &FrozenRun) -> Result<()> {
-    c.execute("DELETE FROM ledger_run_units", [])?;
+    c.execute("DELETE FROM ledger_run_units WHERE run_id=?1", [r.id])?;
     // hex() uses UTF-8 bytes, rather than code-point or locale ordering.
     c.execute("INSERT OR IGNORE INTO ledger_run_units SELECT ?1,CASE WHEN identity_family='claude' AND fact_kind='request' AND native_message_id IS NOT NULL THEN 'm:'||lower(hex(native_message_id)) ELSE 'k:'||identity_key END,CASE WHEN identity_family='claude' AND fact_kind='request' AND native_message_id IS NOT NULL THEN NULL ELSE identity_key END,CASE WHEN identity_family='claude' AND fact_kind='request' AND native_message_id IS NOT NULL THEN native_message_id ELSE NULL END FROM usage_observations WHERE identity_family=?2 AND namespace_key=?3 AND observation_id>?4 AND observation_id<=?5 AND (identity_key IS NOT NULL OR (identity_family='claude' AND fact_kind='request' AND native_message_id IS NOT NULL))",params![r.id,r.family,r.namespace,r.lower,r.upper])?;
     Ok(())
@@ -284,12 +314,15 @@ impl Ledger {
             )?;
             if !cached {
                 make_run_units(&self.conn, &run)?;
-                self.conn.execute("DELETE FROM ledger_run_cache", [])?;
+                self.conn
+                    .execute("DELETE FROM ledger_run_cache WHERE run_id=?1", [run.id])?;
                 self.conn.execute(
                     "INSERT INTO ledger_run_cache VALUES(?1,?2)",
                     params![run.id, data_version],
                 )?;
             }
+            let mut quantum_units = 0usize;
+            let mut yielded = false;
             loop {
                 // Separate first-page and resumed SQL so the composite key is a range seek.
                 let key: Option<String> = match &run.last {
@@ -327,11 +360,19 @@ impl Ledger {
                 tx.commit()?;
                 regression_stop("t4_after_commit");
                 summary.units += 1;
+                quantum_units += 1;
                 summary.changed_units += u64::from(changed);
                 run.last = Some(key);
                 if summary.units >= max_units as u64 {
                     return Ok(summary);
                 }
+                if quantum_units >= 32 {
+                    yielded = true;
+                    break;
+                }
+            }
+            if yielded {
+                continue;
             }
             let tx = self
                 .conn
@@ -345,6 +386,10 @@ impl Ledger {
             regression_stop("t4_done_before_commit");
             tx.commit()?;
             regression_stop("t4_done_after_commit");
+            self.conn
+                .execute("DELETE FROM ledger_run_units WHERE run_id=?1", [run.id])?;
+            self.conn
+                .execute("DELETE FROM ledger_run_cache WHERE run_id=?1", [run.id])?;
             summary.runs += 1;
         }
         Ok(summary)
@@ -622,7 +667,7 @@ fn equivalent_claude_blocks(a: &Observation, b: &Observation) -> bool {
 }
 
 fn repeated_claude_block(c: &Connection, canonical: &str) -> Result<Option<Observation>> {
-    let mut q = c.prepare("SELECT o.* FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility<>'identity_only' ORDER BY o.occurred_ms,o.normalized_hash,o.identity_key,o.observation_id")?;
+    let mut q = c.prepare("SELECT o.* FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility NOT IN('identity_only','pending_finality') ORDER BY o.occurred_ms,o.normalized_hash,o.identity_key,o.observation_id")?;
     let mut rows = q.query([canonical])?;
     let mut first: Option<Observation> = None;
     let mut different_time = false;
@@ -660,10 +705,10 @@ fn decide(c: &Connection, canonical: &str, allow_blocks: bool) -> Result<Decisio
             });
         }
     }
-    let sql="SELECT o.* FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility<>'identity_only' ORDER BY o.normalized_hash,o.identity_key,o.observation_id";
+    let sql="SELECT o.* FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility NOT IN('identity_only','pending_finality') ORDER BY o.normalized_hash,o.identity_key,o.observation_id";
     // Authorities are adapter-owned. No current Claude request adapter has one.
-    let authority_count:i64=c.query_row("SELECT COUNT(DISTINCT o.revision_authority) FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility<>'identity_only'",[canonical],|r|r.get(0))?;
-    let authority:Option<String>=c.query_row("SELECT MAX(o.revision_authority) FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility<>'identity_only'",[canonical],|r|r.get(0))?;
+    let authority_count:i64=c.query_row("SELECT COUNT(DISTINCT o.revision_authority) FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility NOT IN('identity_only','pending_finality')",[canonical],|r|r.get(0))?;
+    let authority:Option<String>=c.query_row("SELECT MAX(o.revision_authority) FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.eligibility NOT IN('identity_only','pending_finality')",[canonical],|r|r.get(0))?;
     let revision: Option<i64> = if let Some(a) = &authority {
         c.query_row("SELECT MAX(o.revision_no) FROM ledger_unit_members m CROSS JOIN ledger_unit_evidence e ON e.raw_key=m.raw_key CROSS JOIN usage_observations o ON o.observation_id=e.id WHERE m.canonical_key=?1 AND o.revision_authority=?2",params![canonical,a],|r|r.get(0))?
     } else {
@@ -854,6 +899,9 @@ fn cumulative_conflict(c: &Connection, canonical: &str, selected: &Observation) 
     let mut rows = q.query([canonical])?;
     while let Some(row) = rows.next()? {
         let candidate = load_observation(row)?;
+        if candidate.eligibility == "pending_finality" {
+            continue;
+        }
         if candidate.eligibility != "eligible"
             || candidate.action != "upsert"
             || !monotonic_replacement(&candidate, selected)
@@ -1179,6 +1227,8 @@ pub(crate) fn rebuild_unit(
         c.execute("INSERT OR IGNORE INTO ledger_unit_alias SELECT canonical_key,canonical_key FROM ledger_unit_members WHERE raw_key<>canonical_key",[])?;
         c.execute("INSERT OR IGNORE INTO ledger_unit_alias SELECT raw_key,canonical_key FROM ledger_unit_members WHERE raw_key<>canonical_key",[])?;
     }
+    super::adoption::guard_selections(c, family, namespace)?;
+    super::coverage::guard_selections(c, family, namespace)?;
     let event_diff:bool=c.query_row("SELECT EXISTS(SELECT identity_key,selected_id,state,has_conflict,fact_kind FROM ledger_unit_decisions EXCEPT SELECT e.identity_key,e.selected_observation_id,e.state,e.has_conflict,e.fact_kind FROM ledger_unit_old_keys k CROSS JOIN usage_events e ON e.identity_key=k.identity_key WHERE e.identity_family=?1 AND e.namespace_key=?2) OR EXISTS(SELECT e.identity_key,e.selected_observation_id,e.state,e.has_conflict,e.fact_kind FROM ledger_unit_old_keys k CROSS JOIN usage_events e ON e.identity_key=k.identity_key WHERE e.identity_family=?1 AND e.namespace_key=?2 EXCEPT SELECT identity_key,selected_id,state,has_conflict,fact_kind FROM ledger_unit_decisions)",params![family,namespace],|r|r.get(0))?;
     let alias_diff:bool=c.query_row("SELECT EXISTS(SELECT alias_key,canonical_key FROM ledger_unit_alias EXCEPT SELECT a.alias_key,a.canonical_key FROM ledger_unit_old_keys k CROSS JOIN identity_alias a ON a.alias_key=k.identity_key WHERE a.identity_family=?1 AND a.namespace_key=?2) OR EXISTS(SELECT a.alias_key,a.canonical_key FROM ledger_unit_old_keys k CROSS JOIN identity_alias a ON a.alias_key=k.identity_key WHERE a.identity_family=?1 AND a.namespace_key=?2 EXCEPT SELECT alias_key,canonical_key FROM ledger_unit_alias)",params![family,namespace],|r|r.get(0))?;
     if !event_diff && !alias_diff {
@@ -1224,7 +1274,14 @@ fn change_rollup(c: &Connection, o: &Observation, sign: i64) -> Result<()> {
     )?;
     let (start, end, day) =
         metrics::day_bounds(&tz, o.occurred_ms.ok_or(LedgerError::CorruptLedger)?)?;
-    let values = metrics::evaluate(&o.metrics)?;
+    let mut values = metrics::evaluate(&o.metrics)?;
+    if o.parser_version == "reported-history-v1" {
+        for value in &mut values {
+            if value.known_value.is_some() {
+                value.state = ValueState::Partial;
+            }
+        }
+    }
     let mut columns = String::from("event_count,bucket_revision");
     for name in METRIC_NAMES {
         columns.push_str(&format!(

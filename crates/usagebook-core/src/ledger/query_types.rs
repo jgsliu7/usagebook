@@ -67,6 +67,10 @@ pub enum Selector {
     Exclude {
         ids: Vec<String>,
     },
+    /// A strict complement, including unknown-model records unless explicitly excluded.
+    ExcludeExact {
+        ids: Vec<String>,
+    },
 }
 impl<'de> Deserialize<'de> for Selector {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -84,20 +88,33 @@ impl<'de> Deserialize<'de> for Selector {
             impl<'de> serde::de::Visitor<'de> for Limited {
                 type Value = Vec<String>;
                 fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                    f.write_str("at most 10000 selected IDs")
+                    f.write_str("at most 20000 selected IDs")
                 }
                 fn visit_seq<A: serde::de::SeqAccess<'de>>(
                     self,
                     mut seq: A,
                 ) -> Result<Self::Value, A::Error> {
-                    let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(10000));
+                    let mut out = Vec::with_capacity(
+                        seq.size_hint().unwrap_or(0).min(MAX_MODEL_SELECTOR_IDS),
+                    );
+                    let mut total_bytes = 0usize;
                     while let Some(v) = seq.next_element::<String>()? {
-                        if out.len() == 10000 || v.len() > 1400 {
+                        if out.len() == MAX_MODEL_SELECTOR_IDS || v.len() > 1400 {
                             return Err(serde::de::Error::custom(
                                 "QUERY_LIMIT: selector exceeds limits",
                             ));
                         }
+                        total_bytes = total_bytes.checked_add(v.len()).ok_or_else(|| {
+                            serde::de::Error::custom("QUERY_LIMIT: selector exceeds byte limit")
+                        })?;
                         out.push(v);
+                        if out.len() > LARGE_SELECTOR_THRESHOLD
+                            && total_bytes > MAX_LARGE_SELECTOR_IDS_BYTES
+                        {
+                            return Err(serde::de::Error::custom(
+                                "QUERY_LIMIT: selector exceeds byte limit",
+                            ));
+                        }
                     }
                     Ok(out)
                 }
@@ -109,6 +126,7 @@ impl<'de> Deserialize<'de> for Selector {
             ("all", None) => Ok(Self::All),
             ("include", Some(ids)) => Ok(Self::Include { ids }),
             ("exclude", Some(ids)) => Ok(Self::Exclude { ids }),
+            ("exclude_exact", Some(ids)) => Ok(Self::ExcludeExact { ids }),
             _ => Err(serde::de::Error::custom("invalid selector fields")),
         }
     }
@@ -118,24 +136,33 @@ impl Selector {
         match self {
             Self::All => true,
             Self::Include { ids } => ids.iter().any(|v| v == id),
-            Self::Exclude { ids } => !ids.iter().any(|v| v == id),
+            Self::Exclude { ids } | Self::ExcludeExact { ids } => !ids.iter().any(|v| v == id),
         }
     }
     pub fn ids(&self) -> &[String] {
         match self {
             Self::All => &[],
-            Self::Include { ids } | Self::Exclude { ids } => ids,
+            Self::Include { ids } | Self::Exclude { ids } | Self::ExcludeExact { ids } => ids,
         }
     }
     pub fn normalize(&mut self, max: usize, max_bytes: usize) -> QueryResult<()> {
         match self {
             Self::All => {}
-            Self::Include { ids } | Self::Exclude { ids } => {
+            Self::Include { ids } | Self::Exclude { ids } | Self::ExcludeExact { ids } => {
                 if ids.len() > max {
                     return Err(QueryError::limit("too many selected IDs"));
                 }
                 if ids.iter().any(|v| v.len() > max_bytes) {
                     return Err(QueryError::limit("selected ID too long"));
+                }
+                if ids.len() > LARGE_SELECTOR_THRESHOLD {
+                    let bytes = ids
+                        .iter()
+                        .try_fold(0usize, |n, id| n.checked_add(id.len()))
+                        .ok_or_else(|| QueryError::limit("selector exceeds byte limit"))?;
+                    if bytes > MAX_LARGE_SELECTOR_IDS_BYTES {
+                        return Err(QueryError::limit("selector exceeds byte limit"));
+                    }
                 }
                 ids.sort();
                 ids.dedup();
@@ -328,6 +355,9 @@ pub type CatalogPage = serde_json::Value;
 pub type Status = serde_json::Value;
 
 pub const MAX_BODY: usize = 16 * 1024 * 1024;
+pub const MAX_MODEL_SELECTOR_IDS: usize = 20_000;
+pub const LARGE_SELECTOR_THRESHOLD: usize = 10_000;
+pub const MAX_LARGE_SELECTOR_IDS_BYTES: usize = 2 * 1024 * 1024;
 impl QueryRequest {
     pub fn from_json(body: &[u8]) -> QueryResult<Self> {
         decode(body)

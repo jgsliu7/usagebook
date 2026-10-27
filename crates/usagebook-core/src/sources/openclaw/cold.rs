@@ -16,7 +16,7 @@ pub(super) const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REFERENCES: usize = 100_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub(super) struct Archive {
+pub(crate) struct Archive {
     pub session_id: String,
     pub generation: String,
     pub archive_name: String,
@@ -35,7 +35,7 @@ fn unsigned(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
 }
 
-pub(super) fn references(conn: &Connection) -> Result<Vec<Archive>, &'static str> {
+pub(crate) fn references(conn: &Connection) -> Result<Vec<Archive>, &'static str> {
     // Fixed upstream bd04f4c, state/openclaw-agent-db-contract.ts: current 24;
     // schema 20 introduced cold transcripts. Do not guess future compatibility.
     // Existing unversioned/legacy projections retain their column-shape checks.
@@ -210,7 +210,7 @@ struct Event {
     created_at: i64,
 }
 
-pub(super) fn scan(
+pub(crate) fn scan(
     conn: &Connection,
     archive: &Archive,
     cold_dir: &Path,

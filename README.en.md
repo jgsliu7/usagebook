@@ -10,7 +10,9 @@ usagebook parses the on-disk data of 27 AI coding tools — read-only, zero conf
 - **27 scannable sources** (20 verified on real machines + 7 per upstream implementation), 1 suspended. macOS first; Linux builds from source; Windows is not usable yet (automated tests failing, no prebuilt archive).
 - **Dashboard**: `usagebook serve` starts a local-only dashboard at `http://127.0.0.1:7878` with daily/hourly trends and source/model breakdowns. Collection runs continuously by default while the process is running. `--refresh-secs` sets the wait after each round (default 60, range 5–86400); page update settings never change it. Use `--collection-mode on-demand` to require new status views for periodic collection after a successful round. Before any round succeeds, whole-round failures retry without views; after a success, later failures still follow the new-view requirement. Individual source errors remain visible. Sleep and process exit stop this guarantee; no system service is installed.
 
-The page selector (10s/30s/1min/off) controls ordinary page reads. Turning it off does not change collection settings; initial loading, recovery, returning to the page and user actions can still fetch data. Manual refresh queues a merged collection request.
+The page selector (20s/30s/1min/off) controls ordinary page reads. Turning it off does not change collection settings; initial loading, recovery, returning to the page and user actions can still fetch data. Manual refresh queues a merged collection request.
+
+Page queries read the local database immediately while collection resumes durable checkpoints in the background. New records with old timestamps and sessions spanning midnight remain eligible. First installation, new tools or roots, and adapter capability upgrades backfill readable history; routine historical audits run every 24 hours. Already adopted contributions stay unchanged. Schema v5 protects permanent deletion controls and requires an upgraded binary.
 - **Interface language**: the dashboard supports **English and 简体中文** — toggle `中文 / EN` in the header; your choice is remembered per browser. Non-zh/en browsers default to English.
 
 ## Supported sources
@@ -45,11 +47,15 @@ The page selector (10s/30s/1min/off) controls ordinary page reads. Turning it of
 
 ## Install (from source)
 
+Source builds require Rust, a C toolchain, and Node.js 22+ with npm. The installer generates dashboard assets locally; generated bundles and target directories are excluded from Git. Prebuilt binaries do not require Node.js.
+
 ```bash
 git clone https://github.com/jgsliu7/usagebook
 cd usagebook
 sh install.sh          # installs to ~/.local/bin by default (see INSTALL.md)
 # or build directly:
+npm ci --include=dev --include=optional --ignore-scripts --no-audit --no-fund
+npm run build:dashboard3d
 cargo build --release --locked  # binary at target/release/usagebook
 ```
 
@@ -67,9 +73,9 @@ usagebook serve      # local dashboard (add --open to launch browser)
 usagebook doctor     # discover source dirs; --check verifies parsing
 ```
 
-### Durable ledger (first version)
+### Durable ledger
 
-Claude Code now has an opt-in durable ledger. Other sources remain visible in the same dashboard and are marked **unprotected**:
+`serve` creates and uses a durable ledger by default. First discovery imports readable history; newly supported tools, roots and capabilities receive their own backfill. Use `serve --temporary` only for explicit temporary operation. Manual commands remain available:
 
 ```bash
 usagebook ledger init --timezone UTC   # --timezone defaults to the system timezone
@@ -78,13 +84,13 @@ usagebook ledger status
 usagebook serve
 ```
 
-Saved Claude usage survives source cleanup. Unchanged files skip body reads; damaged files and unreadable subdirectories are isolated while healthy directories continue to ingest. Incomplete discovery preserves existing history and marks incomplete coverage; only a complete scan can mark unseen files missing. The ledger stores usage metadata, never conversation text. Request facts are retained; daily rollups can be recomputed from facts.
+Confirmed usage and saved pending evidence survive source cleanup. Admission depends on verified identity, finality and overlap rules. Evidence-only sources continue live queries, so their displayed totals can still change with external logs. The current source boundaries are listed in [History preservation](docs/历史用量保存.md). Unchanged files skip body reads; damaged files and unreadable subdirectories are isolated while healthy directories continue to ingest. Incomplete discovery preserves existing history and marks incomplete coverage; only a complete scan can mark unseen files missing. The ledger stores usage metadata, never conversation text. Request facts are retained; daily rollups can be recomputed from facts.
 
-`ledger init` creates an empty ledger without collecting data. Restart an already running server to validate and use it. The dashboard shows temporary mode, pending restart/validation, and per-source storage protection. A detected file is not proof of a valid ledger. During a connection failure, the panel labels cached information as the last confirmed state.
+`ledger init` creates an empty ledger without collecting data; `serve` starts background collection. CC Switch request and daily history is saved and revisited for changes, but unproved account, timezone or native overlap stays pending and is excluded from formal totals. A database file alone is not proof of complete coverage.
 
 CC Switch daily evidence is currently excluded from formal totals because ownership, historical time boundaries and overlap are unverified. The dashboard explains this separately from read success. A later empty or failed read retains previous evidence, its successful read time and a stale notice. Daily-only values are never fabricated into hourly requests. Charts use the occurrence time and the displayed result's report timezone; late records update their original date.
 
-After stopping the server, `ledger pause --source claude` pauses new collection, including subsequently discovered roots; saved history remains readable. Mixed enabled/paused roots make new roots paused conservatively. `ledger resume --source claude` enables existing roots and future discoveries inherit that state. This does not add pause or durable support to live sources, and an unregistered source cannot be paused in advance.
+After stopping the server, `ledger pause --source claude` pauses new collection, including subsequently discovered roots; saved history remains readable. Mixed enabled/paused roots make new roots paused conservatively. `ledger resume --source claude` enables existing roots and future discoveries inherit that state. Evidence-only adapters also respect pause; an unregistered source cannot be paused in advance.
 
 The default `usage-ledger.db` lives in `~/Library/Application Support/usagebook/` on macOS, `$XDG_DATA_HOME/usagebook/` (default `~/.local/share/usagebook/`) on Linux, and `%LOCALAPPDATA%\usagebook\` on Windows. Override the complete filename with `USAGEBOOK_LEDGER_PATH`. The legacy scan-cache settings do not disable or delete this ledger.
 
@@ -94,7 +100,7 @@ API changes: `/api/data` returns 410. The dashboard uses `/api/v2/status`, `/api
 
 The default report uses one cutoff for day/source/model tables and checks the complete ledger stamp before emitting every page, including session totals. A concurrent update stops output with `CURSOR_STALE` and exit code 3; rerun from the beginning, as an emitted prefix is not a complete report. Session totals retain their independent, unwindowed meaning. Read transactions end before writing output, so a slow consumer does not hold a reader transaction across pages.
 
-Status adds `collection`, `storage`, and per-source `history_protection`, `durable_supported`, and `last_scanned_at_ms`. CC `accounting.unaccounted_rows` counts excluded daily evidence rows, not requests. The legacy live `last_saved_at_ms` remains a scan-time compatibility alias; new clients must not interpret it as durable storage time.
+Status adds `collection`, `storage`, and per-source `history_protection`, `durable_supported`, and `last_scanned_at_ms`. `initial_import` separates fixed targets, gaps and saved/published watermarks. `saved_pending_candidates` counts unconfirmed observations; `confirmed_events` / `verified_events` counts verified facts; `source_reported_events` counts explicitly selected reported facts, and `adopted_events` is their sum. An interval fact is not an individual request. CC `accounting.unaccounted_rows` counts pending evidence, not requests. Live `last_saved_at_ms` is an actual evidence-save timestamp when evidence exists, otherwise a legacy scan-time alias; use `last_scanned_at_ms` for scan time and inspect the protection state separately.
 
 This version has been tested on macOS. Linux/Windows application-level validation and large-scale release benchmarks remain release gates. Use local disks; blocking operations on mounted source directories are not yet fully isolated.
 
@@ -137,9 +143,11 @@ Troubleshooting: attach that directory when reporting issues (redact first — p
 ## Disclaimer
 
 - usagebook only **reads** existing local files for statistics; it never modifies any tool's data and makes no network requests at runtime.
-- Saved Claude ledger facts survive source cleanup. Unmigrated sources still depend on their remaining logs. Records removed before their first successful import cannot be recovered.
+- Confirmed ledger facts and saved pending evidence survive source cleanup. Live totals for unadmitted formats still depend on their remaining logs. Records removed before their first successful import cannot be recovered.
 - usagebook is not affiliated with any of the listed AI coding tools; all names and trademarks belong to their respective owners.
 
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
+Explicit `ledger adopt-legacy` previews can freeze a supported legacy reporting basis. Limited CC history selection supports strongly identified OpenCode records and complete Pi daily ranges. These contributions remain source-reported; they are not promoted to verified requests. See [History preservation](docs/历史用量保存.md) for admission, query, and maintenance boundaries. Back up before upgrading to schema v4; older binaries cannot open the new schema.

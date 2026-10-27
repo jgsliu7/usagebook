@@ -38,6 +38,9 @@ enum Command {
         /// 服务就绪后打开本机看板
         #[arg(long)]
         open: bool,
+        /// 临时诊断模式：不创建或写入长期用量账本
+        #[arg(long)]
+        temporary: bool,
     },
     /// 本机数据源自检:发现目录；--check 检查实际解析结果(退出码:0 正常,2 参数错误,3 数据性失败)
     Doctor {
@@ -167,8 +170,9 @@ fn main() {
             refresh_secs,
             collection_mode,
             open,
+            temporary,
         }) => {
-            ledger_http::run(port, refresh_secs, collection_mode, open);
+            ledger_http::run(port, refresh_secs, collection_mode, open, temporary);
         }
         None => {
             ledger_cli::report(

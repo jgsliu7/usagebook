@@ -70,6 +70,16 @@ if [ -z "$binary" ]; then
         binary="$script_dir/usagebook"
     elif [ -f "$script_dir/Cargo.toml" ]; then
         command -v cargo >/dev/null 2>&1 || fail '源码安装需要 Rust；请按 INSTALL.md 安装，或使用预编译发行包'
+        command -v npm >/dev/null 2>&1 || fail '源码安装需要 Node.js 与 npm 来构建看板；请按 INSTALL.md 安装，或使用预编译发行包'
+        (
+            cd "$script_dir"
+            if [ "$offline" = true ]; then
+                npm ci --offline --include=dev --include=optional --ignore-scripts --no-audit --no-fund
+            else
+                npm ci --include=dev --include=optional --ignore-scripts --no-audit --no-fund
+            fi
+            npm run build:dashboard3d
+        )
         build_dir="${CARGO_TARGET_DIR:-$script_dir/target}"
         case "$build_dir" in /*) ;; *) build_dir="$(pwd)/$build_dir" ;; esac
         if [ "$offline" = true ]; then

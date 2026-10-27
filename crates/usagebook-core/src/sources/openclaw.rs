@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
-mod cold;
+pub(crate) mod cold;
 use std::path::{Path, PathBuf};
 
 pub struct OpenclawSource;

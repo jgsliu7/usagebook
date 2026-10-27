@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 pub const CLAUDE_FAMILY: &str = "claude";
 pub const CLAUDE_NAMESPACE: &str = "unknown:claude";
-pub const PARSER_VERSION: &str = "claude-ledger-v1";
+pub const PARSER_VERSION: &str = "claude-ledger-v2";
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CANDIDATE_BYTES: usize = 1024 * 1024;
 
@@ -130,6 +130,7 @@ fn decimal(v: &Value) -> Option<(i64, i64)> {
 }
 fn base(v: &Value) -> Result<Observation> {
     let mut o = Observation::default();
+    o.parser_version = PARSER_VERSION.into();
     o.native_session_id = native_string(v, "/sessionId")?;
     o.session_key = o
         .native_session_id
@@ -244,6 +245,27 @@ pub fn parse_line(line: &[u8]) -> Result<ParsedRecord> {
                 .map(|m| format!("n:{}", m.to_lowercase()))
                 .unwrap_or_default();
             finish(&mut o);
+            // Persisted assistant records can include message-start usage
+            // (notably output_tokens=0), followed by a final record with the
+            // same native request identity. Only a protocol terminal reason
+            // makes this a final request. A complete JSON line alone does not.
+            // Keep the original numbers as pending evidence; the resolver must
+            // not mix them into the final numeric projection.
+            if o.eligibility == "eligible"
+                && !matches!(
+                    v.pointer("/message/stop_reason").and_then(Value::as_str),
+                    Some(
+                        "end_turn"
+                            | "tool_use"
+                            | "max_tokens"
+                            | "stop_sequence"
+                            | "pause_turn"
+                            | "refusal"
+                    )
+                )
+            {
+                o.eligibility = "pending_finality".into();
+            }
             normalized_bytes(&o)?;
             Ok(ParsedRecord {
                 observations: vec![o],
@@ -348,6 +370,15 @@ fn known_non_usage_type(kind: &str) -> bool {
             | "worktree-state"
             | "frame-link"
             | "bridge-session"
+            | "agent-setting"
+            | "fork-context-ref"
+            | "continued-in"
+            // Outbound request diagnostics describe settings and replayed
+            // context, not billed response usage. In particular, the blob's
+            // assistant content is a prompt fragment, not a new response.
+            | "api-request-shape"
+            | "api-request-blob"
+            | "api-request"
     )
 }
 
@@ -412,7 +443,7 @@ pub(crate) fn visit_line(
         _ => {
             return Err(LedgerError::InvalidInput(
                 "modelUsage must be an object".into(),
-            ))
+            ));
         }
     };
     if let Some(models) = models {

@@ -2,14 +2,14 @@
 //! Never serializes a synthetic midnight request for native daily evidence.
 use super::query_types::{QueryError, QueryResult};
 use crate::model::{Caliber, ScanStats, UsageRecord};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegacyDay {
     pub row_key: String,
     pub report_source: String,
@@ -23,7 +23,7 @@ pub struct LegacyDay {
     pub end_ms: Option<i64>,
     pub projection: [Option<i64>; 10],
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LegacyEntry {
     Request {
         record: UsageRecord,
@@ -48,7 +48,7 @@ impl LegacyEntry {
         }
     }
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LegacySourceStatus {
     pub last_scanned_ms: Option<i64>,
     pub stale: bool,
@@ -58,22 +58,351 @@ pub struct LegacySourceStatus {
     /// Readable historical evidence that cannot be allocated to request windows.
     pub unallocated_sessions: usize,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegacySnapshot {
     pub generation: String,
     pub routing_hash: String,
     pub entries: Vec<LegacyEntry>,
     pub sources: BTreeMap<String, LegacySourceStatus>,
-    // Process-local availability evidence only: not query content, persisted
-    // state, or public status. An empty complete scan still remembers its inputs.
+    // Private availability evidence. Never exposed in query content/status.
+    // A complete empty scan also remembers its inputs across process restarts.
     input_containers: BTreeMap<String, Vec<InputContainer>>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct InputContainer {
     path: PathBuf,
     directory: bool,
 }
+
+/// Exact scopes supported by compatibility captures. Durable identity keys are
+/// deliberately not inferred from legacy session IDs or model/time similarity.
+type CapturePrivacyRule = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+pub(crate) struct CapturePrivacy {
+    rules: Vec<CapturePrivacyRule>,
+    adoption_ranges: Vec<(String, i64, i64)>,
+}
+impl CapturePrivacy {
+    pub(crate) fn load(conn: &rusqlite::Connection) -> QueryResult<Self> {
+        let rules = conn.prepare("SELECT kind,report_source,native_tool,start_ms,end_ms FROM suppression_rules WHERE kind IN('source','window')")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let adoption_ranges = conn.prepare("SELECT consumer_tool,start_ms,end_ms FROM adoption_forget_ranges WHERE identity_family IS NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Self {
+            rules,
+            adoption_ranges,
+        })
+    }
+    pub(crate) fn suppresses(
+        &self,
+        conn: &rusqlite::Connection,
+        entry: &LegacyEntry,
+    ) -> QueryResult<bool> {
+        let (native, time, start, end) = match entry {
+            LegacyEntry::Request {
+                record,
+                native_tool,
+                ..
+            } => (
+                native_tool.as_str(),
+                (record.ts_ms > 0).then_some(record.ts_ms),
+                None,
+                None,
+            ),
+            LegacyEntry::SessionTotal { record, .. } => (
+                record.source,
+                (record.ts_ms > 0).then_some(record.ts_ms),
+                None,
+                None,
+            ),
+            LegacyEntry::Day(day) => (day.native_tool.as_str(), None, day.start_ms, day.end_ms),
+        };
+        let overlaps = |a: i64, b: i64| {
+            time.is_some_and(|t| t >= a && t < b)
+                || start.zip(end).is_some_and(|(x, y)| x < b && y > a)
+        };
+        let matching = |source: &Option<String>, tool: &Option<String>| {
+            source.as_deref().is_none_or(|s| s == entry.report_source())
+                && tool.as_deref().is_none_or(|t| t == native)
+        };
+        if self
+            .rules
+            .iter()
+            .any(|(kind, source, tool, _, _)| kind == "source" && matching(source, tool))
+        {
+            return Ok(true);
+        }
+        let complete_day = |a: i64, b: i64| -> QueryResult<()> {
+            if start.zip(end).is_some_and(|(x, y)| a > x || b < y) {
+                return Err(QueryError::new("PRIVACY_SCOPE_INCOMPLETE", "saved daily summaries are indivisible; privacy controls cover only part of this native day"));
+            }
+            Ok(())
+        };
+        for (_, source, tool, a, b) in &self.rules {
+            if !matching(source, tool) {
+                continue;
+            }
+            if let Some((a, b)) = a.zip(*b).filter(|(a, b)| overlaps(*a, *b)) {
+                complete_day(a, b)?;
+                return Ok(true);
+            }
+        }
+        for (tool, a, b) in &self.adoption_ranges {
+            if tool == native && overlaps(*a, *b) {
+                complete_day(*a, *b)?;
+                return Ok(true);
+            }
+        }
+        if let LegacyEntry::Day(day) = entry {
+            if !self.adoption_ranges.is_empty() {
+                return super::adoption::suppresses_unbound_day(
+                    conn,
+                    &day.native_tool,
+                    &day.native_date,
+                )
+                .map_err(|e| {
+                    QueryError::new(e.code(), "cannot apply saved native-day privacy controls")
+                });
+            }
+        }
+        Ok(false)
+    }
+    pub(crate) fn validate(
+        &self,
+        conn: &rusqlite::Connection,
+        snapshot: &LegacySnapshot,
+    ) -> QueryResult<()> {
+        if self.rules.is_empty() && self.adoption_ranges.is_empty() {
+            return Ok(());
+        }
+        for entry in &snapshot.entries {
+            if self.suppresses(conn, entry)? {
+                return Err(QueryError::new(
+                    "PRIVACY_FILTER_REQUIRED",
+                    "saved compatibility capture contains a forgotten source or time range",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl super::Ledger {
+    /// Compatibility publication and its query projection share one commit.
+    pub fn publish_compatibility_capture(&mut self, snapshot: &LegacySnapshot) -> QueryResult<()> {
+        self.require_writer()
+            .map_err(|_| QueryError::invalid("writer required"))?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        snapshot.persist(&tx)?;
+        super::read_model::replace(&tx, snapshot)?;
+        super::db::bump(&tx).map_err(|e| QueryError::new(e.code(), "capture commit failed"))?;
+        tx.commit()?;
+        Ok(())
+    }
+}
 impl LegacySnapshot {
+    /// Publish a restartable capture inside the owning writer transaction.
+    /// Unchanged content updates only capture metadata, not all historical rows.
+    pub fn persist(&self, conn: &rusqlite::Connection) -> QueryResult<()> {
+        use rusqlite::{params, OptionalExtension};
+        if conn.is_autocommit() {
+            return Err(QueryError::invalid(
+                "capture publication requires a transaction",
+            ));
+        }
+        // Check before the same-generation shortcut: a stale caller must not
+        // republish entries forbidden by controls added in this same epoch.
+        CapturePrivacy::load(conn)?.validate(conn, self)?;
+        let (uuid, epoch): (String, String) =
+            conn.query_row("SELECT ledger_uuid,epoch FROM ledger_meta", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        let previous: Option<(bool, String)> = conn.query_row(
+            "SELECT generation=?1 AND ledger_uuid=?2 AND epoch=?3,metadata_json FROM legacy_capture_state WHERE singleton=1",
+            params![self.generation, uuid, epoch], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let unchanged = previous.as_ref().is_some_and(|(unchanged, _)| *unchanged);
+        let previous_hashes = previous
+            .as_ref()
+            .filter(|(unchanged, _)| *unchanged)
+            .and_then(|(_, encoded)| serde_json::from_str::<serde_json::Value>(encoded).ok())
+            .and_then(|metadata| {
+                (metadata["source_content_hash_version"] == 1)
+                    .then(|| metadata.get("source_content_hashes").cloned())
+                    .flatten()
+            })
+            .and_then(|hashes| serde_json::from_value::<BTreeMap<String, String>>(hashes).ok())
+            .filter(|hashes| {
+                self.sources
+                    .keys()
+                    .all(|source| hashes.contains_key(source))
+            });
+        let source_content_hashes = if let Some(hashes) = previous_hashes {
+            hashes
+        } else {
+            // Calculate source-specific retry dependencies while serializing
+            // the rows we already publish. A new unrelated source must not
+            // repeatedly activate every old failed repair bucket.
+            let new_hash = || {
+                let mut hash = Sha256::new();
+                hash.update(b"usagebook/legacy-source-content/v1");
+                hash
+            };
+            let mut hashes: BTreeMap<String, Sha256> = self
+                .sources
+                .keys()
+                .map(|source| (source.clone(), new_hash()))
+                .collect();
+            if !unchanged {
+                conn.execute("DELETE FROM legacy_capture_entries", [])?;
+            }
+            let mut insert = if unchanged {
+                None
+            } else {
+                Some(conn.prepare("INSERT INTO legacy_capture_entries(ordinal,report_source,entry_json) VALUES(?1,?2,?3)")?)
+            };
+            for (i, entry) in self.entries.iter().enumerate() {
+                let encoded = serde_json::to_string(entry)
+                    .map_err(|_| QueryError::invalid("invalid capture entry"))?;
+                let hash = hashes
+                    .entry(entry.report_source().to_owned())
+                    .or_insert_with(new_hash);
+                hash.update((encoded.len() as u64).to_be_bytes());
+                hash.update(encoded.as_bytes());
+                if let Some(insert) = insert.as_mut() {
+                    insert.execute(params![i as i64, entry.report_source(), encoded])?;
+                }
+            }
+            hashes
+                .into_iter()
+                .map(|(source, hash)| (source, format!("{:x}", hash.finalize())))
+                .collect()
+        };
+        let metadata = serde_json::json!({
+            "generation":self.generation, "routing_hash":self.routing_hash,
+            "sources":self.sources, "input_containers":self.input_containers,
+            "entries":[], "entry_count":self.entries.len(),
+            "source_content_hash_version":1,
+            "source_content_hashes":source_content_hashes
+        });
+        conn.execute("INSERT INTO legacy_capture_state VALUES(1,?1,?2,?3,?4) ON CONFLICT(singleton) DO UPDATE SET ledger_uuid=excluded.ledger_uuid,epoch=excluded.epoch,generation=excluded.generation,metadata_json=excluded.metadata_json",
+            params![uuid,epoch,self.generation,metadata.to_string()])?;
+        Ok(())
+    }
+
+    /// Apply only explicit source/time/native-day scopes. Preserve every field
+    /// of retained records; unknown time is not guessed into a dated deletion.
+    pub fn filter_suppressed(&mut self, conn: &rusqlite::Connection) -> QueryResult<usize> {
+        let policy = CapturePrivacy::load(conn)?;
+        if policy.rules.is_empty() && policy.adoption_ranges.is_empty() {
+            return Ok(0);
+        }
+        let keep = self
+            .entries
+            .iter()
+            .map(|entry| policy.suppresses(conn, entry).map(|v| !v))
+            .collect::<QueryResult<Vec<_>>>()?;
+        let removed = keep.iter().filter(|keep| !**keep).count();
+        if removed == 0 {
+            return Ok(0);
+        }
+        let mut flags = keep.into_iter();
+        self.entries.retain(|_| flags.next().unwrap());
+        // Diagnostic row counts describe the retained snapshot, while the scan
+        // success timestamp still describes the completed source read.
+        for (source, status) in &mut self.sources {
+            status.unaccounted_rows = self
+                .entries
+                .iter()
+                .filter(
+                    |entry| matches!(entry, LegacyEntry::Day(day) if &day.report_source == source),
+                )
+                .count();
+            status.unallocated_sessions = self.entries.iter().filter(|entry| matches!(entry, LegacyEntry::SessionTotal { record, .. } if record.source == "goose" && record.source == source)).count();
+        }
+        self.generation = super::types::new_epoch();
+        Ok(removed)
+    }
+
+    /// Read saved normalized fields only. Never discovers or reads source files.
+    pub fn restore_capture(conn: &rusqlite::Connection) -> QueryResult<Option<Self>> {
+        Self::restore_capture_source(conn, None)
+    }
+    pub fn restore_capture_source(
+        conn: &rusqlite::Connection,
+        source: Option<&str>,
+    ) -> QueryResult<Option<Self>> {
+        use rusqlite::OptionalExtension;
+        // One SQLite snapshot for both the capture pointer and its rows.
+        let _transaction = if conn.is_autocommit() {
+            Some(conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='legacy_capture_state' AND type='table')", [], |r|r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        let metadata: Option<String> = conn.query_row(
+            "SELECT s.metadata_json FROM legacy_capture_state s JOIN ledger_meta m ON m.singleton=s.singleton AND m.ledger_uuid=s.ledger_uuid AND m.epoch=s.epoch", [], |r|r.get(0)).optional()?;
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        let invalid =
+            || QueryError::new("LEDGER_UNREADABLE", "invalid saved compatibility capture");
+        let value: serde_json::Value = serde_json::from_str(&metadata).map_err(|_| invalid())?;
+        let expected = value["entry_count"].as_u64().ok_or_else(invalid)?;
+        let mut snapshot: Self = serde_json::from_value(value).map_err(|_| invalid())?;
+        let mut statement = conn.prepare("SELECT entry_json,entry_json -> '$.Request.record.cost_usd',entry_json -> '$.SessionTotal.record.cost_usd' FROM legacy_capture_entries WHERE (?1 IS NULL OR report_source=?1) ORDER BY ordinal")?;
+        let mut rows = statement.query([source])?;
+        while let Some(row) = rows.next()? {
+            let encoded: String = row.get(0)?;
+            let mut entry: LegacyEntry = serde_json::from_str(&encoded).map_err(|_| invalid())?;
+            // The saved decimal literal is authoritative. Rust's float parser
+            // round-trips the original f64 spelling; the JSON fast numeric path
+            // can differ by one ULP. Do not rewrite historical cost on restart.
+            let cost = match &mut entry {
+                LegacyEntry::Request { record, .. } => {
+                    Some((record, row.get::<_, Option<String>>(1)?))
+                }
+                LegacyEntry::SessionTotal { record, .. } => {
+                    Some((record, row.get::<_, Option<String>>(2)?))
+                }
+                LegacyEntry::Day(_) => None,
+            };
+            if let Some((record, literal)) = cost {
+                record.cost_usd = literal
+                    .filter(|value| value != "null")
+                    .map(|value| value.parse::<f64>().map_err(|_| invalid()))
+                    .transpose()?;
+            }
+            snapshot.entries.push(entry);
+        }
+        if source.is_none() && snapshot.entries.len() as u64 != expected {
+            return Err(invalid());
+        }
+        if let Some(source) = source {
+            if snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.report_source() != source)
+            {
+                return Err(invalid());
+            }
+            snapshot.sources.retain(|id, _| id == source);
+            snapshot.input_containers.retain(|id, _| id == source);
+        }
+        Ok(Some(snapshot))
+    }
+
     pub fn new(generation: String, routing_hash: String) -> Self {
         Self {
             generation,

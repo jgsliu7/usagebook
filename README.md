@@ -50,7 +50,7 @@ v0.2 统计 27 种 AI 编程工具的 token 消耗。**首发以 macOS 为主；
 
 ## 快速开始
 
-macOS 从源码安装（需要 Rust 和 Xcode Command Line Tools）：
+macOS 从源码安装（需要 Rust、Node.js 22+ 与 npm，以及 Xcode Command Line Tools）：
 
 ```bash
 git clone https://github.com/jgsliu7/usagebook && cd usagebook
@@ -68,11 +68,13 @@ sh install.sh && "$HOME/.local/bin/usagebook" serve --open
 ## 构建
 
 ```bash
+npm ci --include=dev --include=optional --ignore-scripts --no-audit --no-fund
+npm run build:dashboard3d
 cargo build --release --locked # 首次会下载依赖；SQLite/zstd 随源码构建
 ./target/release/usagebook --help
 ```
 
-源码要求 Rust 1.85+ 与 C 编译工具；最低版本由 CI 单独检查。预编译包运行时不需要 Rust、Node 或系统 SQLite。
+源码要求 Rust 1.85+、Node.js 22+ 与 npm，以及 C 编译工具；最低 Rust 版本由 CI 单独检查。生成的看板脚本与 target 目录不提交到 Git。预编译包运行时不需要 Rust、Node 或系统 SQLite。
 
 ## 用法
 
@@ -104,30 +106,36 @@ usagebook serve --port 8080 --refresh-secs 30
 - **汇总卡片**：随时间窗与筛选联动，附总量环比——今天比较昨日同期（截至本轮扫描时刻）；本周/本月比较完整的上周/上月并明确标注；历史周/月比较完整前期；近 N 天比较前 N 天
 - **六种指标**：全部、未缓存输入、缓存读取、缓存写入、输出（含推理）、推理输出
 - **精确数字**：表格和提示保留完整整数，超过 JavaScript 安全整数范围也不丢精度
-- **页面更新**：10s / 30s / 1分 / 关；“关”停止普通周期取数，首次加载、错误恢复、返回前台和用户操作仍可取数，后台配置不变
+- **页面更新**：20s / 30s / 1分 / 关；“关”停止普通周期取数，首次加载、错误恢复、返回前台和用户操作仍可取数，后台配置不变
 - **按需查询**：已迁移来源直接查询账本，表格分页读取；未迁移来源后台扫描后临时汇合
 - 图表资源随二进制分发，零外网依赖
 
 边界说明：图表的指标切换不改变"总量 Tokens"卡片及其环比的总量口径；今日同期不可计算或缓存仍属于前一天时，不显示该环比；整轮扫描或连接失败时，已有结果继续展示并标出数据截止时间；单个来源扫描失败会另行提示，本轮统计可能不完整；明细表跟随时间窗。
 
-### 长期账本（首版）
+### 长期账本
 
-首版完成 **Claude Code** 的持久化链路，其他来源继续显示在同一看板并标为“未保护”。首次使用先初始化，再导入：
+`usagebook serve` 默认创建或打开独立长期账本，后台补扫当前支持来源仍可读的历史。以后安装新工具、发现新目录或升级新增采集能力时，自动补扫相应范围；不受看板日期筛选影响。
+
+页面刷新直接读库，采集按持久检查点在后台推进，不只按“今天”筛选源数据。跨日会话及旧日期新增记录仍会被发现；普通历史校验默认每 24 小时执行。升级后的首次补扫、上游故障均不阻止显示已保存数据。完整语义与适配边界见[历史用量保存](docs/历史用量保存.md)。
+
+需要指定时区或单独运行采集时：
 
 ```bash
-usagebook ledger init --timezone Asia/Shanghai   # 缺省取系统时区，可省略 --timezone
-usagebook ledger refresh --source claude
+usagebook ledger init --timezone Asia/Shanghai
+usagebook ledger refresh                       # 分批导入所有已支持的用量证据
 usagebook ledger status
 usagebook serve
 ```
 
-`ledger init` 只创建账本，不开始采集；如果看板已在运行，需要重启服务才能使用新账本。页面直接显示临时模式、待重启验证或账本已连接，并逐来源说明保存范围；检测到文件不代表验证成功。连接中断时只显示上次确认状态，不能保证后台仍在运行。
+`ledger init` 只建库；`serve` 或 `ledger refresh` 执行采集。`serve --temporary` 可显式使用临时诊断模式。旧临时服务升级后需要重启才会连接长期账本；创建或迁移失败会报错，不会用空库掩盖故障。
 
-CC Switch 目前只读日汇总作为待核实证据；有记录时页面会显示“已读取、未计入”。归属、历史时区和重叠范围尚不能确认，因此不加入正式总量，也不拆到小时。之前有证据但后来为空或读取失败时，保留上次证据和成功读取时间并标出沿用旧结果。
+**已保存证据与已确认用量分别记录。** Claude、Codex、Kimi/Kimi Work、Qwen、ZCode 等有明确身份和结束证据的记录可以正式入账；流式中间值、旧协议、复制归属不明和累计快照先保存待核对。其它已接入格式会保留白名单用量字段，继续使用 live 查询，不能称其看板合计已经受到完整保护。各适配器的边界见[历史用量保存](docs/历史用量保存.md)。
+
+发现 CC Switch 后会导入请求记录和日汇总的用量证据，并持续复查旧日期的变化。账号、历史时区或与原生记录的重叠未确认时，不加入正式总量；不会把日汇总伪造成小时请求。源库清理后，已成功提交的证据仍留在 usagebook。
 
 小时和日期按用量发生时间、当前图表报表时区归属。迟到记录补回原日期，日汇总随发布更新，不等午夜。
 
-账本仅保存白名单用量元数据，不保存对话正文。成功入账的 Claude 历史在原文件被清理后仍保留；未读取就消失的记录无法恢复。未变化的文件跳过正文，坏文件或不可读子目录隔离并显示缺口，健康目录继续入账；局部发现失败时保留旧历史，完整扫描恢复后再判断文件是否消失。已发布的贡献遇到后来出现的矛盾候选时仍保留原工具、模型、日期和用量，并标记冲突；尚未发布且无法裁决的候选暂不计入。
+账本仅保存白名单用量元数据，不保存对话正文。已确认的历史在原文件被清理后仍保留；未读取就消失的记录无法恢复。未变化的文件跳过正文，坏文件或不可读子目录隔离并显示缺口，健康目录继续入账；局部发现失败时保留旧历史，完整扫描恢复后再判断文件是否消失。已发布的贡献遇到后来出现的矛盾候选时仍保留原工具、模型、日期和用量，并标记冲突；尚未发布且无法裁决的候选暂不计入。
 
 数据保存在独立的 `usage-ledger.db`：macOS 为 `~/Library/Application Support/usagebook/`，Linux 为 `${XDG_DATA_HOME:-~/.local/share}/usagebook/`，Windows 为 `%LOCALAPPDATA%\usagebook\`。可用 `USAGEBOOK_LEDGER_PATH` 指定完整文件路径。请求明细长期保留；按天汇总可随时由明细重算。账本与旧扫描缓存分开，关闭或清理旧缓存不清除账本。
 
@@ -143,7 +151,7 @@ usagebook ledger resume --source claude
 usagebook ledger audit --source claude
 ```
 
-暂停仅控制已支持的账本来源的新增采集，已有记录仍可查询。新发现目录会继承同一来源的暂停状态；已有根有开有关时，新根保守保持关闭。显式 resume 恢复已有根，之后新根继承启用。未登记过的来源不能预先暂停；live 来源未因此获得暂停或长期保存能力。
+暂停仅控制已支持的账本来源的新增采集，已有记录仍可查询。新发现目录会继承同一来源的暂停状态；已有根有开有关时，新根保守保持关闭。显式 resume 恢复已有根，之后新根继承启用。未登记过的来源不能预先暂停；暂停不改变查询路由；保存证据的来源也遵守暂停状态。
 
 恢复和忘记操作先输出影响预览；检查后用同一命令加 `--apply --preview-token <预览返回值>` 执行。忘记记录会留下防止重新导入的规则；恢复旧备份也保留当前删除规则。出现损坏时明确报错，不会自动建空库。请使用本地磁盘；挂载目录的阻塞文件操作尚未通过完整隔离验收。三平台文件格式一致，Linux/Windows 的完整运行测试仍待发布前执行，大数据量下的查询与启动性能仍待优化和验收。
 
@@ -151,7 +159,7 @@ usagebook ledger audit --source claude
 
 同一份默认 `report` 的日期、来源和模型表共用截止时间，全部页及会话累计区块核对同一账本版本。输出过程中数据更新时，命令以 `CURSOR_STALE` 和退出码 3 停止，请从头重新生成；此前已输出的前缀不代表完整报表。会话累计仍不受日期窗口限制。报表逐页释放查询事务，不因慢速输出阻塞后台提交。
 
-状态接口另提供 `collection`（模式、间隔、调度状态）、`storage`（当前服务的存储模式、是否需重启验证、支持长期保存的来源）及每来源 `history_protection`/`durable_supported`/`last_scanned_at_ms`。CC 的 `accounting.unaccounted_rows` 是未计入的日证据行数，不是请求数。兼容旧客户端的 live `last_saved_at_ms` 仍是扫描时间别名，不能当作持久保存时间；新客户端应使用 `last_scanned_at_ms`。
+状态接口另提供 `collection`（模式、间隔、调度状态）、`storage`（当前服务的存储模式、是否需重启验证、支持长期保存的来源）及每来源 `history_protection`/`durable_supported`/`last_scanned_at_ms`。`initial_import` 显示固定首导范围、缺口及已保存/已发布水位；`evidence_supported` 表示具备用量证据保存能力，`durable_supported` 表示具备经审计的正式准入范围。CC 的 `accounting.unaccounted_rows` 是未计入的证据数量，不是调用次数。`saved_pending_candidates` 是尚未对应正式事实的观察数量，`confirmed_events` / `verified_events` 是按适配规则核实的事件数量；`source_reported_events` 是明确采用的来源报告事实数量，`adopted_events` 是二者之和（汇总事实不等于逐请求数），二者不是可相加的请求数。live 来源已有持久证据时，`last_saved_at_ms` 表示实际证据提交时间；没有持久证据时保留旧扫描时间别名，因此采集时间应读取 `last_scanned_at_ms`，持久保护应同时检查保存计数和保护状态。
 
 ### 环境变量
 
@@ -205,7 +213,7 @@ sh install.sh
 ## 免责声明
 
 - 本工具只**读取**本地已有文件做统计，不修改任何工具的数据；运行时不向外网发送请求
-- **持久化范围目前只有 Claude Code**。已成功入账的 Claude 历史在源日志删除后仍保留；其他来源尚未保护，源日志被删除后统计可能减少。扫描快照只是启动缓存，不是永久账本或会话备份
+- **保护范围以成功提交和逐来源准入状态为准**。已确认历史与已保存待核对证据不随源日志删除；尚未准入的 live 合计仍可能变化。扫描缓存不能替代长期账本，也不能恢复从未采集到的记录
 - 与所列各 AI 编程工具无隶属关系;各工具名称与商标归其各自所有者
 
 ## 术语速查
@@ -217,7 +225,7 @@ sh install.sh
 
 ## 用法说明
 
-示例中的 `usagebook` 指安装脚本生成的 `~/.local/bin/usagebook`（需在 PATH 中），或构建产物 `./target/release/usagebook`。也支持从仓库根目录执行 `cargo install --path crates/usagebook-cli --locked`，安装到 Cargo 的可执行目录。
+示例中的 `usagebook` 指安装脚本生成的 `~/.local/bin/usagebook`（需在 PATH 中），或构建产物 `./target/release/usagebook`。完成上面的 npm 构建步骤后，也支持从仓库根目录执行 `cargo install --path crates/usagebook-cli --locked`，安装到 Cargo 的可执行目录。
 
 ## 口径纪律
 
@@ -254,3 +262,5 @@ usagebook-cli(外壳)
 - `docs/数据源档案/00-总览.md` — 数据源规范总入口(统一用量模型/档案索引)
 - `docs/数据源档案/29-源可信度评级报告.md` — 各源可信度评级
 - `CHANGELOG.md` / `SECURITY.md` / `LICENSE`(Apache-2.0)
+
+旧格式可通过带预览的 `ledger adopt-legacy` 选择来源报告历史；CC 支持限定的 OpenCode 强身份补录及 Pi 完整日范围采用。质量、范围、暂停/恢复和安全预算见[历史用量保存](docs/历史用量保存.md)。schema v4 升级前请保存备份；不能用旧二进制直接打开新库。

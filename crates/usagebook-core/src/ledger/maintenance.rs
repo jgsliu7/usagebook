@@ -193,6 +193,9 @@ pub(crate) fn check_conn(c: &Connection) -> Result<()> {
     db::validate(c)?;
     check_integrity(c)?;
     check_selected_events(c)?;
+    super::adoption::check(c)?;
+    super::time_allocation::check(c)?;
+    super::time_repair::check(c)?;
     check_daily_rollups(c)
 }
 fn check_integrity(c: &Connection) -> Result<()> {
@@ -226,7 +229,10 @@ fn check_selected_events(c: &Connection) -> Result<()> {
             OR e.occurred_ms IS NOT o.occurred_ms
             OR e.day_start_ms IS NOT o.day_start_ms
             OR e.day_end_ms IS NOT o.day_end_ms
-            OR o.eligibility<>'eligible'
+            OR (o.eligibility<>'eligible' AND NOT (
+                o.eligibility='pending_finality' AND EXISTS(
+                    SELECT 1 FROM adoption_items a JOIN adoption_policies p ON p.policy_id=a.policy_id
+                    WHERE a.selected_observation_id=o.observation_id AND p.status='active')))
             OR (e.state='active' AND o.action<>'upsert')
             OR (e.state='retracted' AND o.action<>'retract'))",
         [],
@@ -498,7 +504,7 @@ impl Maintenance {
         {
             return Err(LedgerError::InvalidInput("source is not registered".into()));
         }
-        db::change_epoch(&c)?;
+        change_epoch_preserving_read_caches(&c)?;
         regression_stop("pause_before_commit");
         c.execute_batch("COMMIT")?;
         regression_stop("pause_after_commit");
@@ -508,15 +514,30 @@ impl Maintenance {
         validate_scope(scope)?;
         let c = db::open_connection(&self.path, true)?;
         c.execute_batch("BEGIN IMMEDIATE")?;
-        validate_protected(&c, scope)?;
+        validate_registered(&c, scope)?;
         c.execute_batch("CREATE TEMP TABLE delete_ids(id INTEGER PRIMARY KEY); CREATE TEMP TABLE affected_units(family TEXT,namespace TEXT,publish_key TEXT,visible INTEGER,PRIMARY KEY(family,namespace,publish_key));")?;
         select_scope(&c, scope)?;
+        validate_indivisible_days(&c, scope)?;
+        super::adoption::validate_forget(&c, scope)?;
+        super::adoption::before_forget(&c)?;
         let operation =
             serde_json::to_string(scope).map_err(|_| LedgerError::InvalidInput("scope".into()))?;
         let op = hash_parts("forget", &[&operation]);
         add_explicit_rules(&c, scope, &op)?;
-        expand_rules(&c, &op, false)?;
+        // Legacy previews contain saved numeric projections. Any deletion
+        // invalidates and erases these bounded, unapplied staging values.
+        c.execute(
+            "DELETE FROM ledger_runtime_state WHERE state_key LIKE 'legacy-preview/%'",
+            [],
+        )?;
+        let staged_removed = expand_deletion(&c, &op, false)?;
+        super::source_projection::retain_suppressed_row_keys(&c)?;
+        let retained_capture = clear_forgotten_read_caches(&c, scope)?;
+        validate_indivisible_days(&c, scope)?;
         let mut preview = preview(&c, "forget", &operation)?;
+        if staged_removed > 0 {
+            preview.warnings.push(format!("{staged_removed} matching rows are also removed from sealed snapshot checkpoints; unrelated unread rows remain."));
+        }
         if scope.start_ms.is_some() {
             let uncovered = uncovered_time(&c, scope)?;
             if uncovered.request_candidates != "0" || uncovered.day_candidates != "0" {
@@ -544,7 +565,13 @@ impl Maintenance {
                     c.execute("UPDATE source_roots SET enabled=0", [])?;
                 }
             }
-            db::change_epoch(&c)?;
+            change_epoch_preserving_read_caches(&c)?;
+            if let Some(capture) = retained_capture {
+                capture
+                    .persist(&c)
+                    .map_err(|_| LedgerError::CorruptLedger)?;
+                super::read_model::replace(&c, &capture).map_err(|_| LedgerError::CorruptLedger)?;
+            }
             regression_stop("forget_before_commit");
             c.execute_batch("COMMIT")?;
             regression_stop("forget_after_commit");
@@ -600,7 +627,7 @@ impl Maintenance {
                 return Err(LedgerError::InvalidInput("preview expired".into()));
             }
             c.execute("DELETE FROM suppression_rules WHERE rule_id=?1", [id])?;
-            db::change_epoch(&c)?;
+            change_epoch_preserving_read_caches(&c)?;
             regression_stop("unsuppress_before_commit");
             c.execute_batch("COMMIT")?;
             regression_stop("unsuppress_after_commit");
@@ -624,21 +651,22 @@ fn validate_scope(s: &ForgetScope) -> Result<()> {
     }
     Ok(())
 }
-fn validate_protected(c: &Connection, s: &ForgetScope) -> Result<()> {
-    if s.all {
-        return Err(LedgerError::SourceNotProtected);
-    } // Other registered adapters remain live in the first release.
+fn validate_registered(c: &Connection, s: &ForgetScope) -> Result<()> {
     if let Some(source) = &s.source {
-        let(routes,total):(i64,i64)=c.query_row("SELECT COALESCE(sum(route='ledger'),0),count(*) FROM source_roots WHERE report_source=?1",[source],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        if routes == 0 || routes != total {
-            return Err(LedgerError::SourceNotProtected);
+        let exists: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM source_roots WHERE report_source=?1) OR EXISTS(SELECT 1 FROM usage_observations WHERE report_source=?1) OR EXISTS(SELECT 1 FROM legacy_capture_entries WHERE report_source=?1)",[source],|r|r.get(0))?;
+        if !exists {
+            return Err(LedgerError::InvalidInput("source is not registered".into()));
         }
     }
     if let Some(key) = &s.identity {
-        let count:i64=c.query_row("SELECT count(*) FROM usage_observations o JOIN source_roots r ON r.identity_family=o.identity_family AND r.namespace_key=o.namespace_key WHERE o.identity_key=?1 AND r.route='ledger'",[key],|r|r.get(0))?;
+        let count: i64 = c.query_row(
+            "SELECT count(*) FROM usage_observations o WHERE o.identity_key=?1",
+            [key],
+            |r| r.get(0),
+        )?;
         if count == 0 {
             return Err(LedgerError::InvalidInput(
-                "identity is not in a protected source".into(),
+                "identity is not present in saved evidence".into(),
             ));
         }
     }
@@ -646,6 +674,80 @@ fn validate_protected(c: &Connection, s: &ForgetScope) -> Result<()> {
 }
 fn select_scope(c: &Connection, s: &ForgetScope) -> Result<()> {
     c.execute("INSERT INTO delete_ids SELECT observation_id FROM usage_observations WHERE (?1 IS NULL OR report_source=?1) AND (?2 IS NULL OR identity_key=?2) AND (?3 IS NULL OR (occurred_ms>=?3 AND occurred_ms<?4) OR (day_start_ms<?4 AND day_end_ms>?3))",params![s.source,s.identity,s.start_ms,s.end_ms])?;
+    // An adopted CC day gets its calendar from the explicit decision. A dated
+    // deletion of that original report channel must use the same calendar.
+    if s.source.is_some() && s.start_ms.is_some() {
+        c.execute("INSERT OR IGNORE INTO delete_ids SELECT a.source_observation_id FROM adoption_items a JOIN usage_observations original ON original.observation_id=a.source_observation_id JOIN usage_observations selected ON selected.observation_id=a.selected_observation_id WHERE original.report_source=?1 AND ((selected.occurred_ms>=?2 AND selected.occurred_ms<?3) OR (selected.day_start_ms<?3 AND selected.day_end_ms>?2))",params![s.source,s.start_ms,s.end_ms])?;
+    }
+    Ok(())
+}
+fn validate_indivisible_days(c: &Connection, s: &ForgetScope) -> Result<()> {
+    if let Some(key) = &s.identity {
+        let expanded_day: bool = c.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM usage_observations WHERE identity_key=?1 AND fact_kind='day') AND EXISTS(SELECT 1 FROM usage_observations o JOIN delete_ids d ON d.id=o.observation_id WHERE o.fact_kind='day')",
+            [key], |r| r.get(0),
+        )?;
+        if expanded_day {
+            return Err(LedgerError::InvalidInput("the selected request overlaps indivisible daily evidence; select the full aggregate interval or first provide a proved split".into()));
+        }
+    }
+    let Some(start) = s.start_ms else {
+        return Ok(());
+    };
+    let end = s
+        .end_ms
+        .ok_or_else(|| LedgerError::InvalidInput("invalid window".into()))?;
+    let outside: Option<(i64, i64)> = c.query_row(
+        "SELECT o.day_start_ms,o.day_end_ms FROM usage_observations o JOIN delete_ids d ON d.id=o.observation_id WHERE o.fact_kind='day' AND o.day_start_ms IS NOT NULL AND (o.day_start_ms<?1 OR o.day_end_ms>?2) LIMIT 1",
+        params![start,end], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional()?;
+    if let Some((a, b)) = outside {
+        return Err(LedgerError::InvalidInput(format!("indivisible daily evidence spans [{a},{b}); select its whole interval or first provide a proved split")));
+    }
+    Ok(())
+}
+/// Adoption links may add a derived observation whose native identity in turn
+/// reaches another saved revision. Iterate both closures before showing a plan.
+fn expand_deletion(c: &Connection, op: &str, restore: bool) -> Result<u64> {
+    let mut scrubbed = 0_u64;
+    loop {
+        let before: i64 = c.query_row("SELECT count(*) FROM delete_ids", [], |r| r.get(0))?;
+        super::adoption::before_forget(c)?;
+        expand_rules(c, op, restore)?;
+        expand_reported_identities(c, op)?;
+        let erased = super::ccswitch::scrub_snapshot_checkpoints(c, |o| {
+            super::ingest::exact_suppressed(c, o)
+        })?;
+        scrubbed = scrubbed
+            .checked_add(erased)
+            .ok_or(LedgerError::NumericOverflow)?;
+        let after: i64 = c.query_row("SELECT count(*) FROM delete_ids", [], |r| r.get(0))?;
+        if before == after && erased == 0 {
+            return Ok(scrubbed);
+        }
+    }
+}
+/// Strong source identities are useful deletion evidence even before the user
+/// adopts their reported values. Preserve that relation in both directions.
+fn expand_reported_identities(c: &Connection, op: &str) -> Result<()> {
+    let mut st = c.prepare("SELECT o.observation_id,d.projection_json,EXISTS(SELECT 1 FROM delete_ids x WHERE x.id=o.observation_id) FROM usage_observations o JOIN durable_evidence d USING(observation_id) WHERE o.report_source='ccswitch-rollup'")?;
+    let mut rows = st.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let json: String = row.get(1)?;
+        let selected: bool = row.get(2)?;
+        let p: serde_json::Value =
+            serde_json::from_str(&json).map_err(|_| LedgerError::CorruptLedger)?;
+        if let Some(probe) = super::ccswitch::reported_identity_probe(&p)? {
+            if selected || super::ingest::exact_suppressed(c, &probe)? {
+                add_identity_controls(c, &probe, op)?;
+                c.execute("INSERT OR IGNORE INTO delete_ids VALUES(?1)", [id])?;
+            }
+        }
+    }
+    drop(rows);
+    drop(st);
+    c.execute(&format!("INSERT OR IGNORE INTO delete_ids SELECT observation_id FROM usage_observations o WHERE {EXACT_RULES}"), [])?;
     Ok(())
 }
 fn uncovered_time(c: &Connection, s: &ForgetScope) -> Result<UncoveredTime> {
@@ -669,9 +771,11 @@ fn uncovered_time(c: &Connection, s: &ForgetScope) -> Result<UncoveredTime> {
 fn add_explicit_rules(c: &Connection, s: &ForgetScope, op: &str) -> Result<()> {
     if let (None, Some(a)) = (s.identity.as_ref(), s.start_ms) {
         let b = s.end_ms.unwrap();
-        c.execute("INSERT INTO suppression_rules(kind,report_source,native_tool,start_ms,end_ms,operation_id,created_ms)VALUES('window',?1,?1,?2,?3,?4,?5)",params![s.source,a,b,op,now_ms()])?;
+        c.execute("INSERT INTO suppression_rules(kind,report_source,native_tool,start_ms,end_ms,operation_id,created_ms)VALUES('window',?1,NULL,?2,?3,?4,?5)",params![s.source,a,b,op,now_ms()])?;
     } else if let Some(source) = &s.source {
-        c.execute("INSERT OR IGNORE INTO suppression_rules(kind,report_source,native_tool,operation_id,created_ms)VALUES('source',?1,?1,?2,?3)",params![source,op,now_ms()])?;
+        c.execute("INSERT OR IGNORE INTO suppression_rules(kind,report_source,native_tool,operation_id,created_ms)VALUES('source',?1,NULL,?2,?3)",params![source,op,now_ms()])?;
+    } else if s.all {
+        c.execute("INSERT OR IGNORE INTO suppression_rules(kind,report_source,native_tool,operation_id,created_ms) SELECT 'source',report_source,NULL,?1,?2 FROM (SELECT report_source FROM source_roots UNION SELECT report_source FROM usage_observations UNION SELECT report_source FROM legacy_capture_entries)", params![op,now_ms()])?;
     }
     Ok(())
 }
@@ -696,14 +800,33 @@ fn add_identity_controls(c: &Connection, o: &Observation, op: &str) -> Result<()
         };
         if let Some((a, b)) = interval {
             c.execute("INSERT OR IGNORE INTO suppression_rules(kind,native_tool,namespace_key,start_ms,end_ms,operation_id,created_ms)VALUES('coverage_interval',?1,?2,?3,?4,?5,?6)",params![o.native_tool,o.namespace_key,a,b,op,now_ms()])?;
+            if o.fact_kind == "day" {
+                c.execute("INSERT OR IGNORE INTO suppression_rules(kind,native_tool,namespace_key,start_ms,end_ms,operation_id,created_ms)VALUES('consumption_interval',?1,?2,?3,?4,?5,?6)",params![o.native_tool,o.namespace_key,a,b,op,now_ms()])?;
+            }
         } else {
+            // A source day may acquire its calendar only through explicit
+            // adoption. Its durable date tombstone is more precise than the
+            // old unbound-family fallback and must not erase adjacent days.
+            if o.fact_kind == "day" && o.report_source == "ccswitch-rollup" {
+                if let Some(date) = &o.native_date {
+                    if super::adoption::suppresses_unbound_day(c, &o.native_tool, date)? {
+                        return Ok(());
+                    }
+                }
+            }
             c.execute("INSERT OR IGNORE INTO suppression_rules(kind,native_tool,namespace_key,operation_id,created_ms)VALUES('coverage_family',?1,?2,?3,?4)",params![o.native_tool,o.namespace_key,op,now_ms()])?;
         }
     }
     Ok(())
 }
 // SQL exact rules are deliberately independent of statistical aliases.
-const EXACT_RULES:&str="EXISTS(SELECT 1 FROM suppression_rules s WHERE (s.kind='source' AND s.report_source=o.report_source AND s.native_tool=o.native_tool) OR (s.kind='identity' AND s.identity_family=o.identity_family AND s.namespace_key=o.namespace_key AND s.identity_key=o.identity_key) OR (s.kind='session' AND o.fact_kind IN('session_total','session_cost') AND s.identity_family=o.identity_family AND s.namespace_key=o.namespace_key AND s.session_key=o.session_key) OR (s.kind='window' AND (s.report_source IS NULL OR (s.report_source=o.report_source AND s.native_tool=o.native_tool)) AND ((o.occurred_ms>=s.start_ms AND o.occurred_ms<s.end_ms) OR (o.day_start_ms<s.end_ms AND o.day_end_ms>s.start_ms))) OR (o.fact_kind='day' AND s.native_tool=o.native_tool AND s.namespace_key=o.namespace_key AND (s.kind='coverage_family' OR (s.kind='coverage_interval' AND o.day_start_ms<s.end_ms AND o.day_end_ms>s.start_ms))))";
+const EXACT_RULES:&str="EXISTS(SELECT 1 FROM suppression_rules s WHERE
+ (s.kind='source' AND s.report_source=o.report_source AND (s.native_tool IS NULL OR s.native_tool=o.native_tool))
+ OR (s.kind='identity' AND s.identity_family=o.identity_family AND s.namespace_key=o.namespace_key AND s.identity_key=o.identity_key)
+ OR (s.kind='session' AND o.fact_kind IN('session_total','session_cost') AND s.identity_family=o.identity_family AND s.namespace_key=o.namespace_key AND s.session_key=o.session_key)
+ OR (s.kind='window' AND (s.report_source IS NULL OR s.report_source=o.report_source) AND (s.native_tool IS NULL OR s.native_tool=o.native_tool) AND ((o.occurred_ms>=s.start_ms AND o.occurred_ms<s.end_ms) OR (o.day_start_ms<s.end_ms AND o.day_end_ms>s.start_ms)))
+ OR (s.kind='consumption_interval' AND s.native_tool=o.native_tool AND s.namespace_key=o.namespace_key AND ((o.occurred_ms>=s.start_ms AND o.occurred_ms<s.end_ms) OR (o.day_start_ms<s.end_ms AND o.day_end_ms>s.start_ms)))
+ OR (o.fact_kind='day' AND s.native_tool=o.native_tool AND s.namespace_key=o.namespace_key AND (s.kind='coverage_family' OR (s.kind='coverage_interval' AND o.day_start_ms<s.end_ms AND o.day_end_ms>s.start_ms)))) OR EXISTS(SELECT 1 FROM adoption_forget_ranges f WHERE f.consumer_tool=o.native_tool AND (f.identity_family IS NULL OR (f.identity_family=o.identity_family AND f.namespace_key=o.namespace_key)) AND ((o.occurred_ms>=f.start_ms AND o.occurred_ms<f.end_ms) OR (o.day_start_ms<f.end_ms AND o.day_end_ms>f.start_ms)))";
 fn expand_rules(c: &Connection, op: &str, restore: bool) -> Result<()> {
     let mut proof_stamp: Option<String> = None;
     loop {
@@ -813,6 +936,10 @@ fn preview(c: &Connection, operation: &str, parameters: &str) -> Result<Preview>
     Ok(Preview{operation:operation.into(),preview_token:token,affected_candidates:count.to_string(),affected_events:affected.to_string(),replacement:None,released_rule:None,uncovered_time:None,warnings:vec!["All revisions of matching identities and related session totals/costs are removed. Source files and independent backups remain.".into()]})
 }
 fn delete_selected(c: &Connection) -> Result<()> {
+    // Also cover unread snapshot rows and observations reached by a later
+    // identity proof. The CC saver rechecks its outgoing checkpoint before
+    // commit, so an older in-memory block cannot write these values back.
+    super::ccswitch::scrub_snapshot_checkpoints(c, |o| super::ingest::exact_suppressed(c, o))?;
     // Persist each unit's pre-maintenance publication horizon in bounded disk TEMP.
     c.execute_batch("CREATE TEMP TABLE IF NOT EXISTS affected_units(family TEXT,namespace TEXT,publish_key TEXT,visible INTEGER,PRIMARY KEY(family,namespace,publish_key));")?;
     let mut st=c.prepare("SELECT DISTINCT o.identity_family,o.namespace_key,o.identity_key,o.native_message_id FROM usage_observations o JOIN delete_ids d ON d.id=o.observation_id")?;
@@ -854,7 +981,12 @@ fn delete_selected(c: &Connection) -> Result<()> {
     }
     drop(rows);
     drop(st);
-    c.execute("UPDATE source_objects SET checkpoint=NULL,checkpoint_format=NULL,saved_offset=NULL,state='replay_required',target_done=0,object_revision=object_revision+1 WHERE object_id IN(SELECT object_id FROM usage_observations WHERE observation_id IN(SELECT id FROM delete_ids))",[])?;
+    c.execute("UPDATE source_objects SET checkpoint=NULL,checkpoint_format=NULL,saved_offset=NULL,state='replay_required',target_done=0,object_revision=object_revision+1 WHERE object_key NOT LIKE 'cc-values-v2:%' AND object_id IN(SELECT object_id FROM usage_observations WHERE observation_id IN(SELECT id FROM delete_ids))",[])?;
+    c.execute("UPDATE durable_snapshots SET gap_count=gap_count+(SELECT count(*) FROM durable_snapshot_members m JOIN delete_ids d ON d.id=m.observation_id WHERE m.snapshot_id=durable_snapshots.snapshot_id) WHERE EXISTS(SELECT 1 FROM durable_snapshot_members m JOIN delete_ids d ON d.id=m.observation_id WHERE m.snapshot_id=durable_snapshots.snapshot_id)",[])?;
+    c.execute(
+        "DELETE FROM durable_snapshot_members WHERE observation_id IN(SELECT id FROM delete_ids)",
+        [],
+    )?;
     let removed = c.execute(
         "DELETE FROM usage_observations WHERE observation_id IN(SELECT id FROM delete_ids)",
         [],
@@ -889,6 +1021,7 @@ pub(crate) fn add_incoming_controls(c: &Connection, o: &Observation) -> Result<(
 pub(crate) fn finish_incoming_suppression(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TEMP TABLE IF NOT EXISTS delete_ids(id INTEGER PRIMARY KEY); DELETE FROM delete_ids;")?;
     c.execute(&format!("INSERT INTO delete_ids SELECT observation_id FROM usage_observations o WHERE {EXACT_RULES}"),[])?;
+    expand_deletion(c, "suppressed-revision", false)?;
     delete_selected(c)?;
     c.execute("DELETE FROM delete_ids", [])?;
     Ok(())
@@ -909,7 +1042,7 @@ impl Maintenance {
             "DELETE FROM usage_rollups WHERE derived_version<>?1",
             [next],
         )?;
-        db::change_epoch(&c)?;
+        change_epoch_preserving_read_caches(&c)?;
         regression_stop("timezone_before_commit");
         c.execute_batch("COMMIT")?;
         regression_stop("timezone_after_commit");
@@ -960,11 +1093,36 @@ impl Maintenance {
             c.execute_batch(
                 "BEGIN IMMEDIATE; CREATE TEMP TABLE delete_ids(id INTEGER PRIMARY KEY);",
             )?;
+            remember_restore_controls(&current, &c)?;
+            let saved_capture = super::legacy::LegacySnapshot::restore_capture(&c)
+                .map_err(|_| LedgerError::CorruptLedger)?;
             merge_rules(&current, &c)?;
+            super::source_projection::merge_tombstones(&current, &c)?;
             merge_routes(&current, &c)?;
+            merge_coverage_controls(&current, &c)?;
+            super::adoption::merge_restore(&current, &c)?;
+            super::time_allocation::validate_restore(&current, &c)?;
+            super::time_repair::validate_restore(&current, &c)?;
             c.execute(&format!("INSERT INTO delete_ids SELECT observation_id FROM usage_observations o WHERE {EXACT_RULES}"),[])?;
-            expand_rules(&c, "restore-protection", true)?;
+            expand_deletion(&c, "restore-protection", true)?;
+            super::source_projection::retain_suppressed_row_keys(&c)?;
+            super::ccswitch::scrub_snapshot_checkpoints(&c, |o| {
+                super::ingest::exact_suppressed(&c, o)
+            })?;
+            // A restored writer attempt/cutover permit is not evidence that
+            // this process has successfully resumed that old runtime state.
+            c.execute("DELETE FROM ledger_runtime_state", [])?;
+            let retained_capture = prepare_restored_history(&c, saved_capture)?;
             let mut preview = preview(&c, "restore", &input_hash)?;
+            // Preview the database that will actually be installed, including
+            // deletion closure and rebuilt compatibility facts. This is rolled
+            // back on preview-only calls and never mutates the source backup.
+            delete_selected(&c)?;
+            clear_query_projection(&c)?;
+            if let Some(capture) = &retained_capture {
+                persist_restored_capture(&c, capture)?;
+                super::read_model::replace(&c, capture).map_err(|_| LedgerError::CorruptLedger)?;
+            }
             preview.replacement = Some(replacement_impact(&current, &c)?);
             let rules = rule_digest(&current)?;
             preview.preview_token = hash_parts(
@@ -985,8 +1143,7 @@ impl Maintenance {
                         "preview expired; preview again".into(),
                     ));
                 }
-                delete_selected(&c)?;
-                let epoch = db::change_epoch(&c)?;
+                let epoch = change_epoch_preserving_read_caches(&c)?;
                 check_conn(&c)?;
                 regression_stop("restore_before_commit");
                 c.execute_batch("COMMIT")?;
@@ -1040,6 +1197,7 @@ fn rule_digest(c: &Connection) -> Result<String> {
     let mut st=c.prepare("SELECT kind,report_source,identity_family,namespace_key,identity_key,session_key,link_version,link_key,native_tool,start_ms,end_ms FROM suppression_rules ORDER BY kind,report_source,identity_family,namespace_key,identity_key,session_key,link_key,native_tool,start_ms,end_ms")?;
     let mut rows = st.query([])?;
     let mut h = Sha256::new();
+    h.update(super::source_projection::tombstone_digest(c)?.as_bytes());
     while let Some(r) = rows.next()? {
         for i in 0..11 {
             match r.get_ref(i)? {
@@ -1059,6 +1217,35 @@ fn rule_digest(c: &Connection) -> Result<String> {
     }
     Ok(format!("{:x}", h.finalize()))
 }
+/// Fingerprint durable maintenance/domain controls, not the ordinary stream of
+/// newly published identities. An unrelated request must not expire a preview.
+pub(crate) fn adoption_control_digest(c: &Connection) -> Result<String> {
+    let mut h = Sha256::new();
+    h.update(rule_digest(c)?.as_bytes());
+    for sql in [
+        "SELECT root_id,identity_family,namespace_key,report_source,native_tool,identity_version,parser_version,route,enabled FROM source_roots ORDER BY root_id",
+        "SELECT identity_family,namespace_key,identity_key,native_tool,model_key,start_ms,end_ms,rule_version FROM durable_coverage ORDER BY identity_family,namespace_key,identity_key",
+        "SELECT identity_family,namespace_key,session_key,channel FROM durable_channel_choices ORDER BY identity_family,namespace_key,session_key",
+        "SELECT consumer_tool,start_ms,end_ms,native_timezone,identity_family,namespace_key FROM adoption_forget_ranges ORDER BY consumer_tool,start_ms,end_ms,native_timezone,identity_family,namespace_key",
+    ] {
+        h.update(sql.as_bytes());
+        let mut st = c.prepare(sql)?;
+        let columns = st.column_count();
+        let mut rows = st.query([])?;
+        while let Some(row) = rows.next()? {
+            h.update([3]);
+            for i in 0..columns {
+                match row.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => h.update([0]),
+                    rusqlite::types::ValueRef::Integer(n) => { h.update([1]); h.update(n.to_be_bytes()); }
+                    rusqlite::types::ValueRef::Text(v) => { h.update([2]); h.update((v.len() as u64).to_be_bytes()); h.update(v); }
+                    _ => return Err(LedgerError::CorruptLedger),
+                }
+            }
+        }
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
 fn merge_rules(from: &Connection, to: &Connection) -> Result<()> {
     let mut st=from.prepare("SELECT kind,report_source,identity_family,namespace_key,identity_key,session_key,link_version,link_key,native_tool,start_ms,end_ms,operation_id,created_ms FROM suppression_rules")?;
     let mut rows = st.query([])?;
@@ -1068,6 +1255,66 @@ fn merge_rules(from: &Connection, to: &Connection) -> Result<()> {
             values.push(r.get::<_, rusqlite::types::Value>(i)?);
         }
         to.execute("INSERT OR IGNORE INTO suppression_rules(kind,report_source,identity_family,namespace_key,identity_key,session_key,link_version,link_key,native_tool,start_ms,end_ms,operation_id,created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",rusqlite::params_from_iter(values))?;
+    }
+    Ok(())
+}
+/// Controls survive rollback independently of their first observation. A live
+/// adopted day, however, cannot be copied as an owner without its chosen value:
+/// that would claim protection while silently losing the contribution.
+fn merge_coverage_controls(from: &Connection, to: &Connection) -> Result<()> {
+    let mut st = from.prepare("SELECT identity_family,namespace_key,identity_key,native_tool,model_key,start_ms,end_ms,first_observation_id,rule_version,created_ms FROM durable_coverage")?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        let family: String = r.get(0)?;
+        let namespace: String = r.get(1)?;
+        let key: String = r.get(2)?;
+        let hash: Option<Vec<u8>> = from.query_row(
+            "SELECT o.normalized_hash FROM usage_events e JOIN usage_observations o ON o.observation_id=e.selected_observation_id WHERE e.identity_family=?1 AND e.namespace_key=?2 AND e.identity_key=?3 AND e.state='active'",
+            params![family,namespace,key], |r|r.get(0),
+        ).optional()?;
+        if let Some(hash) = hash {
+            let present: bool = to.query_row(
+                "SELECT EXISTS(SELECT 1 FROM usage_events e JOIN usage_observations o ON o.observation_id=e.selected_observation_id WHERE e.identity_family=?1 AND e.namespace_key=?2 AND e.identity_key=?3 AND e.state='active' AND o.normalized_hash=?4)",
+                params![family,namespace,key,hash], |r|r.get(0),
+            )?;
+            if !present {
+                return Err(LedgerError::InvalidInput("backup lacks the selected evidence for a current daily coverage; revise or withdraw that range before restoring".into()));
+            }
+        }
+        let conflict: bool = to.query_row(
+            "SELECT EXISTS(SELECT 1 FROM durable_coverage WHERE identity_family=?1 AND namespace_key=?2 AND identity_key=?3 AND (native_tool<>?4 OR model_key<>?5 OR start_ms<>?6 OR end_ms<>?7))",
+            params![family,namespace,key,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?,r.get::<_,i64>(6)?], |r|r.get(0),
+        )?;
+        if conflict {
+            return Err(LedgerError::IdentityMappingRequired);
+        }
+        let values = (0..10)
+            .map(|i| r.get::<_, rusqlite::types::Value>(i))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        to.execute(
+            "INSERT OR IGNORE INTO durable_coverage VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params_from_iter(values),
+        )?;
+    }
+    drop(rows);
+    drop(st);
+    let mut st = from.prepare("SELECT identity_family,namespace_key,session_key,channel,first_observation_id,created_ms FROM durable_channel_choices")?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        let conflict: bool = to.query_row(
+            "SELECT EXISTS(SELECT 1 FROM durable_channel_choices WHERE identity_family=?1 AND namespace_key=?2 AND session_key=?3 AND channel<>?4)",
+            params![r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?], |r|r.get(0),
+        )?;
+        if conflict {
+            return Err(LedgerError::IdentityMappingRequired);
+        }
+        let values = (0..6)
+            .map(|i| r.get::<_, rusqlite::types::Value>(i))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        to.execute(
+            "INSERT OR IGNORE INTO durable_channel_choices VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params_from_iter(values),
+        )?;
     }
     Ok(())
 }
@@ -1102,6 +1349,9 @@ pub struct ReplacementImpact {
     pub backup_first_ms: Option<String>,
     pub backup_last_ms: Option<String>,
     pub affected_sources: Vec<String>,
+    pub current_capture_entries_absent_or_changed_in_backup: String,
+    pub current_projection_rows_absent_or_changed_in_backup: String,
+    pub current_model_rows_absent_or_changed_in_backup: String,
 }
 fn replacement_impact(current: &Connection, backup: &Connection) -> Result<ReplacementImpact> {
     backup.execute_batch("CREATE TEMP TABLE restore_current_candidates(family TEXT,namespace TEXT,candidate TEXT,hash BLOB,source TEXT); CREATE TEMP TABLE restore_current_events(family TEXT,namespace TEXT,identity TEXT,state TEXT,hash BLOB,source TEXT);")?;
@@ -1156,9 +1406,13 @@ fn replacement_impact(current: &Connection, backup: &Connection) -> Result<Repla
     let mut st = backup.prepare(&format!(
         "SELECT DISTINCT source FROM restore_current_candidates c WHERE {missing} ORDER BY source"
     ))?;
-    let sources = st
+    let mut sources = st
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
+    let (capture, projection, models, saved_sources) = saved_history_impact(current, backup)?;
+    sources.extend(saved_sources);
+    sources.sort();
+    sources.dedup();
     Ok(ReplacementImpact {
         current_candidates_absent_from_backup: missing_candidates.to_string(),
         current_events_absent_or_changed_in_backup: missing_events.to_string(),
@@ -1167,5 +1421,434 @@ fn replacement_impact(current: &Connection, backup: &Connection) -> Result<Repla
         backup_first_ms: c,
         backup_last_ms: d,
         affected_sources: sources,
+        current_capture_entries_absent_or_changed_in_backup: capture.to_string(),
+        current_projection_rows_absent_or_changed_in_backup: projection.to_string(),
+        current_model_rows_absent_or_changed_in_backup: models.to_string(),
     })
+}
+
+// Controls have their own content identity: equal ledger epochs do not imply
+// equal suppression rules or projection tombstones.
+const RESTORE_RULE_COLUMNS: &str = "kind,report_source,identity_family,namespace_key,identity_key,session_key,link_version,link_key,native_tool,start_ms,end_ms";
+fn remember_restore_controls(current: &Connection, c: &Connection) -> Result<()> {
+    c.execute_batch(&format!(
+        "CREATE TEMP TABLE restore_prior_rules AS SELECT {RESTORE_RULE_COLUMNS} FROM suppression_rules;
+         CREATE TEMP TABLE restore_prior_tombstones AS SELECT * FROM source_projection_tombstones;
+         CREATE TEMP TABLE restore_prior_forget_ranges AS SELECT * FROM adoption_forget_ranges;
+         CREATE TEMP TABLE restore_control_roots AS SELECT root_id,report_source,identity_family,namespace_key FROM source_roots;
+         CREATE TEMP TABLE restore_saved_capture_entries AS SELECT * FROM legacy_capture_entries;
+         CREATE TEMP TABLE restore_saved_capture_state AS SELECT * FROM legacy_capture_state;"
+    ))?;
+    let mut statement = current
+        .prepare("SELECT root_id,report_source,identity_family,namespace_key FROM source_roots")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        c.execute(
+            "INSERT INTO restore_control_roots VALUES(?1,?2,?3,?4)",
+            params![
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?
+            ],
+        )?;
+    }
+    Ok(())
+}
+fn new_restore_rule() -> String {
+    format!(
+        "NOT EXISTS(SELECT 1 FROM restore_prior_rules old WHERE {})",
+        RESTORE_RULE_COLUMNS
+            .split(',')
+            .map(|name| format!("old.{name} IS s.{name}"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    )
+}
+fn clear_query_projection(c: &Connection) -> Result<()> {
+    super::time_repair::clear_staging(c)?;
+    c.execute_batch(
+        "DELETE FROM query_live_facts; DELETE FROM query_live_state;
+        DELETE FROM legacy_capture_entries; DELETE FROM legacy_capture_state;",
+    )?;
+    Ok(())
+}
+/// Keep historical inputs unchanged whenever their privacy can be proved. Old
+/// compatibility rows do not carry every durable identity / SQLite row mapping;
+/// an ambiguous new control must refuse replacement, never silently erase an
+/// unrelated source or guess that two records are the same.
+fn prepare_restored_history(
+    c: &Connection,
+    snapshot: Option<super::legacy::LegacySnapshot>,
+) -> Result<Option<super::legacy::LegacySnapshot>> {
+    use super::legacy::LegacyEntry;
+    let mut snapshot = snapshot;
+    if let Some(saved) = &mut snapshot {
+        let policy =
+            super::legacy::CapturePrivacy::load(c).map_err(|_| LedgerError::CorruptLedger)?;
+        let ordinals = c
+            .prepare(
+                "SELECT ordinal,report_source FROM restore_saved_capture_entries ORDER BY ordinal",
+            )?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if ordinals.len() != saved.entries.len() {
+            return Err(LedgerError::CorruptLedger);
+        }
+        for (entry, (ordinal, source)) in saved.entries.iter().zip(&ordinals) {
+            if entry.report_source() != source {
+                return Err(LedgerError::CorruptLedger);
+            }
+            if policy
+                .suppresses(c, entry)
+                .map_err(|e| LedgerError::InvalidInput(e.message))?
+            {
+                c.execute(
+                    "DELETE FROM restore_saved_capture_entries WHERE ordinal=?1",
+                    [ordinal],
+                )?;
+            }
+        }
+        saved
+            .filter_suppressed(c)
+            .map_err(|e| LedgerError::InvalidInput(e.message))?;
+        let mut retained = Vec::with_capacity(saved.entries.len());
+        let mut checked = std::collections::BTreeSet::new();
+        for entry in saved.entries.drain(..) {
+            let source = entry.report_source();
+            let native = match &entry {
+                LegacyEntry::Request { native_tool, .. } => native_tool.as_str(),
+                LegacyEntry::SessionTotal { record, .. } => record.source,
+                LegacyEntry::Day(day) => day.native_tool.as_str(),
+            };
+            if checked.insert((source.to_owned(), native.to_owned())) {
+                reject_ambiguous_restore_controls(c, source, native)?;
+            }
+            retained.push(entry);
+        }
+        saved.entries = retained;
+        saved.generation = new_epoch();
+        // Routing controls can have been merged from the current database.
+        saved.routing_hash =
+            super::query::QueryService::routing_hash(c).map_err(|_| LedgerError::CorruptLedger)?;
+    }
+    // Saved projections are historical inputs too, even without a published
+    // compatibility capture. Their own tombstone matcher has already run.
+    let sources = c.prepare("SELECT DISTINCT r.report_source,r.native_tool FROM source_projection_rows p JOIN source_roots r USING(root_id)")?
+        .query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (source, native) in sources {
+        // Projection tombstones have exact row keys and were applied already;
+        // identity controls still lack that map for some legacy schemas.
+        reject_ambiguous_restore_rules(c, &source, &native)?;
+    }
+    // Whole-source erasure also removes model attribution retained separately.
+    let forget_minimax: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE kind='source' AND report_source='minimax' AND (native_tool IS NULL OR native_tool='minimax'))", [], |r|r.get(0))?;
+    if forget_minimax {
+        c.execute("DELETE FROM minimax_model_files", [])?;
+    }
+    Ok(snapshot)
+}
+/// Keep source input bytes, including decimal monetary literals, unchanged.
+/// Re-serializing an f64 decoded with a different JSON path can round by one ULP;
+/// a maintenance round trip must not rewrite historical amounts or their hashes.
+fn persist_restored_capture(c: &Connection, saved: &super::legacy::LegacySnapshot) -> Result<()> {
+    use std::collections::BTreeMap;
+    super::legacy::CapturePrivacy::load(c)
+        .and_then(|p| p.validate(c, saved))
+        .map_err(|e| LedgerError::InvalidInput(e.message))?;
+    let (uuid, epoch): (String, String) =
+        c.query_row("SELECT ledger_uuid,epoch FROM ledger_meta", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    let raw: String = c.query_row(
+        "SELECT metadata_json FROM restore_saved_capture_state WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| LedgerError::CorruptLedger)?;
+    let new_hash = || {
+        let mut hash = Sha256::new();
+        hash.update(b"usagebook/legacy-source-content/v1");
+        hash
+    };
+    let mut hashes: BTreeMap<String, Sha256> = saved
+        .sources
+        .keys()
+        .map(|source| (source.clone(), new_hash()))
+        .collect();
+    let mut statement = c.prepare(
+        "SELECT report_source,entry_json FROM restore_saved_capture_entries ORDER BY ordinal",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut count = 0usize;
+    while let Some(row) = rows.next()? {
+        let source: String = row.get(0)?;
+        let encoded: String = row.get(1)?;
+        let hash = hashes.entry(source).or_insert_with(new_hash);
+        hash.update((encoded.len() as u64).to_be_bytes());
+        hash.update(encoded.as_bytes());
+        count += 1;
+    }
+    if count != saved.entries.len() {
+        return Err(LedgerError::CorruptLedger);
+    }
+    let hashes: BTreeMap<_, _> = hashes
+        .into_iter()
+        .map(|(source, hash)| (source, format!("{:x}", hash.finalize())))
+        .collect();
+    metadata["generation"] = serde_json::json!(saved.generation);
+    metadata["routing_hash"] = serde_json::json!(saved.routing_hash);
+    metadata["sources"] =
+        serde_json::to_value(&saved.sources).map_err(|_| LedgerError::CorruptLedger)?;
+    metadata["entries"] = serde_json::json!([]);
+    metadata["entry_count"] = serde_json::json!(count);
+    metadata["source_content_hash_version"] = serde_json::json!(1);
+    metadata["source_content_hashes"] = serde_json::json!(hashes);
+    c.execute(
+        "INSERT INTO legacy_capture_entries SELECT * FROM restore_saved_capture_entries",
+        [],
+    )?;
+    c.execute(
+        "INSERT INTO legacy_capture_state VALUES(1,?1,?2,?3,?4)",
+        params![uuid, epoch, saved.generation, metadata.to_string()],
+    )?;
+    Ok(())
+}
+
+fn reject_ambiguous_restore_controls(c: &Connection, source: &str, native: &str) -> Result<()> {
+    let new_tombstone: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM source_projection_tombstones s
+         WHERE (EXISTS(SELECT 1 FROM restore_control_roots r WHERE r.root_id=s.root_id AND r.report_source=?1)
+          OR NOT EXISTS(SELECT 1 FROM restore_control_roots r WHERE r.root_id=s.root_id)) AND NOT EXISTS(SELECT 1 FROM restore_prior_tombstones old
+          WHERE old.root_id=s.root_id AND old.table_name=s.table_name AND old.row_key_hash=s.row_key_hash))",
+        [source], |r| r.get(0))?;
+    if new_tombstone {
+        return Err(ambiguous_restore(source));
+    }
+    reject_ambiguous_restore_rules(c, source, native)
+}
+fn reject_ambiguous_restore_rules(c: &Connection, source: &str, native: &str) -> Result<()> {
+    let ambiguous: bool = c.query_row(&format!(
+        "SELECT EXISTS(SELECT 1 FROM suppression_rules s WHERE {} AND s.kind NOT IN('source','window') AND
+         ((s.identity_family IS NOT NULL AND (s.identity_family IN(?1,?2) OR NOT EXISTS(SELECT 1 FROM restore_control_roots r WHERE r.identity_family=s.identity_family AND r.namespace_key=s.namespace_key) OR EXISTS(SELECT 1 FROM restore_control_roots r WHERE r.report_source=?1 AND r.identity_family=s.identity_family AND r.namespace_key=s.namespace_key))) OR s.native_tool=?2)) OR
+         EXISTS(SELECT 1 FROM adoption_forget_ranges f WHERE f.consumer_tool=?2 AND f.identity_family IS NOT NULL
+           AND NOT EXISTS(SELECT 1 FROM restore_prior_forget_ranges old WHERE old.consumer_tool=f.consumer_tool AND old.start_ms=f.start_ms AND old.end_ms=f.end_ms AND old.native_timezone IS f.native_timezone AND old.identity_family IS f.identity_family AND old.namespace_key IS f.namespace_key))", new_restore_rule()),
+        params![source, native], |r| r.get(0))?;
+    if ambiguous {
+        Err(ambiguous_restore(source))
+    } else {
+        Ok(())
+    }
+}
+fn ambiguous_restore(source: &str) -> LedgerError {
+    LedgerError::InvalidInput(format!("cannot safely restore saved {source} history: new privacy controls lack an exact compatibility mapping; current ledger and backup are unchanged"))
+}
+/// Compare input content, not row numbers or generations. Multiplicity matters
+/// for compatibility captures; repeated equal rows must not conceal a loss.
+fn saved_history_impact(
+    current: &Connection,
+    backup: &Connection,
+) -> Result<(u64, u64, u64, Vec<String>)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let queries = [
+        "SELECT report_source,entry_json FROM legacy_capture_entries",
+        "SELECT s.report_source,json_array(p.root_id,p.table_name,p.row_key,p.projection_json) FROM source_projection_rows p JOIN source_projection_scopes s USING(root_id)",
+        "SELECT 'minimax',json_array(f.path,f.root_path,f.session_id,r.line_offset,r.turn_id,r.timestamp_ms,r.model) FROM minimax_model_rows r JOIN minimax_model_files f USING(path)",
+    ];
+    let mut counts = [0u64; 3];
+    let mut affected = BTreeSet::new();
+    for (i, sql) in queries.iter().enumerate() {
+        let mut remaining = BTreeMap::<(String, [u8; 32]), u64>::new();
+        let mut st = backup.prepare(sql)?;
+        let mut rows = st.query([])?;
+        while let Some(row) = rows.next()? {
+            let encoded: String = row.get(1)?;
+            *remaining
+                .entry((row.get(0)?, Sha256::digest(encoded.as_bytes()).into()))
+                .or_default() += 1;
+        }
+        let mut st = current.prepare(sql)?;
+        let mut rows = st.query([])?;
+        while let Some(row) = rows.next()? {
+            let encoded: String = row.get(1)?;
+            let key: (String, [u8; 32]) = (row.get(0)?, Sha256::digest(encoded.as_bytes()).into());
+            let amount = remaining.entry(key.clone()).or_default();
+            if *amount > 0 {
+                *amount -= 1;
+            } else {
+                counts[i] += 1;
+                affected.insert(key.0);
+            }
+        }
+    }
+    Ok((
+        counts[0],
+        counts[1],
+        counts[2],
+        affected.into_iter().collect(),
+    ))
+}
+
+/// Forget invalidates the affected compatibility sources; unrelated saved
+/// views and source checkpoints must survive even if their inputs are gone.
+fn clear_forgotten_read_caches(
+    c: &Connection,
+    scope: &ForgetScope,
+) -> Result<Option<super::legacy::LegacySnapshot>> {
+    use std::collections::BTreeSet;
+    let previous = super::legacy::LegacySnapshot::restore_capture(c)
+        .map_err(|_| LedgerError::CorruptLedger)?;
+    let mut affected: BTreeSet<String> = c.prepare("SELECT DISTINCT report_source FROM usage_observations WHERE observation_id IN (SELECT id FROM delete_ids)")?
+        .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    if let Some(source) = &scope.source {
+        affected.insert(source.clone());
+    }
+    if scope.all {
+        super::time_repair::clear_staging(c)?;
+    } else {
+        for source in &affected {
+            super::time_repair::clear_source_staging(c, source)?;
+        }
+    }
+    if let (Some(snapshot), Some((start, end))) = (&previous, scope.start_ms.zip(scope.end_ms)) {
+        for entry in &snapshot.entries {
+            if !scope.all && !affected.contains(entry.report_source()) {
+                continue;
+            }
+            if let super::legacy::LegacyEntry::Day(day) = entry {
+                if day
+                    .start_ms
+                    .zip(day.end_ms)
+                    .is_some_and(|(a, b)| a < end && b > start && (start > a || end < b))
+                {
+                    return Err(LedgerError::InvalidInput(
+                        "saved daily summaries are indivisible; select the complete native day"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    }
+    if scope.identity.is_some()
+        && previous.as_ref().is_some_and(|s| {
+            s.entries
+                .iter()
+                .any(|row| affected.contains(row.report_source()))
+        })
+    {
+        for source in &affected {
+            let ledger_route: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM source_roots WHERE report_source=?1 AND route='ledger')", [source], |r|r.get(0))?;
+            if !ledger_route {
+                return Err(LedgerError::InvalidInput("single-identity deletion cannot safely partition this source's compatibility view; source and date scopes are supported".into()));
+            }
+        }
+    }
+    if scope.all && scope.start_ms.is_none() {
+        clear_read_caches(c)?;
+        return Ok(None);
+    }
+    for source in &affected {
+        if scope.start_ms.is_none() && scope.identity.is_none() {
+            c.execute(
+                "DELETE FROM source_projection_scopes WHERE report_source=?1",
+                [source],
+            )?;
+        }
+        if source == "minimax" && scope.start_ms.is_none() && scope.identity.is_none() {
+            c.execute("DELETE FROM minimax_model_files", [])?;
+        }
+    }
+    c.execute("DELETE FROM query_live_facts", [])?;
+    c.execute("DELETE FROM query_live_state", [])?;
+    c.execute("DELETE FROM legacy_capture_entries", [])?;
+    c.execute("DELETE FROM legacy_capture_state", [])?;
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    let mut retained =
+        super::legacy::LegacySnapshot::new(new_epoch(), previous.routing_hash.clone());
+    for (source, status) in &previous.sources {
+        if !affected.contains(source) || scope.start_ms.is_some() {
+            retained.sources.insert(source.clone(), status.clone());
+            retained.retain_input_containers(source, &previous);
+        }
+    }
+    retained.entries = previous
+        .entries
+        .into_iter()
+        .filter(|entry| {
+            if !scope.all && !affected.contains(entry.report_source()) {
+                return true;
+            }
+            let Some((start, end)) = scope.start_ms.zip(scope.end_ms) else {
+                return false;
+            };
+            // A dated forget cannot select unknown-time rows. Native daily
+            // intervals remain indivisible, just as the durable observations.
+            use super::legacy::LegacyEntry;
+            match entry {
+                LegacyEntry::Request { record, .. } | LegacyEntry::SessionTotal { record, .. } => {
+                    record.ts_ms <= 0 || record.ts_ms < start || record.ts_ms >= end
+                }
+                LegacyEntry::Day(day) => day
+                    .start_ms
+                    .zip(day.end_ms)
+                    .is_none_or(|(a, b)| a >= end || b <= start),
+            }
+        })
+        .collect();
+    Ok(Some(retained))
+}
+
+/// A restore replaces history, so all derived views must be rebuilt against it.
+fn clear_read_caches(c: &Connection) -> Result<()> {
+    super::time_repair::clear_staging(c)?;
+    for name in [
+        "query_live_facts",
+        "query_live_state",
+        "legacy_capture_entries",
+        "legacy_capture_state",
+        "source_projection_rows",
+        "source_projection_scopes",
+        "minimax_model_rows",
+        "minimax_model_files",
+    ] {
+        let exists: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            [name],
+            |r| r.get(0),
+        )?;
+        if exists {
+            c.execute(&format!("DELETE FROM {name}"), [])?;
+        }
+    }
+    Ok(())
+}
+
+/// Pausing collection changes controls, not saved history. Keep cache provenance
+/// in the same maintenance transaction; deletion/restoration never use this path.
+fn change_epoch_preserving_read_caches(c: &Connection) -> Result<String> {
+    let previous: String = c.query_row("SELECT epoch FROM ledger_meta", [], |r| r.get(0))?;
+    let next = db::change_epoch(c)?;
+    for name in [
+        "query_live_state",
+        "legacy_capture_state",
+        "source_projection_scopes",
+        "minimax_model_files",
+    ] {
+        let exists: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            [name],
+            |r| r.get(0),
+        )?;
+        if exists {
+            c.execute(
+                &format!("UPDATE {name} SET epoch=?1 WHERE epoch=?2"),
+                params![next, previous],
+            )?;
+        }
+    }
+    Ok(next)
 }

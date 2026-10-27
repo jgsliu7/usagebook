@@ -11,7 +11,7 @@ pub enum Caliber {
 }
 
 /// 一条归一后的用量记录。所有数据源解析的最终产物。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UsageRecord {
     /// 数据源 id(全部合法值见 lib.rs SOURCE_CATALOG)
     pub source: &'static str,
@@ -41,6 +41,65 @@ pub struct UsageRecord {
     pub request_count: u32,
     /// 去重键(各源档案 §5)
     pub dedup_key: String,
+}
+
+impl<'de> Deserialize<'de> for UsageRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct OwnedRecord {
+            /// 数据源 id(全部合法值见 lib.rs SOURCE_CATALOG)
+            pub source: String,
+            pub session_id: String,
+            /// 子代理标识(None = 主代理)
+            pub agent: Option<String>,
+            pub model: String,
+            /// epoch 毫秒(本地时区转日)
+            pub ts_ms: i64,
+            pub caliber: Caliber,
+            pub input_uncached: u64,
+            pub cache_read: u64,
+            pub cache_write: u64,
+            /// cache_write 中按 1 小时 TTL 写入的子集(≤cache_write;Anthropic 单独计价,
+            /// 5 分钟写价的 1.6 倍)。仅 claude 转录提取,其余源为 0;五桶合计口径不变。
+            /// 未提供或无法从冲突明细确定时兼容为 0;后者同时在 ScanStats.notes 中诊断。
+            #[serde(default)]
+            pub cache_write_1h: u64,
+            /// 模型输出(不含单列的思考桶)
+            pub output: u64,
+            pub reasoning_output: u64,
+            /// 源自带成本(官方口径,如 TRAE dollar_float / Claude cost-state);估算成本不落此字段
+            pub cost_usd: Option<f64>,
+            /// 该记录承载的请求数:常规记录恒 1;日聚合回填行(ccswitch-rollup)为该日请求数。
+            /// 序列化缺省 1,兼容既有 L2 缓存行。
+            #[serde(default = "request_count_one")]
+            pub request_count: u32,
+            /// 去重键(各源档案 §5)
+            pub dedup_key: String,
+        }
+        let row = OwnedRecord::deserialize(deserializer)?;
+        let source = crate::SOURCE_CATALOG
+            .iter()
+            .find(|source| source.id == row.source)
+            .map(|source| source.id)
+            .ok_or_else(|| serde::de::Error::custom("unknown usage source"))?;
+        Ok(Self {
+            source,
+            session_id: row.session_id,
+            agent: row.agent,
+            model: row.model,
+            ts_ms: row.ts_ms,
+            caliber: row.caliber,
+            input_uncached: row.input_uncached,
+            cache_read: row.cache_read,
+            cache_write: row.cache_write,
+            cache_write_1h: row.cache_write_1h,
+            output: row.output,
+            reasoning_output: row.reasoning_output,
+            cost_usd: row.cost_usd,
+            request_count: row.request_count,
+            dedup_key: row.dedup_key,
+        })
+    }
 }
 
 fn request_count_one() -> u32 {

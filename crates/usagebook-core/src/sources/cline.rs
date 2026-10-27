@@ -16,8 +16,8 @@
 //! 去重键:cline:{sessionId}:{messageId},id 稳定、ts:index 兜底(§5-6)
 //! db 不读:sessions 表无 token 列,文件即账本(§2)
 
-use crate::common::{env_roots, home};
-use crate::model::{Caliber, ScanStats, UsageRecord, UsageSource};
+use crate::common::{env_roots, file_stamp, home, FileStamp, SourceFingerprint};
+use crate::model::{Caliber, PreparedSourceScan, ScanStats, UsageRecord, UsageSource};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -29,26 +29,33 @@ struct ManifestInfo {
     is_import: bool,
     model: String,
     provider: String,
+    invalid_json: bool,
 }
 
 const NO_MANIFEST: ManifestInfo = ManifestInfo {
     is_import: false,
     model: String::new(),
     provider: String::new(),
+    invalid_json: false,
 };
 
 /// 读同目录 manifest `<sessionId>.json`(§3):
 /// metadata.sessionHistoryOrigin.mode=="import" 或 importedFrom 存在 → 导入镜像(§5-1);
-/// 缺失/损坏按 native 处理(子代理本就无 manifest)。
-fn read_manifest(dir: &Path) -> ManifestInfo {
+/// 缺失可选 manifest 保持兼容；损坏时仅允许消息本身能证明归属和模型的历史。
+fn read_manifest(dir: &Path) -> std::io::Result<ManifestInfo> {
     let Some(name) = dir.file_name().and_then(|s| s.to_str()) else {
-        return NO_MANIFEST;
+        return Ok(NO_MANIFEST);
     };
-    let Ok(text) = std::fs::read_to_string(dir.join(format!("{name}.json"))) else {
-        return NO_MANIFEST;
+    let text = match std::fs::read_to_string(dir.join(format!("{name}.json"))) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(NO_MANIFEST),
+        Err(error) => return Err(error),
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return NO_MANIFEST;
+        return Ok(ManifestInfo {
+            invalid_json: true,
+            ..NO_MANIFEST
+        });
     };
     let is_import = v
         .pointer("/metadata/sessionHistoryOrigin/mode")
@@ -56,8 +63,9 @@ fn read_manifest(dir: &Path) -> ManifestInfo {
         == Some("import")
         || v.get("metadata")
             .is_some_and(|m| m.get("importedFrom").is_some_and(|x| !x.is_null()));
-    ManifestInfo {
+    Ok(ManifestInfo {
         is_import,
+        invalid_json: false,
         model: v
             .get("model")
             .and_then(|x| x.as_str())
@@ -68,7 +76,7 @@ fn read_manifest(dir: &Path) -> ManifestInfo {
             .and_then(|x| x.as_str())
             .unwrap_or_default()
             .to_string(),
-    }
+    })
 }
 
 impl UsageSource for ClineSource {
@@ -100,54 +108,205 @@ impl UsageSource for ClineSource {
         Vec::new()
     }
 
+    fn prepare_scan(&self, roots: &[PathBuf]) -> Option<Box<dyn PreparedSourceScan>> {
+        Some(Box::new(ClineInputs::discover(roots, None)))
+    }
+
     fn scan_roots(
         &self,
-        roots: &[std::path::PathBuf],
+        roots: &[PathBuf],
         max_files: Option<usize>,
     ) -> (Vec<UsageRecord>, ScanStats) {
-        let mut stats = ScanStats::default();
-        if roots.is_empty() {
-            stats.notes.push(
-                "未发现 ~/.cline/data/sessions 或 CLINE_SESSION_DATA_DIR/CLINE_DATA_DIR/CLINE_DIR"
-                    .into(),
-            );
-            return (vec![], stats);
-        }
-        // —— 发现(自写):sessions/<dir>/*.messages.json 全 glob(§2)——
-        // 子代理 agent_*.messages.json 同目录异名,只取目录同名文件会漏
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut per_root = Vec::new();
-        for r in roots {
-            let mut got: Vec<PathBuf> = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(r) {
-                for e in rd.flatten() {
-                    let d = e.path();
-                    if !d.is_dir() {
-                        continue;
-                    }
-                    if let Ok(md) = std::fs::read_dir(&d) {
-                        for f in md.flatten() {
-                            let p = f.path();
-                            if p.file_name()
-                                .and_then(|n| n.to_str())
-                                .is_some_and(|n| n.ends_with(".messages.json"))
-                            {
-                                got.push(p);
-                            }
+        ClineInputs::discover(roots, max_files).scan()
+    }
+}
+
+/// The cache and parser share one shallow discovery manifest. An incomplete
+/// directory listing must never become a successful replacement of saved usage.
+struct ClineInputs {
+    files: Vec<PathBuf>,
+    per_root: Vec<(String, usize)>,
+    fingerprint: SourceFingerprint,
+    stats: ScanStats,
+}
+
+#[cfg(feature = "regression-hooks")]
+thread_local! {
+    static ENTRY_ERROR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static TYPE_ERROR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "regression-hooks")]
+#[doc(hidden)]
+pub fn __fail_directory_entry_for_tests(path: PathBuf) {
+    ENTRY_ERROR.with(|slot| *slot.borrow_mut() = Some(path));
+}
+
+#[cfg(feature = "regression-hooks")]
+#[doc(hidden)]
+pub fn __fail_directory_type_for_tests(path: PathBuf) {
+    TYPE_ERROR.with(|slot| *slot.borrow_mut() = Some(path));
+}
+
+impl ClineInputs {
+    fn failure(&mut self, path: &Path, error: impl std::fmt::Display) {
+        self.stats.failed = true;
+        self.stats
+            .notes
+            .push(format!("{} 用量输入读取失败: {error}", path.display()));
+    }
+
+    fn entries(&mut self, path: &Path) -> Vec<std::fs::DirEntry> {
+        let mut entries = Vec::new();
+        match std::fs::read_dir(path) {
+            Ok(reader) => {
+                #[cfg(feature = "regression-hooks")]
+                let reader = {
+                    let fault = ENTRY_ERROR.with(|slot| {
+                        if slot.borrow().as_deref() == Some(path) {
+                            slot.borrow_mut().take();
+                            true
+                        } else {
+                            false
                         }
+                    });
+                    reader.chain(
+                        fault.then(|| Err(std::io::Error::other("injected directory entry error"))),
+                    )
+                };
+                for entry in reader {
+                    match entry {
+                        Ok(entry) => entries.push(entry),
+                        Err(error) => self.failure(path, error.kind()),
                     }
                 }
             }
-            got.sort(); // 会话目录/文件名排序,保证确定性
-            per_root.push((r.display().to_string(), got.len()));
-            files.extend(got);
-            if max_files.is_some_and(|m| files.len() >= m) {
-                files.truncate(max_files.unwrap());
+            Err(error) => self.failure(path, error.kind()),
+        }
+        entries.sort_by_key(|entry| entry.path());
+        entries
+    }
+
+    fn metadata(&mut self, path: &Path) -> Option<std::fs::Metadata> {
+        #[cfg(feature = "regression-hooks")]
+        let fault = TYPE_ERROR.with(|slot| {
+            if slot.borrow().as_deref() == Some(path) {
+                slot.borrow_mut().take();
+                true
+            } else {
+                false
+            }
+        });
+        #[cfg(feature = "regression-hooks")]
+        if fault {
+            self.failure(path, "injected directory type error");
+            return None;
+        }
+        match std::fs::metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                self.failure(path, error.kind());
+                None
+            }
+        }
+    }
+
+    fn remember_file(&mut self, path: &Path) {
+        match file_stamp(path) {
+            Some(stamp) => self.fingerprint.push((path.to_path_buf(), stamp)),
+            None => self.failure(path, "无法读取文件状态"),
+        }
+    }
+
+    fn discover(roots: &[PathBuf], max_files: Option<usize>) -> Self {
+        let mut out = Self {
+            files: Vec::new(),
+            per_root: Vec::new(),
+            fingerprint: Vec::new(),
+            stats: ScanStats::default(),
+        };
+        if roots.is_empty() {
+            out.stats.notes.push(
+                "未发现 ~/.cline/data/sessions 或 CLINE_SESSION_DATA_DIR/CLINE_DATA_DIR/CLINE_DIR"
+                    .into(),
+            );
+        }
+        for root in roots {
+            let mut files = Vec::new();
+            // A genuinely absent optional root remains a complete empty input.
+            // A dangling link, wrong type or other I/O error is not absence.
+            match std::fs::symlink_metadata(root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    out.failure(root, error.kind());
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            match out.metadata(root) {
+                Some(metadata) if metadata.is_dir() => {}
+                Some(_) => {
+                    out.failure(root, "预期会话目录");
+                    continue;
+                }
+                None => continue,
+            }
+            out.fingerprint
+                .push((root.clone(), FileStamp::membership()));
+            for entry in out.entries(root) {
+                let dir = entry.path();
+                match out.metadata(&dir) {
+                    Some(metadata) if metadata.is_dir() => {}
+                    Some(_) => continue,
+                    None => continue,
+                }
+                out.fingerprint.push((dir.clone(), FileStamp::membership()));
+                for entry in out.entries(&dir) {
+                    let path = entry.path();
+                    let name = path.file_name().and_then(|name| name.to_str());
+                    let is_messages = name.is_some_and(|name| name.ends_with(".messages.json"));
+                    let is_manifest = dir
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|session| name == Some(format!("{session}.json").as_str()));
+                    if !is_messages && !is_manifest {
+                        continue;
+                    }
+                    match out.metadata(&path) {
+                        Some(metadata) if metadata.is_file() => {}
+                        Some(_) => {
+                            out.failure(&path, "预期会话文件");
+                            continue;
+                        }
+                        None => continue,
+                    }
+                    out.remember_file(&path);
+                    if is_messages {
+                        files.push(path);
+                    }
+                }
+            }
+            files.sort();
+            out.per_root.push((root.display().to_string(), files.len()));
+            out.files.extend(files);
+            if max_files.is_some_and(|limit| out.files.len() >= limit) {
+                out.files.truncate(max_files.unwrap());
                 break;
             }
         }
-        stats.files_seen = files.len();
+        out.stats.files_seen = out.files.len();
+        out
+    }
+}
 
+impl PreparedSourceScan for ClineInputs {
+    fn fingerprint(&self) -> Option<SourceFingerprint> {
+        (!self.stats.failed).then(|| self.fingerprint.clone())
+    }
+
+    fn scan(&self) -> (Vec<UsageRecord>, ScanStats) {
+        let mut stats = self.stats.clone();
+        let files = &self.files;
         let mut records: Vec<UsageRecord> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new(); // 幂等入队,同键不入(00-总览 §5-1)
         let mut native_sessions: HashSet<String> = HashSet::new();
@@ -159,20 +318,41 @@ impl UsageSource for ClineSource {
         let mut excl_reclass = 0u64;
         let mut dup_dropped = 0u64;
 
-        for path in &files {
+        for path in files {
             let dir = path.parent().unwrap_or(Path::new(""));
             // 性能:先读小 manifest(<1KB)判导入,避免把 308MB 导入镜像整文件读入解析
             // (实测该源 RSS 664MB 的主因);manifest 缺失才落回读文件按 origin.mode 复核
-            let pre_manifest = read_manifest(dir);
+            let pre_manifest = match read_manifest(dir) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    stats.failed = true;
+                    stats.notes.push(format!(
+                        "{} 会话信息读取失败: {}",
+                        dir.display(),
+                        error.kind()
+                    ));
+                    continue;
+                }
+            };
             if pre_manifest.is_import {
                 import_files += 1;
                 continue;
             }
-            // 整文件 JSON 非 JSONL(§3);读/解析失败按坏行计数上报
-            let Some(doc) = std::fs::read_to_string(path)
-                .ok()
-                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            else {
+            // 整文件 JSON 非 JSONL(§3);读取失败与 JSON 错误都阻止发布。
+            let text = match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) => {
+                    stats.failed = true;
+                    stats.lines_bad_json += 1;
+                    stats.notes.push(format!(
+                        "{} 用量文件读取失败: {}",
+                        path.display(),
+                        error.kind()
+                    ));
+                    continue;
+                }
+            };
+            let Ok(doc) = serde_json::from_str::<Value>(&text) else {
                 stats.lines_bad_json += 1;
                 continue;
             };
@@ -188,11 +368,19 @@ impl UsageSource for ClineSource {
                 .pointer("/origin/mode")
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
-            let mut mf: Option<ManifestInfo> = Some(pre_manifest);
+            let mf = pre_manifest;
+            if mf.invalid_json && !matches!(own_mode, "native" | "subagent" | "import") {
+                stats.failed = true;
+                stats.notes.push(format!(
+                    "{} 会话信息 JSON 不完整，无法确认导入归属",
+                    dir.display()
+                ));
+                continue;
+            }
             let is_import = match own_mode {
                 "import" => true,
                 "subagent" => false,
-                _ => mf.as_ref().map(|i| i.is_import).unwrap_or(false),
+                _ => mf.is_import,
             };
             if is_import {
                 import_files += 1;
@@ -227,6 +415,7 @@ impl UsageSource for ClineSource {
                 native_sessions.insert(session_id.clone());
             }
 
+            let mut invalid_model_reported = false;
             for (idx, m) in msgs.iter().enumerate() {
                 // 已知角色仅 user/assistant(§3 本机全集);其余计未知类型
                 match m.get("role").and_then(|x| x.as_str()) {
@@ -268,16 +457,26 @@ impl UsageSource for ClineSource {
                 };
                 let output = o_tok.saturating_sub(rs); // reasoning 为 output 子集(§4)
                                                        // 模型回退链(§5-2):per-message modelInfo.id → manifest.model → provider:xxx
+                if mf.invalid_json && m.pointer("/modelInfo/id").and_then(Value::as_str).is_none() {
+                    stats.failed = true;
+                    if !invalid_model_reported {
+                        stats.notes.push(format!(
+                            "{} 会话信息 JSON 不完整，无法读取模型回退信息",
+                            dir.display()
+                        ));
+                        invalid_model_reported = true;
+                    }
+                    continue;
+                }
                 let model = m
                     .pointer("/modelInfo/id")
                     .and_then(|x| x.as_str())
                     .map(str::to_string)
                     .unwrap_or_else(|| {
-                        let info = mf.get_or_insert_with(|| read_manifest(dir));
-                        if !info.model.is_empty() {
-                            info.model.clone()
-                        } else if !info.provider.is_empty() {
-                            format!("provider:{}", info.provider)
+                        if !mf.model.is_empty() {
+                            mf.model.clone()
+                        } else if !mf.provider.is_empty() {
+                            format!("provider:{}", mf.provider)
                         } else {
                             "unknown".into()
                         }
@@ -316,7 +515,7 @@ impl UsageSource for ClineSource {
             }
         }
 
-        for (root, n) in per_root {
+        for (root, n) in &self.per_root {
             stats
                 .notes
                 .push(format!("根 {}:{n} 个 *.messages.json", root));

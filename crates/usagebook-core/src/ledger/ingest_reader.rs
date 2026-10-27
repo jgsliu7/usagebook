@@ -30,6 +30,152 @@ pub(super) struct Job {
 pub(super) struct PrefixProof {
     pub len: i64,
     pub digest: Vec<u8>,
+    #[serde(default)]
+    pub resume: Option<SavedStreamState>,
+}
+// Stable SHA-256 compression state. Checkpoints store completed blocks only;
+// the final <64 bytes are reread from source, never persisted as source content.
+#[derive(Clone)]
+struct PortableSha256 {
+    state: [u32; 8],
+    total: u64,
+    partial: Vec<u8>,
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+impl Default for PortableSha256 {
+    fn default() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            total: 0,
+            partial: Vec::new(),
+            head: Vec::new(),
+            tail: Vec::new(),
+        }
+    }
+}
+impl PortableSha256 {
+    fn update(&mut self, mut bytes: &[u8]) {
+        self.total += bytes.len() as u64;
+        let head_n = bytes.len().min(4096 - self.head.len());
+        self.head.extend_from_slice(&bytes[..head_n]);
+        if bytes.len() >= 4096 {
+            self.tail.clear();
+            self.tail.extend_from_slice(&bytes[bytes.len() - 4096..]);
+        } else {
+            self.tail.extend_from_slice(bytes);
+            let excess = self.tail.len().saturating_sub(4096);
+            self.tail.drain(..excess);
+        }
+        while !bytes.is_empty() {
+            let n = bytes.len().min(64 - self.partial.len());
+            self.partial.extend_from_slice(&bytes[..n]);
+            bytes = &bytes[n..];
+            if self.partial.len() == 64 {
+                sha2::compress256(
+                    &mut self.state,
+                    std::slice::from_ref(sha2::digest::generic_array::GenericArray::from_slice(
+                        &self.partial,
+                    )),
+                );
+                self.partial.clear();
+            }
+        }
+    }
+    fn finalize(&self) -> Vec<u8> {
+        let mut padded = self.clone();
+        let bits = self.total * 8;
+        let n = if self.partial.len() < 56 {
+            56 - self.partial.len()
+        } else {
+            120 - self.partial.len()
+        };
+        let mut pad = vec![0; n];
+        pad[0] = 0x80;
+        pad.extend_from_slice(&bits.to_be_bytes());
+        padded.update(&pad);
+        padded.state.iter().flat_map(|n| n.to_be_bytes()).collect()
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct SavedStreamState {
+    version: u32,
+    pub offset: u64,
+    state: [u32; 8],
+    pub digest: Vec<u8>,
+    device: u64,
+    file: u64,
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+fn stream_anchors(path: &Path, offset: u64) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+    let n = offset.min(4096) as usize;
+    let mut f = File::open(path).map_err(source_io)?;
+    let mut b = vec![0; n];
+    f.read_exact(&mut b).map_err(source_io)?;
+    let head = b.clone();
+    f.seek(SeekFrom::Start(offset - n as u64))
+        .map_err(source_io)?;
+    f.read_exact(&mut b).map_err(source_io)?;
+    Ok((head, b, 2 * n as u64))
+}
+impl SavedStreamState {
+    fn capture(hash: &PortableSha256, version: &FileVersion) -> Result<Self> {
+        let head = Sha256::digest(&hash.head).to_vec();
+        let tail = Sha256::digest(&hash.tail).to_vec();
+        Ok(Self {
+            version: 2,
+            offset: hash.total,
+            state: hash.state,
+            digest: hash.finalize(),
+            device: version.device,
+            file: version.file,
+            head,
+            tail,
+        })
+    }
+    fn restore(&self, path: &Path, version: &FileVersion) -> Result<(PortableSha256, u64)> {
+        if self.version != 2
+            || self.digest.len() != 32
+            || self.head.len() != 32
+            || self.tail.len() != 32
+            || self.offset > MAX_STREAM_BYTES as u64
+            || self.device != version.device
+            || self.file != version.file
+        {
+            return Err(LedgerError::StaleObservation);
+        }
+        let (head, tail, mut bytes) = stream_anchors(path, self.offset)?;
+        if Sha256::digest(&head).as_slice() != self.head
+            || Sha256::digest(&tail).as_slice() != self.tail
+        {
+            return Err(LedgerError::StaleObservation);
+        }
+        let n = (self.offset % 64) as usize;
+        let mut f = File::open(path).map_err(source_io)?;
+        f.seek(SeekFrom::Start(self.offset - n as u64))
+            .map_err(source_io)?;
+        let mut remainder = vec![0; n];
+        f.read_exact(&mut remainder).map_err(source_io)?;
+        bytes += n as u64;
+        let mut hash = PortableSha256 {
+            state: self.state,
+            total: self.offset - n as u64,
+            partial: Vec::new(),
+            head: Vec::new(),
+            tail: Vec::new(),
+        };
+        hash.update(&remainder);
+        hash.head = head;
+        hash.tail = tail;
+        if hash.finalize() != self.digest {
+            return Err(LedgerError::StaleObservation);
+        }
+        Ok((hash, bytes))
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct FileVersion {
@@ -133,6 +279,8 @@ pub(super) enum Event {
         audit_bytes: Option<String>,
         ignored: u64,
         version: Option<FileVersion>,
+        #[serde(default)]
+        stream_state: Option<SavedStreamState>,
     },
     Done {
         task: String,
@@ -159,6 +307,7 @@ pub(super) struct Pool {
     sender: mpsc::SyncSender<Job>,
     receiver: mpsc::Receiver<Event>,
     pub slots: usize,
+    pub owner: Option<PathBuf>,
     pub occupied: std::collections::BTreeSet<String>,
     helper: Option<std::process::Child>,
     helper_task: Option<String>,
@@ -196,6 +345,7 @@ impl Pool {
             sender,
             receiver,
             slots,
+            owner: None,
             occupied: Default::default(),
             helper: None,
             helper_task: None,
@@ -427,6 +577,7 @@ fn run(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
                 audit_bytes,
                 ignored: std::mem::take(ignored),
                 version: None,
+                stream_state: None,
             })
         };
         loop {
@@ -561,12 +712,35 @@ fn run_stream(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
         let meta = file.metadata().map_err(source_io)?;
         let version = file_version(Some(&file), &meta)?;
         require_open_version(&file, job, &version)?;
-        let mut hash = Sha256::new();
+        let mut hash = PortableSha256::default();
         if let Some(proof) = &job.proof {
             if proof.len != job.offset || proof.digest.len() != 32 {
                 return Err(LedgerError::StaleObservation);
             }
             let mut left = proof.len as u64;
+            if let Some(saved) = proof.resume.as_ref().filter(|_| !job.audit) {
+                if saved.offset != proof.len as u64 || saved.digest != proof.digest {
+                    return Err(LedgerError::StaleObservation);
+                }
+                match saved.restore(&job.path, &version) {
+                    Ok((restored, read)) => {
+                        hash = restored;
+                        bytes += read;
+                        left = 0;
+                        file.seek(SeekFrom::Start(proof.len as u64))
+                            .map_err(source_io)?;
+                    }
+                    Err(LedgerError::StaleObservation) => {
+                        emit(Event::Prefix {
+                            task: job.task.clone(),
+                            accepted: false,
+                            version: version.clone(),
+                        })?;
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             let mut buffer = [0u8; 64 * 1024];
             let mut progress = Instant::now();
             let mut slice = 0u64;
@@ -595,7 +769,7 @@ fn run_stream(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
                 }
             }
             require_open_version(&file, job, &version)?;
-            let accepted = hash.clone().finalize().as_slice() == proof.digest.as_slice();
+            let accepted = hash.finalize().as_slice() == proof.digest.as_slice();
             emit(Event::Prefix {
                 task: job.task.clone(),
                 accepted,
@@ -620,6 +794,7 @@ fn run_stream(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
                      ignored: &mut u64,
                      offset: i64,
                      input: &BufReader<std::io::Take<File>>,
+                     hash: &PortableSha256,
                      emit: &mut dyn FnMut(Event) -> Result<()>|
          -> Result<()> {
             check()?;
@@ -631,6 +806,7 @@ fn run_stream(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
                 audit_bytes: None,
                 ignored: std::mem::take(ignored),
                 version: Some(version.clone()),
+                stream_state: Some(SavedStreamState::capture(hash, &version)?),
             })
         };
         loop {
@@ -655,21 +831,21 @@ fn run_stream(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
                 // A proof-only audit leaves its existing checkpoint and stamp intact.
                 if offset != job.offset || !batch.is_empty() || ignored != 0 || job.proof.is_none()
                 {
-                    flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                    flush(&mut batch, &mut ignored, offset, &input, &hash, &mut emit)?;
                 }
                 require_open_version(input.get_ref().get_ref(), job, &version)?;
                 if offset == job.len {
-                    seal = Some(hash.finalize().to_vec());
+                    seal = Some(hash.finalize());
                     final_version = Some(version);
                 }
                 return Ok(());
             }
             if n > MAX_LINE_BYTES {
-                flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                flush(&mut batch, &mut ignored, offset, &input, &hash, &mut emit)?;
                 return Err(LedgerError::RecordTooLarge);
             }
             if !line.ends_with(b"\n") {
-                flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                flush(&mut batch, &mut ignored, offset, &input, &hash, &mut emit)?;
                 return Ok(());
             }
             let next = offset
@@ -694,7 +870,7 @@ fn run_stream(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
                 o.normalized_hash = claude::normalized_hash(&o)?;
                 let size = claude::normalized_bytes(&o)?.len();
                 if batch.len() >= BATCH_ROWS || projected + size > SLICE_BYTES as usize {
-                    flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                    flush(&mut batch, &mut ignored, offset, &input, &hash, &mut emit)?;
                     projected = 0;
                 }
                 projected += size;
@@ -704,7 +880,7 @@ fn run_stream(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
             match parsed {
                 Ok(n) => ignored += n,
                 Err(error) => {
-                    flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                    flush(&mut batch, &mut ignored, offset, &input, &hash, &mut emit)?;
                     return Err(error);
                 }
             }
@@ -712,7 +888,7 @@ fn run_stream(job: &Job, mut emit: impl FnMut(Event) -> Result<()>) {
             offset = next;
             slice_bytes += n as u64;
             if slice_bytes >= SLICE_BYTES || progress.elapsed().as_millis() >= 100 {
-                flush(&mut batch, &mut ignored, offset, &input, &mut emit)?;
+                flush(&mut batch, &mut ignored, offset, &input, &hash, &mut emit)?;
                 projected = 0;
                 slice_bytes = 0;
                 progress = Instant::now();
@@ -972,6 +1148,7 @@ pub(super) fn stream_reader_regression(
         proof: (prefix_len > 0).then_some(PrefixProof {
             len: prefix_len,
             digest,
+            resume: None,
         }),
         identity: None,
         cancel: Some(cancel.clone()),
@@ -1015,6 +1192,7 @@ pub(super) fn helper_stream_regression(
         proof: Some(PrefixProof {
             len: prefix_len,
             digest,
+            resume: None,
         }),
         identity: None,
         cancel: None,

@@ -65,11 +65,13 @@ for package in packages:
     lines.append(f"| {name} {version} | {package.get('license') or 'See license file'} | [crate]({url}); " + "; ".join(refs) + " |")
 
 vendor = root / "crates/usagebook-cli/src/vendor/licenses"
-for name, version, repo, filename in [
-    ("Chart.js", "4.4.3", "chartjs/Chart.js", "Chart.js-4.4.3-MIT.txt"),
-    ("@kurkle/color", "0.3.2", "kurkle/color", "kurkle-color-0.3.2-MIT.txt"),
-]:
-    source = f"https://github.com/{repo}/blob/v{version}/LICENSE.md"
+javascript = [
+    ("Chart.js", "4.4.3", "chartjs/Chart.js", "v4.4.3", "LICENSE.md", "Chart.js-4.4.3-MIT.txt"),
+    ("@kurkle/color", "0.3.2", "kurkle/color", "v0.3.2", "LICENSE.md", "kurkle-color-0.3.2-MIT.txt"),
+    ("Three.js", "0.183.2", "mrdoob/three.js", "r183", "LICENSE", "Three.js-0.183.2-MIT.txt"),
+]
+for name, version, repo, tag, license_path, filename in javascript:
+    source = f"https://github.com/{repo}/blob/{tag}/{license_path}"
     lines.append(f"| {name} {version} | MIT | [tagged upstream]({source}); {register((vendor / filename).read_text().strip())} |")
 
 lines += ["", "## License texts", ""]
@@ -82,4 +84,4 @@ if args.check:
         raise SystemExit("THIRD_PARTY_LICENSES.md is stale; run python3 scripts/collect_licenses.py")
 else:
     path.write_text(output)
-print(f"{len(packages)} crates + 2 vendored JavaScript components; {len(texts)} distinct license texts")
+print(f"{len(packages)} crates + {len(javascript)} vendored JavaScript components; {len(texts)} distinct license texts")

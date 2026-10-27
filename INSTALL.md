@@ -6,10 +6,12 @@
 
 ### macOS：从已有源码安装
 
-需要 Git、Rust 1.85+（建议当前 stable）和 Xcode Command Line Tools。先检查：
+需要 Git、Rust 1.85+（建议当前 stable）、Node.js 22+ 与 npm，以及 Xcode Command Line Tools。先检查：
 
 ```bash
 cargo --version
+node --version
+npm --version
 xcode-select -p
 ```
 
@@ -22,7 +24,7 @@ sh install.sh
 "$HOME/.local/bin/usagebook" --version
 ```
 
-首次源码构建会下载锁定的依赖。只用已有依赖缓存可运行 `sh install.sh --offline`。期望版本输出为 `usagebook 0.2.0`。编译时间和磁盘占用取决于机器、网络与已有构建缓存，不承诺固定秒数。
+首次源码构建会下载锁定的 Rust 与 npm 依赖，并生成嵌入看板脚本；生成脚本、node_modules 和 target 均不提交。只用已有依赖缓存可运行 `sh install.sh --offline`，两类依赖都须已缓存。期望版本输出为 `usagebook 0.2.0`。编译时间和磁盘占用取决于机器、网络与已有构建缓存，不承诺固定秒数。
 
 已具备上述工具并位于源码目录时，也可一条命令安装并打开看板：
 
@@ -71,6 +73,8 @@ sh install.sh --binary ./target/release/usagebook --prefix /absolute/path/usageb
 开发者也可从仓库根目录使用 Cargo 自身安装：
 
 ```bash
+npm ci --include=dev --include=optional --ignore-scripts --no-audit --no-fund
+npm run build:dashboard3d
 cargo install --path crates/usagebook-cli --locked
 ```
 
@@ -104,9 +108,9 @@ cargo install --path crates/usagebook-cli --locked
 "$HOME/.local/bin/usagebook" serve --port 7879 --open
 ```
 
-看板仅绑定本机地址，图表库随程序分发，断网也可显示。首次扫描时间由日志体积决定；快照可加快后续启动，但不是永久历史账本。已成功入账的 Claude 历史在源日志删除后仍保留；其他未保护来源的统计可能减少。
+看板仅绑定本机地址，图表库随程序分发，断网也可显示。首次扫描时间由日志体积决定；快照可加快后续启动，但不是永久历史账本。serve 默认建立独立长期账本，首次发现工具时补扫历史。已确认用量与已保存证据在源日志删除后仍保留；证据待核对、仍走 live 的来源，其当前统计仍可能变化。准入范围见[历史用量保存](docs/历史用量保存.md)。
 
-运行中的程序只读取本机源文件并写入自己的缓存，不上传用量或会话，也不读取任何上传配置。获取源码、首次下载构建依赖和手动更新需要网络；系统浏览器自身的扩展与联网行为不由本程序控制。
+运行中的程序只读取本机源文件并写入自己的缓存和长期账本，不上传用量或会话，也不读取任何上传配置。获取源码、首次下载构建依赖和手动更新需要网络；系统浏览器自身的扩展与联网行为不由本程序控制。
 
 本产品的缓存默认放在 `~/.usagebook/`。如需独立缓存目录，可用：
 
@@ -116,7 +120,7 @@ USAGEBOOK_DATA_DIR=/absolute/path/usagebook-data "$HOME/.local/bin/usagebook" se
 
 `USAGEBOOK_DATA_DIR` 不会改变数据来源或复制原始日志。
 
-Claude Code 的长期账本是另一份数据，需按 [README 的长期账本步骤](README.md#长期账本首版)初始化；默认位于 macOS 的 `~/Library/Application Support/usagebook/usage-ledger.db` 或 Linux 的 `${XDG_DATA_HOME:-~/.local/share}/usagebook/usage-ledger.db`，也可用 `USAGEBOOK_LEDGER_PATH` 指定完整路径。清理 `~/.usagebook/` 扫描缓存不会清理它；删除账本文件则会丢失已保存的历史，请先用 `usagebook ledger backup` 备份。
+长期账本与缓存分开，serve 默认自动初始化，操作见 [README 的长期账本步骤](README.md#长期账本)；默认位于 macOS 的 `~/Library/Application Support/usagebook/usage-ledger.db` 或 Linux 的 `${XDG_DATA_HOME:-~/.local/share}/usagebook/usage-ledger.db`，也可用 `USAGEBOOK_LEDGER_PATH` 指定完整路径。清理 `~/.usagebook/` 扫描缓存不会清理它；删除账本文件则会丢失已保存的历史，请先用 `usagebook ledger backup` 备份。
 
 ## 4. 终端报表与导出
 
@@ -125,7 +129,7 @@ Claude Code 的长期账本是另一份数据，需按 [README 的长期账本�
 "$HOME/.local/bin/usagebook" --source codex --days 7 --json > usage-last-7-days.json
 ```
 
-Claude Code 已入账的历史来自长期账本，其他来源仍统计可读取日志中的记录；来源、时间、模型覆盖都可能有限。费用金额不展示：各家工具计价差异很大且源数据覆盖不全，展示容易误导。CLI 的 JSON 示例导出 token 报表。报告问题时优先提供版本与 `doctor --check` 诊断计数，先脱敏路径和模型别名，不要提交原始会话或密钥。
+已完成准入的来源从长期账本查询，证据待核对来源保留 live 查询；来源、时间、模型覆盖都可能有限。费用金额不展示：各家工具计价差异很大且源数据覆盖不全，展示容易误导。CLI 的 JSON 示例导出 token 报表。报告问题时优先提供版本与 `doctor --check` 诊断计数，先脱敏路径和模型别名，不要提交原始会话或密钥。
 
 ## 5. 更新与卸载
 
@@ -141,7 +145,7 @@ sh install.sh
 
 发行包用户下载并校验新包、完整解压，在新包目录重新运行 `sh install.sh`。若使用自定义 `--prefix`，更新时传入相同目录。更新不会删除缓存或原始数据。
 
-升级/降级与本地状态库：`~/.usagebook/` 下的旧状态库只是扫描加速缓存；Claude 已入账历史保存在独立的 `usage-ledger.db`，不能通过重扫原始日志保证恢复。其他未保护来源仍依赖原始日志。当前缓存代次使用 `~/.usagebook/state.db.cache-p6-s2-l1/state.db`；解析语义、数据库结构或锁协议不兼容时会使用另一个目录，首次扫描重建。旧 `state.db` 和其他代次目录不会被读取、迁移或清理，因此新旧程序采用相同配置时可以同时运行。请勿将旧程序人为指向新版的实际库文件。
+升级/降级与本地状态库：`~/.usagebook/` 下的旧状态库只是扫描加速缓存；已确认历史和待核对证据保存在独立的 `usage-ledger.db`，不能通过重扫原始日志保证恢复。未正式准入来源的 live 合计仍依赖原始日志。当前缓存代次使用 `~/.usagebook/state.db.cache-p6-s2-l1/state.db`；解析语义、数据库结构或锁协议不兼容时会使用另一个目录，首次扫描重建。旧 `state.db` 和其他缓存代次目录不会被读取、迁移或清理。长期账本另有单写者锁，同一账本只能运行一个采集服务；schema v1/v2 自动事务迁移至 v3，旧程序拒绝新版结构。降级前先保留新版账本和备份，不能用旧库覆盖升级后的新增证据。
 
 `USAGEBOOK_STATE_DB` 现在是逻辑基址：`/x/custom.db` 对应 `/x/custom.db.cache-p6-s2-l1/state.db`，这是自定义路径配置的兼容变化；以 `usagebook doctor` 显示的实际路径为准。数据库连接整个生命周期持有目录外的稳定 `.lock` 文件锁。仅在所有使用者连接关闭、取得独占锁且确认损坏后，才会整体移动目录为 `<版本目录>.bad-<时间戳>-<序号>` 并重建。其他进程仍在使用，或出现锁冲突、权限、磁盘满等错误时，本进程改为全量扫描，不把这些错误当作损坏。当前代次的损坏备份最多保留三份。需要手动清理缓存或锁文件时，先停止所有使用该代次的 usagebook 进程。
 
@@ -165,7 +169,7 @@ Windows 当前不可用：自动测试尚未通过（源码可编译，测试失
 .\target\release\usagebook.exe serve --open
 ```
 
-源码构建需要 Rust MSVC 工具链和 Visual Studio Build Tools（C++ 工具），运行 `cargo build --release --locked`。按 Ctrl-C 停止看板；卸载时删除构建目录。来源默认路径和解析结果以实机检查为准，兼容代码存在不等于已完成验收。
+源码构建需要 Rust MSVC 工具链、Node.js 22+ 与 npm，以及 Visual Studio Build Tools（C++ 工具）；先运行 `npm ci --include=dev --include=optional --ignore-scripts --no-audit --no-fund` 和 `npm run build:dashboard3d`，再运行 `cargo build --release --locked`。按 Ctrl-C 停止看板；卸载时删除构建目录。来源默认路径和解析结果以实机检查为准，兼容代码存在不等于已完成验收。
 
 ## 7. 常见问题
 

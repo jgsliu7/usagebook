@@ -1,4 +1,5 @@
-//! Schema v2 gate: fresh ledgers are v2, and a v1 database upgrades in place
+//! Original schema v2 migration gate, followed through the current v7 schema:
+//! a v1 database upgrades in place
 //! on the first write open with every fact, derived row, and suppression rule
 //! preserved. The frozen v1 DDL lives beside this file; the rebuilt tables
 //! must end up byte-identical (modulo whitespace) to a fresh init.
@@ -91,7 +92,7 @@ fn v1_migrates_in_place_and_preserves_data() {
     let schema: i64 = c
         .query_row("SELECT schema_version FROM ledger_meta", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(schema, 2);
+    assert_eq!(schema, 7);
 
     let object_cols = columns(c, "source_objects");
     for dead in ["audit_generation", "audit_offset", "audit_digest"] {
@@ -138,8 +139,8 @@ fn v1_migrates_in_place_and_preserves_data() {
         .query_row("SELECT commit_seq FROM ledger_meta", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        seq, 1,
-        "migration must bump commit_seq so stale cursors die"
+        seq, 6,
+        "each migration from v1 through v7 must bump commit_seq so stale cursors die"
     );
 
     {
@@ -156,7 +157,7 @@ fn v1_migrates_in_place_and_preserves_data() {
     .unwrap();
     assert_eq!(c.last_insert_rowid(), 3);
 
-    // The rebuilt tables must match a fresh v2 init definition for definition.
+    // The rebuilt tables must match a fresh current init definition for definition.
     let fresh_path = temp_db("fresh");
     let fresh = Ledger::init(&fresh_path, "UTC").unwrap();
     assert_eq!(normalized_ddl(c), normalized_ddl(fresh.connection()));
@@ -167,7 +168,7 @@ fn v1_migrates_in_place_and_preserves_data() {
 }
 
 #[test]
-fn fresh_init_is_v2_and_reopens() {
+fn fresh_init_has_current_schema_and_reopens() {
     let path = temp_db("init");
     {
         let db = Ledger::init(&path, "UTC").unwrap();
@@ -179,7 +180,7 @@ fn fresh_init_is_v2_and_reopens() {
             !columns(db.connection(), "usage_rollups").contains(&"hour_cache_revision".to_string())
         );
     }
-    // Reopen both ways to prove validate accepts v2 without migration.
+    // Reopen both ways to prove validate accepts the current schema.
     Ledger::open(&path, true).unwrap();
     Ledger::open(&path, false).unwrap();
     let _ = std::fs::remove_file(&path);

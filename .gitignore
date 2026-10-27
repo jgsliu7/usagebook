@@ -2,6 +2,10 @@
 /target
 code/target
 
+# 前端构建依赖与生成的嵌入资源（源码构建前生成，不提交产物）
+node_modules/
+/crates/usagebook-cli/src/dashboard_3d.bundle.js
+
 # macOS
 .DS_Store
 

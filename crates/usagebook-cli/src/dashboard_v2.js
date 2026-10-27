@@ -2,6 +2,10 @@
 /* 原看板的数据适配：服务端完成统计；浏览器保存轻量实体目录、当前视图和用户已展开的汇总页。 */
 let v2Status = null, v2View = null, v2Controller = null, coldRetryTimer = null;
 let statusReachable = null, statusRequestSeq = 0;
+let statusFailureSince=null, statusNoticeTimer=null;
+let wakeConfirmTimer=null,wakeGeneration=0;
+let selectionIssue=null, selectionIssueDetail='', selectionIssueDimension='model', modelMigrationPending=false, validationFailureKind=null;
+const selectionIssues=new Map(), tableLimitBlocks=new Map();
 let viewGeneration = 0, restoringSelection = true, manualRefresh = null, pendingQueryKey = null;
 let globalTotalsCache = null;
 const RETRY_WAIT_MS=180000, RETRY_DELAY_MS=5000, NOTICE_DELAY_MS=60000;
@@ -11,6 +15,9 @@ const labels = {source:new Map(),model:new Map()};
 const modelColorIndices = new Map();
 const previousCatalogIds = {source:null,model:null};
 const catalogSequences={source:0,model:0};
+const catalogJobs={source:null,model:null};
+const catalogRevisions={source:0,model:0},catalogSynced={source:0,model:0};
+let catalogFailureSince=null;
 const filterPanels = {source:null,model:null};
 const METRIC_IDS = {total:'total',input:'input_uncached',cr:'cache_read',cw:'cache_write',output:'output_combined',reason:'reasoning_output'};
 const unknownMetric = () => ({state:'unknown',known_value:null});
@@ -19,13 +26,67 @@ const selected = (sel,id) => !sel || (sel.exclude ? !sel.has(id) : sel.has(id));
 const selector = (sel,dim) => {
   if(!sel)return {mode:'all'};
   const ids=[...sel];
-  // The UI keeps the original checked set; large selections use its equivalent complement on the wire.
-  if(dim&&ids.length>10000)return {mode:sel.exclude?'include':'exclude',ids:catalogItems(dim).map(x=>x.id).filter(id=>!sel.has(id))};
-  return {mode:sel.exclude?'exclude':'include',ids};
+  return {mode:sel.exclude?(dim==='model'?'exclude_exact':'exclude'):'include',ids};
 };
 const catalogItems = dim => catalogs[dim].items;
 const stampKey = stamp => JSON.stringify(stamp);
+const catalogComplete = dim => !!catalogs[dim].stamp&&!!v2Status?.stamp&&stampKey(catalogs[dim].stamp)===stampKey(v2Status.stamp);
 const setScanningText = txt => { $('#scanning-txt').textContent = txt; };
+function showSelectionIssue(kind,dimension='model') {
+  selectionIssues.set(kind+':'+dimension,{kind,dimension});
+  renderSelectionIssue();
+}
+function selectionIssueDescription({kind,dimension}) {
+  return kind==='protocol'?words('当前服务不支持此模型筛选，请更新服务或清除筛选。','This service does not support this model filter; update it or clear the filter.'):
+    kind==='storage'?words('筛选偏好未保存。','Filter preference was not saved.'):
+    kind==='catalog'?(dimension==='source'?words('来源目录暂时无法读取，保留当前筛选。','The source directory cannot be read; the current filter is retained.'):words('模型目录暂时无法读取，保留当前筛选。','The model directory cannot be read; the current filter is retained.')):
+    ['query','table','panel'].includes(kind)?words('当前查询受到限制，请稍后重试。','The current query is limited; please try again later.'):
+    words('筛选超出限制，请清除筛选后重新选择。','Filter exceeds the limit; clear the filter and select again.');
+}
+function renderSelectionIssue() {
+  const issues=[...selectionIssues.values()];
+  const issue=issues.find(x=>x.kind==='storage')||issues.find(x=>x.kind==='catalog')||issues.find(x=>x.kind==='protocol'||x.kind==='limit')||issues[issues.length-1];
+  if(!issue){selectionIssue=null;selectionIssueDetail='';$('#clear-model-filter').hidden=true;if(DATA?.ready)renderStatus();return;}
+  const {kind}=issue,action=issues.find(x=>x.kind==='protocol'||x.kind==='limit');
+  selectionIssue=kind;selectionIssueDetail=selectionIssueDescription(issue);
+  selectionIssueDimension=(action||issue).dimension;
+  const button=$('#clear-model-filter');button.hidden=!action;
+  button.textContent=selectionIssueDimension==='source'?words('清除来源筛选','Clear source filter'):words('清除模型筛选','Clear model filter');
+  button.title=selectionIssueDescription(action||issue);
+  const text=words(kind==='catalog'?'目录受限':['query','table','panel'].includes(kind)?'查询受限':'筛选受限',kind==='catalog'?'Directory limited':['query','table','panel'].includes(kind)?'Query limited':'Filter limited');
+  if(DATA?.ready)renderStatus();else{$('#status').textContent=text;$('#status').title=selectionIssueDetail;setScanningText(text);}
+}
+function clearSelectionIssue(kind,dimension){
+  for(const [key,issue] of selectionIssues)if((!kind||issue.kind===kind)&&(!dimension||issue.dimension===dimension))selectionIssues.delete(key);
+  renderSelectionIssue();
+}
+function validateSelection(dim,sel) {
+  validationFailureKind=null;
+  if(!v2Status)return true;
+  const caps=v2Status.capabilities||{},model=dim==='model';
+  if(model&&sel?.exclude&&caps.model_selector_exact!==true){showSelectionIssue('protocol',dim);return false;}
+  const maxIds=model?(caps.model_selector_exact===true?Math.min(20000,Number(caps.model_selector_max_ids)||10000):10000):128;
+  const maxIdBytes=model?1400:256;
+  if(sel){
+    let idBytes=0;
+    for(const id of sel){const size=new TextEncoder().encode(id).length;if(size>maxIdBytes){showSelectionIssue('limit',dim);return false;}idBytes+=size;}
+    const threshold=Number(caps.model_selector_large_threshold)||10000;
+    const largeMax=Number(caps.model_selector_large_max_ids_bytes)||2097152;
+    if(sel.size>maxIds||(model&&sel.size>threshold&&idBytes>largeMax)){showSelectionIssue('limit',dim);return false;}
+  }
+  const overrides=dim==='model'?{model:sel}:{source:sel};
+  const body=JSON.stringify(dashboardRequest(buildQuery(null,overrides)));
+  const maxBody=Math.min(16*1024*1024,Number(caps.max_body_bytes)||16*1024*1024);
+  if(new TextEncoder().encode(body).length>maxBody){
+    // The rest of the request may already exceed the limit. Only attribute it
+    // to this selector if removing this dimension makes that request fit.
+    const without=JSON.stringify(dashboardRequest(buildQuery(null,dim==='model'?{model:null}:{source:null})));
+    if(sel&&new TextEncoder().encode(without).length<=maxBody)showSelectionIssue('limit',dim);
+    else {validationFailureKind='query';showSelectionIssue('query');}
+    return false;
+  }
+  return true;
+}
 
 // Only chart geometry becomes Number. Text, tooltips, totals and ratios use decimal strings/BigInt.
 function formatInteger(value, compact = true) {
@@ -83,7 +144,7 @@ function showLoadFailure(error) {
   setScanningText(t('status.connFailScan'));$('#ledger-note').hidden=true;
 }
 function observeScanStatus(status) {
-  const issue=status.refresh_error||(status.sources||[]).some(s=>s.error&&s.error!=='LOADING');
+  const issue=status.refresh_error||status.storage?.error||(status.sources||[]).some(s=>s.error&&s.error!=='LOADING');
   if(issue)scanIssueSince??=Date.now();else scanIssueSince=null;
   return !!issue;
 }
@@ -95,21 +156,30 @@ function retryInBackground() {
   const delay=Date.now()<recoveryUntil?RETRY_DELAY_MS:30000;
   coldRetryTimer=setTimeout(()=>{coldRetryTimer=null;if(!document.hidden&&seq===loadSeq)load(true);},delay);
 }
+function cancelWakeConfirmation() {
+  wakeGeneration++;clearTimeout(wakeConfirmTimer);wakeConfirmTimer=null;
+}
 function resumeDashboard() {
-  recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=v2Status?.refresh_generation??null;
-  loadFailureSince=null;scanIssueSince=null;loadFailed=false;
+  cancelWakeConfirmation();
+  // Keep an existing recovery's generation: another wake must not make a
+  // scan that just completed look like a new baseline.
+  if(!recoveryUntil){recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=v2Status?.refresh_generation??null;}
   if(DATA?.ready){$('#ledger-note').hidden=true;renderStatus();}
   return load(true);
 }
+
 async function apiV2(path,body,signal) {
   const controller=new AbortController();
   const abort=()=>controller.abort();
   if(signal?.aborted)controller.abort();else signal?.addEventListener('abort',abort,{once:true});
   let timeout;
   try {
+    const encoded=body?JSON.stringify(body):undefined;
+    const maxBody=Math.min(16*1024*1024,Number(v2Status?.capabilities?.max_body_bytes)||16*1024*1024);
+    if(encoded&&new TextEncoder().encode(encoded).length>maxBody){const error=new Error('Request exceeds limit');error.code='QUERY_LIMIT';throw error;}
     return await Promise.race([
       (async()=>{
-        const response=await fetch('/api/v2/'+path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined,cache:'no-store',signal:controller.signal});
+        const response=await fetch('/api/v2/'+path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:encoded,cache:'no-store',signal:controller.signal});
         let value;try{value=await response.json();}catch(e){if(e.name==='AbortError')throw e;throw new Error(`HTTP ${response.status}`);}
         if(!response.ok){const detail=typeof value.error==='object'?value.error:{code:value.error,message:value.message};const e=new Error(detail?.message||`HTTP ${response.status}`);e.code=detail?.code;throw e;}
         return value;
@@ -213,9 +283,9 @@ function hiddenBarSeries(id,namespace,ids) {
 function currentQueryKey() {
   return JSON.stringify([state.win,state.rs,state.re,localDayStr(),_selKey(state.srcSel),_selKey(state.mdlSel),state.metric,state.group,v2Status?.stamp?.report_timezone]);
 }
-function buildQuery(windowOverride) {
+function buildQuery(windowOverride,overrides={}) {
   const bounds=rangeBounds();
-  return {window:windowOverride||(bounds?{kind:'calendar',start_date:bounds[0],end_date_exclusive:addDay(bounds[1],1)}:{kind:'all'}),report_timezone:v2Status.stamp.report_timezone,as_of_ms:null,sources:selector(state.srcSel,'source'),models:selector(state.mdlSel,'model'),metric:METRIC_IDS[state.metric],group_by:state.group};
+  return {window:windowOverride||(bounds?{kind:'calendar',start_date:bounds[0],end_date_exclusive:addDay(bounds[1],1)}:{kind:'all'}),report_timezone:v2Status.stamp.report_timezone,as_of_ms:null,sources:selector(Object.hasOwn(overrides,'source')?overrides.source:state.srcSel,'source'),models:selector(Object.hasOwn(overrides,'model')?overrides.model:state.mdlSel,'model'),metric:METRIC_IDS[state.metric],group_by:state.group};
 }
 function comparisonSpec() {
   if(state.win==='all')return null;
@@ -236,7 +306,7 @@ function registerLabels(dim,items) {
   for(const item of items){labels[dim].set(item.id,item.label);if(dim==='source')SRC_LABELS[item.id]=item.label;
     else if(item.color_index!=null)modelColorIndices.set(item.id,Number(item.color_index));}
 }
-async function readFullCatalog(dim,signal) {
+async function readFullCatalog(dim,signal,expectedStamp=null) {
   const sequence=++catalogSequences[dim];
   // Selection recovery must only see complete directories, even after a failed page.
   for(let attempt=0;attempt<2;attempt++){
@@ -245,11 +315,13 @@ async function readFullCatalog(dim,signal) {
       do{
         const page=await apiV2('catalog',{dimension:dim,search:'',page:{limit:200,cursor}},signal);
         if(signal?.aborted||sequence!==catalogSequences[dim])return false;
+        if(expectedStamp&&stampKey(page.stamp)!==stampKey(expectedStamp)){const e=new Error('Catalog snapshot changed');e.code='CURSOR_STALE';throw e;}
         if(first)verifyStamp(first,page);else first=page;
         items.push(...page.items);cursor=page.next_cursor;
       }while(cursor);
       registerLabels(dim,items);
       catalogs[dim]={items,next:null,total:first.total_count,stamp:first.stamp};
+      catalogRevisions[dim]++;
       return true;
     }catch(e){
       if(signal?.aborted||sequence!==catalogSequences[dim])return false;
@@ -258,8 +330,18 @@ async function readFullCatalog(dim,signal) {
     }
   }
 }
-function syncSelections() {
-  for(const dim of ['source','model']){
+function catalogTask(dim,stamp) {
+  const key=stampKey(stamp),old=catalogJobs[dim];
+  // Source membership also depends on the time cutoff chosen on its first
+  // page. Start a fresh source task per read; model membership is stamp keyed.
+  if(dim==='model'&&old&&old.key===key&&!old.controller.signal.aborted)return old.promise;
+  old?.controller.abort();
+  const controller=new AbortController(),job={key,controller,promise:null};
+  job.promise=readFullCatalog(dim,controller.signal,stamp).finally(()=>{if(catalogJobs[dim]===job)catalogJobs[dim]=null;});
+  catalogJobs[dim]=job;return job.promise;
+}
+function syncSelections(dimensions=['source','model']) {
+  for(const dim of dimensions){
     const key=dim==='source'?'srcSel':'mdlSel',ids=catalogItems(dim).map(x=>x.id),previous=previousCatalogIds[dim];
     let sel=state[key],solo=state[dim==='source'?'srcSolo':'mdlSolo'];
     // Stable model IDs contain case-sensitive base64url; only source IDs have legacy case aliases.
@@ -269,22 +351,24 @@ function syncSelections() {
       // Source catalogs depend on the cutoff and successful source scans, so even
       // a complete first directory cannot prove that a saved target is invalid.
       // Models are invalidated only by the global server check after the query.
-      solo=match??solo;setSelection(dim,new Set([solo]),solo);
+      solo=match??solo;if(!setSelection(dim,new Set([solo]),solo))return false;
       previousCatalogIds[dim]=new Set(ids);
       continue;
     }
-    if(sel&&ids.length){
-      if(sel.exclude)sel=new Set(ids.filter(id=>!sel.has(id)));
+    if(sel&&ids.length&&!sel.exclude){
       if(sel.size){
         const known=new Map(ids.map(id=>[matchKey(id),id]));
-        const alive=new Set([...sel].map(id=>known.get(matchKey(id))).filter(Boolean));
+        // A directory can omit a selected source at its cutoff, or a model
+        // selected from a newer table while the directory is still catching up.
+        const alive=new Set([...sel].map(id=>known.get(matchKey(id))??id));
         if(previous)for(const id of ids)if(!previous.has(id))alive.add(id);
-        sel=alive.size===0?(previous||dim==='model'?sel:null):alive.size===ids.length?null:alive;
+        sel=alive.size===ids.length&&ids.every(id=>alive.has(id))?null:alive;
       }
-      setSelection(dim,sel);
+      if(!setSelection(dim,sel))return false;
     }
     previousCatalogIds[dim]=new Set(ids);
   }
+  return true;
 }
 function migrateModels() {
   if(!state.mdlSel)return;
@@ -296,19 +380,23 @@ function migrateModels() {
     const id=name?'m1:n:'+encoded:'m1:u';labels.model.set(id,name);return id;
   };
   for(const name of state.mdlSel)next.add(migrate(name));
-  setSelection('model',next,state.mdlSolo===null?null:migrate(state.mdlSolo));
+  state.mdlSel=next;state.mdlSolo=state.mdlSolo===null?null:migrate(state.mdlSolo);modelMigrationPending=true;
+}
+function dashboardRequest(query){
+  const trend=state.win.includes('week')?{unit:'week',periods:10,anchor_date:localDayStr()}:state.win.includes('month')?{unit:'month',periods:12,anchor_date:localDayStr()}:null;
+  return {kind:'dashboard',query,series_unit:'day',max_points:10000,table_limit:100,comparison:comparisonSpec(),trend};
 }
 async function fetchDashboard(signal) {
-  const query=buildQuery(),key=currentQueryKey(), trend=state.win.includes('week')?{unit:'week',periods:10,anchor_date:localDayStr()}:state.win.includes('month')?{unit:'month',periods:12,anchor_date:localDayStr()}:null;
-  const response=await apiV2('query',{kind:'dashboard',query,series_unit:'day',max_points:10000,table_limit:100,comparison:comparisonSpec(),trend},signal);
+  const query=buildQuery(),key=currentQueryKey();
+  const response=await apiV2('query',dashboardRequest(query),signal);
   const payload=response.payload.data, fixed={...query,as_of_ms:response.as_of_ms}, extra=[];
-  let day=payload.latest_day,sourceTable=payload.source_table,modelTable=payload.model_table;
+  let day=payload.selected_day??payload.latest_day,sourceTable=payload.source_table,modelTable=payload.model_table;
   // Future-dated facts and daily evidence can become eligible as time advances
   // without changing the data stamp. Totals must share this query's cutoff.
   const globalKey=stampKey(response.stamp)+'|'+response.as_of_ms;
   const isGlobal=query.window.kind==='all'&&query.sources.mode==='all'&&query.models.mode==='all';
-  let globalMetrics=isGlobal?payload.totals.metrics:globalTotalsCache?.key===globalKey?globalTotalsCache.metrics:null;
-  if(isGlobal&&!signal?.aborted)globalTotalsCache={key:globalKey,metrics:globalMetrics};
+  let globalMetrics=payload.global_metrics??(isGlobal?payload.totals.metrics:globalTotalsCache?.key===globalKey?globalTotalsCache.metrics:null);
+  if((payload.global_metrics||isGlobal)&&!signal?.aborted)globalTotalsCache={key:globalKey,metrics:globalMetrics};
   if(!globalMetrics)extra.push(apiV2('query',{kind:'totals',query:{...fixed,window:{kind:'all'},sources:{mode:'all'},models:{mode:'all'},group_by:'none',metric:'total'}},signal).then(r=>{
     verifyStamp(response,r);globalMetrics=r.payload.data.metrics;
     if(!signal?.aborted)globalTotalsCache={key:globalKey,metrics:globalMetrics};
@@ -317,7 +405,7 @@ async function fetchDashboard(signal) {
     const date=winDay();extra.push(apiV2('query',{kind:'day',query:{...fixed,window:{kind:'calendar',start_date:date,end_date_exclusive:addDay(date,1)}},date},signal).then(r=>{verifyStamp(response,r);day=r.payload.data;}));
   }
   // Detail rows always rank by total tokens, independent of the selected chart metric.
-  if(query.metric!=='total')for(const dimension of ['source','model'])extra.push(apiV2('query',{kind:'table',query:{...fixed,metric:'total'},dimension,scope:'facet',page:{limit:100,cursor:null}},signal).then(r=>{verifyStamp(response,r);if(dimension==='source')sourceTable=r.payload.data;else modelTable=r.payload.data;}));
+  if(query.metric!=='total'&&payload.detail_tables_metric!=='total')for(const dimension of ['source','model'])extra.push(apiV2('query',{kind:'table',query:{...fixed,metric:'total'},dimension,scope:'facet',page:{limit:100,cursor:null}},signal).then(r=>{verifyStamp(response,r);if(dimension==='source')sourceTable=r.payload.data;else modelTable=r.payload.data;}));
   await Promise.all(extra);
   // A background refresh keeps rows the user already reached by scrolling.
   if(v2View?.key===key)for(const dim of ['source','model']){
@@ -332,18 +420,22 @@ async function fetchDashboard(signal) {
 function verifyStamp(expected,actual) {
   if(stampKey(expected.stamp)!==stampKey(actual.stamp)){const e=new Error(words('数据已更新，正在重新读取','Data changed; reloading'));e.code='CURSOR_STALE';throw e;}
 }
-async function load(passive) {
+async function load(passive,signal) {
+  clearTimeout(wakeConfirmTimer);wakeConfirmTimer=null;
   const seq=++loadSeq,intentRevision=chartIntentRevision;pendingQueryKey=currentQueryKey();v2Controller?.abort();const controller=v2Controller=new AbortController();
+  const abort=()=>controller.abort();
+  if(signal?.aborted)controller.abort();else signal?.addEventListener('abort',abort,{once:true});
   clearTimeout(coldRetryTimer);coldRetryTimer=null;
   try {
+    if(DATA?.ready)renderStatus();
     let status=await readStatusV2('status?arf='+(passive===true?'':state.arf),controller.signal,()=>seq===loadSeq);
-    if(seq!==loadSeq)return {ok:false,superseded:true};
+    if(seq!==loadSeq||controller.signal.aborted)return {ok:false,superseded:true};
     let scanIssue=observeScanStatus(status);
     registerLabels('source',(status.sources||[]).map(s=>({id:s.id,label:s.label||s.id})));
     if(!status.ready){
       loadFailureSince=null;loadFailed=false;
       if(!DATA){
-        $('#app').hidden=true;$('#scanning').hidden=false;setScanningText(status.refresh_error?t('status.scanFailRetry'):t('scan.first'));
+        $('#app').hidden=true;$('#scanning').hidden=false;setScanningText(status.refresh_error?t('status.scanFailRetry'):t('data.loading'));
         coldRetryTimer=setTimeout(()=>{if(!document.hidden)load(true);},status.refresh_error?5000:3000);
       }else{
         renderStatus();if(!recoveryUntil){recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=status.refresh_generation;}
@@ -351,13 +443,13 @@ async function load(passive) {
       }
       return {ok:false,pending:true};
     }
+    if(!validateSelection('model',state.mdlSel)||!validateSelection('source',state.srcSel))return validationFailureKind==='query'?{ok:false,queryLimited:true}:{ok:false,selectionLimited:true};
     // Source membership is as-of dependent; model names are snapshot metadata.
+    if(catalogJobs.model&&catalogJobs.model.key!==stampKey(status.stamp))catalogJobs.model.controller.abort();
     const changedCatalogs=['source','model'].filter(dim=>dim==='source'||!catalogs[dim].stamp||stampKey(catalogs[dim].stamp)!==stampKey(status.stamp));
-    if(changedCatalogs.length){
-      const completed=await Promise.all(changedCatalogs.map(dim=>readFullCatalog(dim,controller.signal)));
-      if(seq!==loadSeq||controller.signal.aborted||completed.some(done=>!done))return {ok:false,superseded:true};
-      syncSelections();
-    }
+    // Directory pagination is independent metadata. A busy catalog must not
+    // prevent a complete, consistent dashboard response from being displayed.
+    const catalogWork=changedCatalogs.map(dim=>({dim,promise:catalogTask(dim,status.stamp).then(ok=>({ok}),error=>({error}))}));
     pendingQueryKey=currentQueryKey();
     let next;
     for(let attempt=0;attempt<2;attempt++){
@@ -365,6 +457,7 @@ async function load(passive) {
       catch(e){if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){status=await readStatusV2('status?arf=',controller.signal,()=>seq===loadSeq);scanIssue=observeScanStatus(status);continue;}throw e;}
     }
     if(seq!==loadSeq||controller.signal.aborted||intentRevision!==chartIntentRevision||next.key!==currentQueryKey())return {ok:false,superseded:true};
+    let selectionConfirmationDeferred=false;
     if(restoringSelection){
       // UNKNOWN_SOURCE uses the static source registry; directory absence alone is insufficient.
       const clearSource=state.srcSolo!==null&&next.response.warnings.includes('UNKNOWN_SOURCE:'+state.srcSolo);
@@ -372,23 +465,38 @@ async function load(passive) {
       if(state.mdlSel&&!state.mdlSel.exclude&&state.mdlSel.size&&next.response.warnings.includes('ALL_SELECTED_MODELS_UNKNOWN')){
         // A failed source can hide its models, even when that source is not selected.
         // Check all sources at this snapshot/cutoff without reusing cached coverage.
-        const confirmation=await apiV2('query',{kind:'totals',query:{...next.query,window:{kind:'all'},sources:{mode:'all'},metric:'total',group_by:'none'}},controller.signal);
+        let confirmation;
+        try{
+          confirmation=await apiV2('query',{kind:'totals',query:{...next.query,window:{kind:'all'},sources:{mode:'all'},metric:'total',group_by:'none'}},controller.signal);
+          verifyStamp(next.response,confirmation);
+        }catch(e){
+          if(e.code!=='CURSOR_STALE')throw e;
+          // This check may clear restored preferences; it supplies no displayed
+          // values. Keep the selection and render the consistent dashboard.
+          confirmation=null;selectionConfirmationDeferred=true;
+        }
         if(seq!==loadSeq||controller.signal.aborted||intentRevision!==chartIntentRevision||next.key!==currentQueryKey())return {ok:false,superseded:true};
-        verifyStamp(next.response,confirmation);
-        clearModel=confirmation.source_coverage==='complete'&&confirmation.warnings.includes('ALL_SELECTED_MODELS_UNKNOWN');
+        clearModel=confirmation?.source_coverage==='complete'&&confirmation.warnings.includes('ALL_SELECTED_MODELS_UNKNOWN');
       }
       if(clearSource||clearModel){
-        restoringSelection=false;
+        restoringSelection=selectionConfirmationDeferred;
         if(clearSource)setSelection('source',null);
         if(clearModel)setSelection('model',null);
-        return load(true);
+        return load(true,signal);
       }
     }
-    restoringSelection=false;v2View=next;loadFailed=false;loadFailureSince=null;
+    restoringSelection=selectionConfirmationDeferred;v2View=next;loadFailed=false;loadFailureSince=null;
+    if(modelMigrationPending){modelMigrationPending=false;if(!persist(MDL_LS_KEY,state.mdlSel,state.mdlSolo))showSelectionIssue('storage','model');else clearSelectionIssue('storage','model');}
+    clearSelectionIssue('protocol');clearSelectionIssue('limit');clearSelectionIssue('query');
+    for(const [dim,block] of tableLimitBlocks){
+      if(block.key!==next.key||block.stamp!==stampKey(next.response.stamp)||!next.tables[dim].next_cursor){
+        tableLimitBlocks.delete(dim);clearSelectionIssue('table',dim);
+      }
+    }
     registerLabels('source',next.tables.source.rows);registerLabels('model',next.tables.model.rows);
-    if(state.metric==='cw'&&!cwVisible()){state.metric='total';segSync('#seg-metric',v=>v==='total');return load(true);}
+    if(state.metric==='cw'&&!cwVisible()){state.metric='total';segSync('#seg-metric',v=>v==='total');return load(true,signal);}
     DATA={ready:true,generated_at_ms:Number(status.generated_at_ms||next.response.as_of_ms),view_generation:++viewGeneration,last_scan_failed:!!status.refresh_error,version:status.version,sources:status.sources||[]};
-    if(!status.refresh_error&&BigInt(status.refresh_generation||'0')!==BigInt(rescanTimedOutGen||'0'))rescanTimedOut=false;
+    refreshTimedOut=false;
     $('#scanning').hidden=true;$('#app').hidden=false;
     prepareDays();next.key=currentQueryKey();renderPayload();
     if(!recoveryUntil&&(status.refreshing||scanIssue)){recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=status.refresh_generation;}
@@ -396,14 +504,40 @@ async function load(passive) {
       if(!status.refreshing&&!scanIssue&&(recoveryBase===null||status.refresh_generation!==recoveryBase)){recoveryUntil=0;recoveryBase=null;clearTimeout(coldRetryTimer);coldRetryTimer=null;}
       else retryInBackground();
     }
+    const syncCatalog=dim=>{
+      if(seq!==loadSeq||controller.signal.aborted||intentRevision!==chartIntentRevision||
+        catalogSynced[dim]===catalogRevisions[dim]||stampKey(catalogs[dim].stamp)!==stampKey(status.stamp))return;
+      const before=currentQueryKey();if(!syncSelections([dim]))return;catalogSynced[dim]=catalogRevisions[dim];
+      if(currentQueryKey()!==before){load(true);return;}
+      renderSelectorButtons();
+      if(filterPanels[dim]&&JSON.stringify(filterPanels[dim].items)!==JSON.stringify(catalogItems(dim)))buildFilterPanel(dim);
+    };
+    // A complete model directory can be displayed while an unrelated source
+    // directory is still loading, without changing the saved selection yet.
+    for(const {dim,promise} of catalogWork)void promise.then(({ok})=>{
+      if(!ok||seq!==loadSeq||controller.signal.aborted||intentRevision!==chartIntentRevision||stampKey(catalogs[dim].stamp)!==stampKey(v2Status?.stamp))return;
+      clearSelectionIssue('catalog',dim);
+      if(dim!=='model')return;
+      renderSelectorButtons();
+      if(filterPanels.model&&JSON.stringify(filterPanels.model.items)!==JSON.stringify(catalogItems('model')))buildFilterPanel('model');
+    });
+    void Promise.all(catalogWork.map(work=>work.promise)).then(results=>{
+      if(seq!==loadSeq||controller.signal.aborted||intentRevision!==chartIntentRevision)return;
+      for(const dim of ['source','model'])syncCatalog(dim);
+      for(let i=0;i<results.length;i++)if(['QUERY_LIMIT','BODY_TOO_LARGE'].includes(results[i].error?.code))showSelectionIssue('catalog',catalogWork[i].dim);
+      const failed=results.find(result=>result.error&&result.error.name!=='AbortError'&&!['QUERY_LIMIT','BODY_TOO_LARGE'].includes(result.error.code));
+      if(failed){catalogFailureSince??=Date.now();loadFailureSince=catalogFailureSince;showLoadFailure(failed.error);retryInBackground();}
+      else catalogFailureSince=null;
+    });
     return {ok:true,status};
   } catch(e){
-    if(seq!==loadSeq||e.name==='AbortError')return {ok:false,superseded:true};
+    if(seq!==loadSeq||controller.signal.aborted||e.name==='AbortError')return {ok:false,superseded:true};
     if(e.code==='INVALID_CUSTOM_RANGE')return {ok:false,invalidRange:true};
+    if(['QUERY_LIMIT','BODY_TOO_LARGE'].includes(e.code)){showSelectionIssue('query');return {ok:false,queryLimited:true};}
     showLoadFailure(e);if(!DATA)coldRetryTimer=setTimeout(()=>{if(!document.hidden)load(true);},5000);
     return {ok:false};
   }
-  finally {if(seq===loadSeq)pendingQueryKey=null;}
+  finally {signal?.removeEventListener('abort',abort);if(seq===loadSeq){pendingQueryKey=null;if(DATA?.ready)renderStatus();}}
 }
 function render() {
   setWinSegUi();renderSelectorButtons();
@@ -430,7 +564,9 @@ function cwVisible() {
 function renderPayload() {
   renderedDay=localDayStr();prepareDays();setWinSegUi();renderSelectorButtons();
   $('#seg-metric [data-v="cw"]').hidden=!cwVisible()&&state.metric!=='cw';
-  renderCards();renderStatus();renderCharts();renderModelTable();renderSourceTable();
+  renderCards();renderStatus();
+  try{renderCharts();}catch(error){console.error('Chart rendering failed',error);}
+  renderModelTable();renderSourceTable();
   if(!loadFailed){$('#ledger-note').textContent='';$('#ledger-note').hidden=true;}
   for(const dimension of ['source','model']){
     const panel=filterPanels[dimension];if(panel&&!panel.element.hidden){
@@ -471,10 +607,25 @@ async function readStatusV2(path,signal,isCurrent) {
   try {
     const result=await apiV2(path,undefined,signal);
     if(!result||typeof result!=='object'||!Array.isArray(result.sources))throw new Error('Invalid status response');
-    if(current()){v2Status=result;statusReachable=true;}
+    if(current()){
+      v2Status=result;statusReachable=true;statusFailureSince=null;
+      clearTimeout(statusNoticeTimer);statusNoticeTimer=null;
+      if(DATA?.ready)renderStatus();
+    }
     return result;
   } catch(error) {
-    if(current()){statusReachable=false;}
+    if(current()&&error?.name!=='AbortError'){
+      // An explicit server limit is a valid response, not a lost connection.
+      if(['QUERY_LIMIT','BODY_TOO_LARGE'].includes(error.code)){
+        statusReachable=true;statusFailureSince=null;clearTimeout(statusNoticeTimer);statusNoticeTimer=null;
+        if(DATA?.ready)renderStatus();
+        throw error;
+      }
+      statusReachable=false;statusFailureSince??=Date.now();
+      clearTimeout(statusNoticeTimer);
+      if(!signal)statusNoticeTimer=setTimeout(()=>{statusNoticeTimer=null;if(statusReachable===false)renderStatus();},Math.max(0,NOTICE_DELAY_MS-(Date.now()-statusFailureSince)));
+      if(DATA?.ready)renderStatus();
+    }
     throw error;
   }
 }
@@ -482,16 +633,21 @@ function renderStatus() {
   if(!DATA?.ready)return;
   const asOf=t('status.dataAsOf',localDate(DATA.generated_at_ms)),stale=localDayStr(new Date(DATA.generated_at_ms))!==localDayStr();
   const details=[asOf];
+  if(selectionIssue)details.push(selectionIssueDetail);
   const scanNotice=scanIssueSince!==null&&Date.now()-scanIssueSince>=NOTICE_DELAY_MS;
-  if(loadFailed)details.push(t('st.connFailShow'));else if(v2Status?.refresh_error&&scanNotice)details.push(t('st.scanFailShow'));
+  const connectionFailed=statusReachable===false&&statusFailureSince!==null&&Date.now()-statusFailureSince>=NOTICE_DELAY_MS;
+  if(connectionFailed)details.push(t('status.connFail'));
+  if(loadFailed||connectionFailed)details.push(t('st.connFailShow'));else if(v2Status?.refresh_error&&scanNotice)details.push(t('st.scanFailShow'));
   if(stale)details.push(t('st.waitData'));
-  const pending=(pendingQueryKey&&pendingQueryKey!==v2View?.key)||(v2View&&v2View.key!==currentQueryKey());
+  const key=currentQueryKey(),mismatched=!!(v2View&&v2View.key!==key);
+  const reading=pendingQueryKey===key,pending=mismatched&&reading;
   if(pending)details.push(words('正在读取所选范围…','Loading selected range…'));
+  else if(mismatched)details.push(words('当前选择尚未更新，显示此前统计。','The current selection has not updated; showing previous results.'));
   const failed=(v2Status?.sources||[]).filter(s=>s.error&&s.error!=='LOADING').length;
   if(failed&&scanNotice)details.push(t('st.srcFailed',failed));
-  if(rescanTimedOut)details.push(t('st.rescanTimeout'));
+  if(refreshTimedOut)details.push(t('st.refreshTimeout'));
   if(v2Status?.refreshing)details.push(t('st.bgScan'));
-  if(rescanBusy)details.push(t('st.manualScan'));
+  if((reading||refreshBusy)&&!state.arf)details.push(t('st.readingSaved'));
   const isolated=(v2Status?.sources||[]).reduce((n,s)=>n+BigInt(s.isolated_objects||'0'),0n);
   if(isolated)details.push(words(`${isolated} 个文件已隔离`,`${isolated} files isolated`));
   for(const source of v2Status?.sources||[])if(source.accounting?.state==='partial'){
@@ -500,20 +656,23 @@ function renderStatus() {
       `${srcLabel(source.id)}: cumulative usage in ${count} sessions cannot be fully attributed to requests.`));
   }
   const remaining=Math.max(0,Math.ceil((arfNextAt-Date.now())/1000));
-  const refreshDetail=state.arf?t('st.arf',state.arf,remaining):t('st.arfOff');
+  const refreshDetail=state.arf?(reading||refreshBusy?t('st.arfReading',state.arf):t('st.arf',state.arf,remaining)):t('st.arfOff');
   details.push(refreshDetail);
   // Keep the ticking digits outside the live status message and reserve their space.
   const countdown=$('#refresh-countdown');
-  countdown.hidden=!state.arf;
-  countdown.textContent=state.arf?t('st.nextRefresh',remaining):'';
+  countdown.hidden=!state.arf||reading||refreshBusy;
+  countdown.textContent=countdown.hidden?'':t('st.nextRefresh',remaining);
   countdown.title=refreshDetail;
   countdown.setAttribute('aria-label',refreshDetail);
-  const updating=!!(pending||v2Status?.refreshing||rescanBusy);
-  const saved=loadFailed||rescanTimedOut||stale||isolated>0n||(scanNotice&&(v2Status?.refresh_error||failed));
-  const el=$('#status'),text=t(updating?'st.shortUpdating':saved?'st.shortSaved':'st.shortReady');
+  const updating=!!(reading||v2Status?.refreshing||refreshBusy);
+  const saved=loadFailed||connectionFailed||refreshTimedOut||stale||(mismatched&&!pending)||isolated>0n||(scanNotice&&(v2Status?.refresh_error||failed));
+  const persistenceFailure=(v2Status?.sources||[]).find(s=>['save_error','publish_error','recovery_unverified'].includes(s.state));
+  const storageFailure=v2Status?.storage?.error;
+  const failureText=storageFailure||persistenceFailure?.state==='save_error'?words('保存失败','Save failed'):persistenceFailure?.state==='publish_error'?words('入账失败','Publish failed'):persistenceFailure?words('待恢复','Recovery pending'):null;
+  const el=$('#status'),text=failureText||(selectionIssue?words(selectionIssue==='storage'?'未保存':selectionIssue==='catalog'?'目录受限':['query','table','panel'].includes(selectionIssue)?'查询受限':'筛选受限',selectionIssue==='storage'?'Not saved':selectionIssue==='catalog'?'Directory limited':['query','table','panel'].includes(selectionIssue)?'Query limited':'Filter limited'):t(updating?'st.shortUpdating':saved?'st.shortSaved':'st.shortReady'));
   if(el.dataset.last!==text){el.textContent=text;el.dataset.last=text;}
   el.classList.toggle('st-scan',updating);
-  el.title=[...new Set([...details,...dataNotes(),...(v2Status?.sources||[]).filter(s=>s.error).map(s=>`${srcLabel(s.id)}: ${s.error}`),v2Status?.refresh_error||''].filter(Boolean))].join('\n');
+  el.title=[...new Set([...details,...dataNotes(),...(v2Status?.sources||[]).filter(s=>s.error).map(s=>`${srcLabel(s.id)}: ${s.error}`),v2Status?.refresh_error||'',v2Status?.storage?.error||''].filter(Boolean))].join('\n');
   const header=document.querySelector('header h1');if(header)header.title=t('status.dataAsOf',localDate(DATA.generated_at_ms));
   if(DATA.version)$('#ver').textContent=t('ver.note',DATA.version);
 }
@@ -522,6 +681,9 @@ function dataNotes() {
   const r=v2View.response,d=r.payload.data,notes=[];
   if(r.source_coverage==='partial')notes.push(words('当前统计未覆盖全部来源用量。','Totals do not cover all source usage.'));
   if(r.warnings.includes('LIVE_HISTORY_UNPROTECTED'))notes.push(words('部分来源仍依赖原始历史文件。','Some sources still depend on their original history files.'));
+  if(d.series?.grouping_unallocated?.known_value && d.series.grouping_unallocated.known_value!=='0')notes.push(words('部分历史汇总跨越显示日期，仍计入总量，但未拆分到日图。','Some historical aggregates cross display dates; totals retain them without splitting them across daily bars.'));
+  if(r.warnings.includes('MEMBERSHIP_UNKNOWN'))notes.push(words('部分记录无法确定是否属于所选范围，已单独保留。','Some records have uncertain filter membership and are kept separate.'));
+  if(d.totals.quality?.source_reported_total?.known_value && d.totals.quality.source_reported_total.known_value!=='0')notes.push(words('包含按来源报告采用的固定历史用量，尚未逐请求核实。','Includes frozen source-reported history without per-request verification.'));
   if(r.warnings.includes('DAY_EVIDENCE_EXCLUDED'))notes.push(words('有时区或覆盖范围待确认的日汇总，暂未计入。','Daily records with unverified timezone or coverage are excluded.'));
   if(r.warnings.includes('SESSION_USAGE_UNALLOCATED'))notes.push(words('部分会话累计无法完整归入请求；图表与排行只包含可归属的用量。','Some session totals cannot be fully attributed to requests; charts and rankings include attributable usage only.'));
   if(d.totals.coverage.grain==='day'||d.totals.coverage.grain==='mixed')notes.push(words('日汇总计入总量；小时图仅展示真实的小时记录。','Totals include daily records; hourly charts show only known hourly usage.'));
@@ -561,17 +723,86 @@ function drawSeries(id,series,onClick,presentation={}) {
     data:{labels:points.map(p=>presentation.label?presentation.label(p):p.label),datasets},options});
 }
 function daySeries(day) {
-  return {keys:day?.keys||[],points:(day?.hours||Array.from({length:24},(_,hour)=>({hour,values:[]}))).map(h=>({label:String(h.hour).padStart(2,'0')+(h.state==='nonexistent'?' ∅':h.intervals?.length>1?' ↺':''),values:h.values}))};
+  const hourlyKeys=day?.keys||[],daily=day?.day_only_series,hasUnallocated=!!daily?.keys?.length;
+  const keys=[...new Map([...hourlyKeys,...(daily?.keys||[])].map(key=>[key.id,key])).values()];
+  const hourlyIndex=new Map(hourlyKeys.map((key,index)=>[key.id,index]));
+  const hours=hasUnallocated&&!hourlyKeys.length?[]:(day?.hours||Array.from({length:24},(_,hour)=>({hour,values:[]})));
+  const points=hours.map(hour=>({label:String(hour.hour).padStart(2,'0')+(hour.state==='nonexistent'?' ∅':hour.intervals?.length>1?' ↺':''),
+    values:keys.map(key=>hour.values?.[hourlyIndex.get(key.id)]||unknownMetric())}));
+  if(hasUnallocated){
+    const dailyIndex=new Map(daily.keys.map((key,index)=>[key.id,index]));
+    points.push({label:t('bucket.unallocatedTime'),values:keys.map(key=>daily.values?.[dailyIndex.get(key.id)]||unknownMetric())});
+  }
+  return {keys,points,hasUnallocated};
+}
+// Rendering may temporarily fall back, while the user's current-page choice remains 3D.
+let dailyRenderedView=state.view,daily3dRevision=0;
+function setDailyViewUi() {
+  $('#daily-view').setAttribute('aria-label',t('view.label'));
+  document.querySelectorAll('#daily-view button').forEach(button=>{
+    const active=button.dataset.v===dailyRenderedView;
+    button.classList.toggle('on',active);button.setAttribute('aria-pressed',String(active));
+    button.title=state.view==='3d'&&dailyRenderedView!=='3d'?t('view.fallback'):'';
+  });
+  $('#daily3d-tools').hidden=dailyRenderedView!=='3d';
+  $('#daily3d-auto').textContent=state.autoRotate?'⏸':'▶';
+  $('#daily3d-auto').title=t(state.autoRotate?'view.stop':'view.auto');
+}
+function changeDailyView(view) {
+  if(view!=='3d'&&view!=='standard')return;
+  state.view=view;
+  // Preserve the already displayed chart until its query matches the controls.
+  // The chosen view will be applied when that query succeeds.
+  if(v2View&&v2View.key===currentQueryKey())renderCharts();else if(!v2View){dailyRenderedView=view;setDailyViewUi();}
+}
+function destroyDailyChart() {
+  const chart=charts['#chartDaily'];if(chart){try{chart.destroy();}catch{}delete charts['#chartDaily'];}
+}
+function drawMainSeries(series,onClick) {
+  const renderRevision=++daily3dRevision;
+  if(state.view==='3d'){
+    const keys=series?.keys||[],points=series?.points||[],ids=keys.map(key=>key.id),namespace=state.group,intentRevision=chartIntentRevision;
+    const current=()=>renderRevision===daily3dRevision&&intentRevision===chartIntentRevision&&namespace===state.group&&state.view==='3d';
+    const hidden=hiddenBarSeries('#chartDaily',namespace,ids);
+    const used=keys.map((key,index)=>({key,index})).filter(item=>!hidden.has(item.key.id));
+    const ok=window.Usagebook3D?.update({
+      container:$('#daily3d-stage'),legend:$('#daily3d-legend'),
+      keys:used.map(({key,index})=>({id:key.id,label:displayKey(key),color:chartColor(key,index)})),
+      legendKeys:keys.map((key,index)=>({id:key.id,label:displayKey(key),color:chartColor(key,index),hidden:hidden.has(key.id)})),
+      legendToggleTitle:key=>t(key.hidden?'view.showSeries':'view.hideSeries',key.label),
+      onToggleSeries:id=>{
+        if(!current()||!ids.includes(id))return;
+        const entry=barVisibility['#chartDaily'],key=barSeriesKey(namespace,id);
+        if(entry.hidden.has(key))entry.hidden.delete(key);else entry.hidden.set(key,entry.seen);
+        drawMainSeries(series,onClick);
+      },
+      points:points.map(point=>({...point,values:used.map(item=>point.values[item.index]||unknownMetric())})),
+      formatValue:metricText,autoRotate:state.autoRotate,
+      onClick:onClick?((point,index)=>{if(current())onClick(points[index],index);}):null,
+    });
+    if(ok){
+      destroyDailyChart();$('#chartDaily').hidden=true;$('#daily3d').hidden=false;
+      const fallback=document.getElementById('chartDaily-fallback');if(fallback)fallback.hidden=true;
+      dailyRenderedView='3d';
+      window.Usagebook3D.pause(false);setDailyViewUi();return;
+    }
+  }
+  dailyRenderedView='standard';
+  window.Usagebook3D?.pause(true);$('#daily3d').hidden=true;$('#chartDaily').hidden=false;
+  setDailyViewUi();drawSeries('#chartDaily',series,onClick);
 }
 function renderCharts() {
   const d=v2View.response.payload.data,single=isDayWin(state.win);
+  const day=daySeries(v2View.day),dayTitle=day.hasUnallocated?t('chart.unallocatedTime'):'';
   const reportTimezone=v2View.response.stamp.report_timezone;
   $('#day-prev').hidden=!single;$('#day-next').hidden=!single;$('#day-back').hidden=!single||state.win==='today';
   $('#hourly-panel').hidden=single;$('#grid2').classList.toggle('single',single);
-  $('#daily-h2').textContent=t(single?'h2.dayHourly':'h2.daily');
+  $('#daily-h2').textContent=t(single?(day.hasUnallocated?'h2.dayUsage':'h2.dayHourly'):'h2.daily');
+  $('#daily-h2').title=single?dayTitle:'';
+  $('#hourly-h2').title='';
   const metric=d.totals.metrics[METRIC_IDS[state.metric]];
   $('#daily-sub').textContent=single&&metric.state==='exact'&&metric.known_value==='0'?t('empty.noSel'):t(single?'sub.dayTotal':'sub.total',metricText(metric));
-  drawSeries('#chartDaily',single?daySeries(v2View.day):d.series,single?null:point=>{
+  drawMainSeries(single?day:d.series,single?null:point=>{
     if(d.series.unit==='day')enterDay(point.label);else {changeQueryIntent(()=>{state.win='custom';state.rs=dateInReportZone(point.start_ms,reportTimezone);state.re=addDay(dateInReportZone(point.end_ms_exclusive,reportTimezone),-1);});customDateEditing=false;render();}
   });
   if(!single){
@@ -584,8 +815,9 @@ function renderCharts() {
         customDateEditing=false;render();
       },{selectedIndex,label:point=>unit==='week'?point.label.slice(5):point.label.slice(0,7)});
     }else{
-      $('#hourly-h2').textContent=t('h2.hourly');$('#hourly-sub').textContent=v2View.day?t('sub.hourlyDay',v2View.day.date,metricText(v2View.day.total.metrics[METRIC_IDS[state.metric]])):t('empty.none');
-      drawSeries('#chartHourly',daySeries(v2View.day));
+      $('#hourly-h2').textContent=t(day.hasUnallocated?'h2.dayUsage':'h2.hourly');$('#hourly-h2').title=dayTitle;
+      $('#hourly-sub').textContent=v2View.day?t('sub.hourlyDay',v2View.day.date,metricText(v2View.day.total.metrics[METRIC_IDS[state.metric]])):t('empty.none');
+      drawSeries('#chartHourly',day);
     }
   }
   renderDoughnut();
@@ -645,11 +877,13 @@ function shareTitle(share) {
 }
 async function loadTablePage(dim) {
   const view=v2View,signal=v2Controller?.signal;if(!view||view.tableBusy.has(dim)||!view.tables[dim].next_cursor)return;
+  const block=tableLimitBlocks.get(dim);
+  if(block?.blocked&&block.key===view.key&&block.stamp===stampKey(view.response.stamp))return;
   view.tableBusy.add(dim);renderDetailTable(dim);
   try{const result=await apiV2('query',{kind:'table',query:{...view.query,metric:'total'},dimension:dim,scope:'facet',page:{limit:100,cursor:view.tables[dim].next_cursor}},signal);
     if(view!==v2View||view.key!==currentQueryKey())return;verifyStamp(view.response,result);const page=result.payload.data;
-    view.tables[dim]={...page,rows:[...view.tables[dim].rows,...page.rows]};registerLabels(dim,page.rows);DATA.view_generation=++viewGeneration;
-  }catch(e){if(e.name!=='AbortError'&&!signal?.aborted&&view===v2View&&view.key===currentQueryKey()){if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code))load(true);else showLoadFailure(e);}}
+    view.tables[dim]={...page,rows:[...view.tables[dim].rows,...page.rows]};tableLimitBlocks.delete(dim);clearSelectionIssue('table',dim);registerLabels(dim,page.rows);DATA.view_generation=++viewGeneration;
+  }catch(e){if(e.name!=='AbortError'&&!signal?.aborted&&view===v2View&&view.key===currentQueryKey()){if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code))load(true);else if(['QUERY_LIMIT','BODY_TOO_LARGE'].includes(e.code)){tableLimitBlocks.set(dim,{key:view.key,stamp:stampKey(view.response.stamp),cursor:view.tables[dim].next_cursor,blocked:true});showSelectionIssue('table',dim);}else showLoadFailure(e);}}
   finally{view.tableBusy.delete(dim);if(view===v2View&&view.key===currentQueryKey())renderDetailTable(dim);}
 }
 function renderSelectorButtons() {
@@ -657,7 +891,8 @@ function renderSelectorButtons() {
     const sel=dim==='source'?state.srcSel:state.mdlSel,button=$(dim==='source'?'#src-ms-btn':'#mdl-ms-btn'),ids=catalogItems(dim).map(x=>x.id);
     let label=t(dim==='source'?'ms.allSrc':'ms.allMdl'),sub=ids.length?t('ms.nItems',ids.length):'';
     if(sel){const live=ids.filter(id=>selected(sel,id));
-      if(!live.length){label=t(dim==='source'?'ms.noSrc':'ms.noMdl');sub='';}
+      if(sel.exclude&&!ids.length){label=words('已筛选','Filtered');sub='';}
+      else if(!live.length){label=t(dim==='source'?'ms.noSrc':'ms.noMdl');sub='';}
       else if(live.length===1){label=labels[dim].get(live[0])||live[0];sub=t('ms.oneItem');}
       else {label=t('ms.selected',live.length,ids.length);sub='';}
     }
@@ -696,10 +931,10 @@ async function readFilterPage(dim,append) {
     const data=ranking.payload.data;if(!append)panel.stats.clear();
     for(const row of data.rows)panel.stats.set(row.id,row);
     panel.statsNext=data.next_cursor;panel.statsDone=!data.next_cursor;registerLabels(dim,data.rows);
-    panel.element.querySelector('.ms-error').textContent='';
+    panel.element.querySelector('.ms-error').textContent='';clearSelectionIssue('panel',dim);
   }catch(e){if(panel===filterPanels[dim]&&seq===panel.sequence&&e.name!=='AbortError'){
     panel.statsNext=null;
-    if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){panel.key='';load(true);}else{
+    if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){panel.key='';load(true);}else if(['QUERY_LIMIT','BODY_TOO_LARGE'].includes(e.code)){showSelectionIssue('panel',dim);}else{
       panel.element.querySelector('.ms-error').textContent=words('用量稍后更新，筛选仍可使用。','Usage will update later; filters remain available.');
       showLoadFailure(e);
     }
@@ -728,40 +963,32 @@ function loadVisibleTablePages() {
     if(box.top<window.innerHeight+160&&box.bottom>=0)loadTablePage(dim);
   }
 }
-function rescanUntilNew(done) {
-  if(manualRefresh)manualRefresh.finish();
-  const op={finished:false,timers:new Set(),controller:new AbortController()};manualRefresh=op;
+function refreshSavedView(done) {
+  // A user-requested read permits one retry of a previously limited page.
+  for(const block of tableLimitBlocks.values())block.blocked=false;
+  if(manualRefresh)manualRefresh.finish(false,false,true);
+  const op={finished:false,controller:new AbortController(),timer:null};manualRefresh=op;
   const active=()=>manualRefresh===op&&!op.finished;
-  const later=(fn,ms)=>{const timer=setTimeout(()=>{op.timers.delete(timer);if(active())fn();},ms);op.timers.add(timer);};
-  op.finish=(timedOut=false,failed=false)=>{
+  op.finish=(timedOut=false,failed=false,superseded=false,selectionLimited=false,queryLimited=false)=>{
     if(!active())return;
-    op.finished=true;for(const timer of op.timers)clearTimeout(timer);op.controller.abort();
-    manualRefresh=null;rescanBusy=false;if(!failed)rescanTimedOut=timedOut;
-    rescanTimedOutGen=v2Status?.refresh_generation||'0';
+    op.finished=true;clearTimeout(op.timer);op.controller.abort();
+    manualRefresh=null;refreshBusy=false;if(!failed)refreshTimedOut=timedOut;
     $('#btn-refresh').disabled=false;$('#btn-refresh').textContent=t('btn.refresh');
-    // An explicitly requested update reports incomplete sources immediately;
-    // ordinary background hiccups still use the quiet notice delay.
-    if(failed)scanIssueSince=Math.min(scanIssueSince??Date.now(),Date.now()-NOTICE_DELAY_MS);
-    if(timedOut&&!recoveryUntil){recoveryUntil=Date.now();recoveryBase=v2Status?.refresh_generation??null;}
-    if(timedOut||failed)retryInBackground();
-    renderStatus();if(done)done({ok:!timedOut&&!failed,timedOut,failed});
+    if((timedOut||failed)&&!selectionLimited&&!queryLimited&&!recoveryUntil){recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=null;}
+    // The normal load path records source/storage errors separately. A manual
+    // read completes as soon as its saved result arrives, even during collection.
+    if(!selectionLimited&&!queryLimited&&!selectionIssues.has('query:model')&&(!superseded||pendingQueryKey===null))retryInBackground();renderStatus();
+    if(done)done({ok:!timedOut&&!failed&&!superseded,timedOut,failed,...(superseded?{superseded:true}:{}),...(selectionLimited?{selectionLimited:true}:{}),...(queryLimited?{queryLimited:true}:{})});
   };
-  rescanBusy=true;$('#btn-refresh').disabled=true;$('#btn-refresh').textContent=t('btn.rescaning');renderStatus();later(()=>op.finish(true),RETRY_WAIT_MS);
-  const start=async()=>{
-    try{
-      const initial=await readStatusV2('status?arf=',op.controller.signal,active);if(!active())return;
-      const base=BigInt(initial.refresh_generation||'0');
-      await apiV2('refresh',{},op.controller.signal);if(!active())return;
-      const poll=async()=>{try{
-        const status=await readStatusV2('status?arf=',op.controller.signal,active);if(!active())return;observeScanStatus(status);renderStatus();
-        if(BigInt(status.refresh_generation||'0')!==base&&!status.refreshing){
-          const result=await load(true);if(!active())return;
-          if(result?.ok){op.finish(false,observeScanStatus(result.status));return;}
-        }
-      }catch(e){if(active())showLoadFailure(e);}if(active())later(poll,RETRY_DELAY_MS);};
-      later(poll,300);
-    }catch(e){if(active()){showLoadFailure(e);later(start,RETRY_DELAY_MS);}}
-  };start();
+  refreshBusy=true;$('#btn-refresh').disabled=true;$('#btn-refresh').textContent=t('btn.refreshing');renderStatus();
+  op.timer=setTimeout(()=>op.finish(true),RETRY_WAIT_MS);
+  // The operation only owns this read's abort signal. Its deadline cannot
+  // cancel a later filter change or an independent automatic read.
+  void load(true,op.controller.signal).then(result=>{
+    if(active())op.finish(false,!result?.ok&&!result?.superseded,!!result?.superseded,!!result?.selectionLimited,!!result?.queryLimited);
+  },error=>{
+    if(active()){showLoadFailure(error);op.finish(false,true);}
+  });
 }
 
 /* ---------------- 启动 ---------------- */
@@ -769,6 +996,15 @@ function rescanUntilNew(done) {
 migrateModels();
 window.addEventListener('scroll',loadVisibleTablePages,{passive:true});
 window.addEventListener('resize',loadVisibleTablePages);
+document.querySelectorAll('#daily-view button').forEach(button=>button.addEventListener('click',()=>changeDailyView(button.dataset.v)));
+$('#daily3d-reset').addEventListener('click',()=>window.Usagebook3D?.reset());
+$('#daily3d-top').addEventListener('click',()=>window.Usagebook3D?.top());
+$('#daily3d-left').addEventListener('click',()=>window.Usagebook3D?.rotate(-1));
+$('#daily3d-right').addEventListener('click',()=>window.Usagebook3D?.rotate(1));
+$('#daily3d-zoom-in').addEventListener('click',()=>window.Usagebook3D?.zoom(1));
+$('#daily3d-zoom-out').addEventListener('click',()=>window.Usagebook3D?.zoom(-1));
+$('#daily3d-auto').addEventListener('click',()=>{state.autoRotate=!state.autoRotate;window.Usagebook3D?.setAutoRotate(state.autoRotate);setDailyViewUi();});
+setDailyViewUi();
 applyArf();
 setInterval(()=>{if(!DATA?.ready||document.hidden)return;if(renderedDay!==localDayStr())render();else renderStatus();},1000);
 load();

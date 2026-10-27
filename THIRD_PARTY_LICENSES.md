@@ -111,6 +111,7 @@ For alternative licenses (OR), the upstream alternatives are preserved; addition
 | zstd-sys 2.1.0+zstd.1.5.7 | BSD-3-Clause | [crate](https://crates.io/crates/zstd-sys/2.1.0+zstd.1.5.7); `LICENSE` [text](#license-769153f04f135a5b); `LICENSE.BSD-3-Clause` [text](#license-08728d1c12d66320); `zstd/COPYING` [text](#license-1be990a929b50ca9); `zstd/LICENSE` [text](#license-2caa041c7859b01c) |
 | Chart.js 4.4.3 | MIT | [tagged upstream](https://github.com/chartjs/Chart.js/blob/v4.4.3/LICENSE.md); [text](#license-a118d9aa1d342170) |
 | @kurkle/color 0.3.2 | MIT | [tagged upstream](https://github.com/kurkle/color/blob/v0.3.2/LICENSE.md); [text](#license-baae0ed474319aed) |
+| Three.js 0.183.2 | MIT | [tagged upstream](https://github.com/mrdoob/three.js/blob/r183/LICENSE); [text](#license-e981c93a41a4ee27) |
 
 ## License texts
 
@@ -5625,4 +5626,32 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+<a id="license-e981c93a41a4ee27"></a>
+
+### License e981c93a41a4ee27
+
+````text
+The MIT License
+
+Copyright © 2010-2026 three.js authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ````

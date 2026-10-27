@@ -1,8 +1,8 @@
--- Canonical schema v2. Migrations must also preserve suppression rules.
+-- Canonical schema v7. Migrations must also preserve every deletion control.
 PRAGMA foreign_keys=ON;
 CREATE TABLE ledger_meta (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
- schema_version INTEGER NOT NULL CHECK(schema_version=2),
+ schema_version INTEGER NOT NULL CHECK(schema_version=7),
  ledger_uuid TEXT NOT NULL, epoch TEXT NOT NULL,
  commit_seq INTEGER NOT NULL CHECK(commit_seq>=0),
  derived_version INTEGER NOT NULL CHECK(derived_version>0),
@@ -88,7 +88,7 @@ CREATE TABLE usage_observations (
  identity_version INTEGER NOT NULL CHECK(identity_version>0),
  semantics_version INTEGER NOT NULL CHECK(semantics_version>0),
  observed_ms INTEGER NOT NULL,
- eligibility TEXT NOT NULL CHECK(eligibility IN('eligible','identity_unknown','time_unknown','inconsistent','identity_only')),
+ eligibility TEXT NOT NULL CHECK(eligibility IN('eligible','identity_unknown','time_unknown','inconsistent','identity_only','pending_finality')),
  action TEXT NOT NULL CHECK(action IN('upsert','retract')),
  revision_authority TEXT, revision_no INTEGER CHECK(revision_no>=0),
  fact_kind TEXT NOT NULL CHECK(fact_kind IN('request','day','session_cost','session_total')),
@@ -124,7 +124,7 @@ CREATE INDEX observations_object ON usage_observations(object_id,observation_id)
 CREATE INDEX observations_time ON usage_observations(occurred_ms,report_source,identity_key);
 CREATE INDEX observations_pending_day ON usage_observations(report_source,native_date,observation_id) WHERE fact_kind='day';
 CREATE INDEX observations_session ON usage_observations(identity_family,namespace_key,session_key,observation_id);
-CREATE INDEX observations_unresolved ON usage_observations(report_source,identity_family,namespace_key,identity_key) WHERE eligibility IN('identity_unknown','time_unknown','inconsistent');
+CREATE INDEX observations_unresolved ON usage_observations(report_source,identity_family,namespace_key,identity_key) WHERE eligibility IN('identity_unknown','time_unknown','inconsistent','pending_finality');
 CREATE INDEX observations_saved ON usage_observations(report_source,observed_ms);
 CREATE TRIGGER observations_immutable BEFORE UPDATE ON usage_observations
  BEGIN SELECT RAISE(ABORT,'immutable observation'); END;
@@ -202,32 +202,34 @@ CREATE INDEX rollups_window ON usage_rollups(derived_version,grain,local_day,rep
 
 CREATE TABLE suppression_rules (
  rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
- kind TEXT NOT NULL CHECK(kind IN('source','window','identity','identity_link','session','coverage_interval','coverage_family')),
+ kind TEXT NOT NULL CHECK(kind IN('source','window','identity','identity_link','session','coverage_interval','coverage_family','consumption_interval')),
  report_source TEXT, identity_family TEXT, namespace_key TEXT, identity_key TEXT, session_key TEXT,
  link_version INTEGER, link_key TEXT,
  native_tool TEXT, start_ms INTEGER, end_ms INTEGER,
  operation_id TEXT NOT NULL, created_ms INTEGER NOT NULL,
  CHECK((start_ms IS NULL AND end_ms IS NULL) OR (start_ms IS NOT NULL AND end_ms IS NOT NULL AND end_ms>start_ms)),
  CHECK(
-  (kind='source' AND report_source IS NOT NULL AND native_tool IS NOT NULL AND identity_family IS NULL AND namespace_key IS NULL AND identity_key IS NULL AND start_ms IS NULL)
+  (kind='source' AND report_source IS NOT NULL AND identity_family IS NULL AND namespace_key IS NULL AND identity_key IS NULL AND start_ms IS NULL)
   OR (kind='window' AND identity_family IS NULL AND namespace_key IS NULL AND identity_key IS NULL AND start_ms IS NOT NULL AND end_ms IS NOT NULL)
   OR (kind='session' AND identity_family IS NOT NULL AND namespace_key IS NOT NULL AND session_key IS NOT NULL AND identity_key IS NULL AND report_source IS NULL AND native_tool IS NULL AND start_ms IS NULL)
   OR (kind='identity' AND identity_family IS NOT NULL AND namespace_key IS NOT NULL AND identity_key IS NOT NULL AND report_source IS NULL AND native_tool IS NULL AND start_ms IS NULL)
   OR (kind='identity_link' AND identity_family IS NOT NULL AND namespace_key IS NOT NULL AND identity_key IS NULL AND report_source IS NULL AND native_tool IS NULL AND start_ms IS NULL)
   OR (kind='coverage_interval' AND native_tool IS NOT NULL AND namespace_key IS NOT NULL AND start_ms IS NOT NULL AND end_ms IS NOT NULL AND report_source IS NULL AND identity_family IS NULL AND identity_key IS NULL)
+  OR (kind='consumption_interval' AND native_tool IS NOT NULL AND namespace_key IS NOT NULL AND start_ms IS NOT NULL AND end_ms IS NOT NULL AND report_source IS NULL AND identity_family IS NULL AND identity_key IS NULL)
   OR (kind='coverage_family' AND native_tool IS NOT NULL AND namespace_key IS NOT NULL AND start_ms IS NULL AND report_source IS NULL AND identity_family IS NULL AND identity_key IS NULL)
  ),
  CHECK(kind='session' OR session_key IS NULL),
  CHECK((kind='identity_link' AND link_version IS NOT NULL AND link_version=1 AND link_key IS NOT NULL AND length(link_key)=64 AND link_key NOT GLOB '*[^0-9a-f]*')
     OR (kind<>'identity_link' AND link_version IS NULL AND link_key IS NULL)),
- CHECK(kind<>'window' OR (report_source IS NULL AND native_tool IS NULL) OR (report_source IS NOT NULL AND native_tool IS NOT NULL))
+ CHECK(kind<>'window' OR native_tool IS NULL OR report_source IS NOT NULL)
 ) STRICT;
 CREATE UNIQUE INDEX suppression_session ON suppression_rules(identity_family,namespace_key,session_key) WHERE kind='session';
 CREATE UNIQUE INDEX suppression_identity ON suppression_rules(identity_family,namespace_key,identity_key) WHERE kind='identity';
 CREATE UNIQUE INDEX suppression_link ON suppression_rules(identity_family,namespace_key,link_version,link_key) WHERE kind='identity_link';
-CREATE UNIQUE INDEX suppression_source ON suppression_rules(report_source,native_tool) WHERE kind='source';
+CREATE UNIQUE INDEX suppression_source ON suppression_rules(report_source,COALESCE(native_tool,'')) WHERE kind='source';
 CREATE UNIQUE INDEX suppression_family ON suppression_rules(native_tool,namespace_key) WHERE kind='coverage_family';
 CREATE UNIQUE INDEX suppression_interval ON suppression_rules(native_tool,namespace_key,start_ms,end_ms) WHERE kind='coverage_interval';
+CREATE UNIQUE INDEX suppression_consumption_interval ON suppression_rules(native_tool,namespace_key,start_ms,end_ms) WHERE kind='consumption_interval';
 CREATE INDEX suppression_window ON suppression_rules(kind,report_source,native_tool,start_ms,end_ms);
 CREATE INDEX suppression_coverage ON suppression_rules(native_tool,namespace_key,kind,start_ms,end_ms);
 

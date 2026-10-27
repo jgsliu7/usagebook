@@ -705,6 +705,17 @@ pub fn gc_source(source: &str, live: &[PathBuf]) -> usize {
 
 // —— source_state(非 JSONL 大源的源级指纹门; ——
 
+// Keep Gemini's metadata-aware records separate from older processes sharing
+// this disposable cache. Other sources retain their existing cache namespace.
+const GEMINI_SOURCE_CACHE_KEY: &str = "gemini:metadata-v1";
+fn source_cache_key(source: &str) -> &str {
+    if source == "gemini" {
+        GEMINI_SOURCE_CACHE_KEY
+    } else {
+        source
+    }
+}
+
 pub struct SourceRow {
     pub fingerprint: std::sync::Arc<[u8]>,
     pub records: std::sync::Arc<[u8]>,
@@ -715,7 +726,7 @@ pub fn source_row(source: &str) -> Option<SourceRow> {
     with_conn(|conn| {
         conn.query_row(
             "SELECT fingerprint, records, records_len FROM source_state WHERE source = ?1",
-            [source],
+            [source_cache_key(source)],
             |r| {
                 Ok(SourceRow {
                     fingerprint: r.get::<_, Vec<u8>>(0)?.into_boxed_slice().into(),
@@ -737,7 +748,13 @@ pub fn replace_source(source: &str, fingerprint: &[u8], records: &[u8], records_
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(source) DO UPDATE SET fingerprint = ?2, records = ?3,
                                               records_len = ?4, updated_ms = ?5",
-            rusqlite::params![source, fingerprint, records, records_len as i64, now],
+            rusqlite::params![
+                source_cache_key(source),
+                fingerprint,
+                records,
+                records_len as i64,
+                now
+            ],
         )?;
         Ok::<(), rusqlite::Error>(())
     });
@@ -746,7 +763,10 @@ pub fn replace_source(source: &str, fingerprint: &[u8], records: &[u8], records_
 /// 空记录且扫描成功的源:删除旧行(镜像 L1b 的不冻结语义;。
 pub fn delete_source(source: &str) {
     let _ = with_conn(|conn| {
-        conn.execute("DELETE FROM source_state WHERE source = ?1", [source])?;
+        conn.execute(
+            "DELETE FROM source_state WHERE source = ?1",
+            [source_cache_key(source)],
+        )?;
         Ok::<(), rusqlite::Error>(())
     });
 }
@@ -962,6 +982,14 @@ pub fn doctor_snapshot() -> DoctorSnapshot {
         snap.sources = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
+        // Obsolete Gemini cache rows are ignored by this binary. Diagnostics
+        // still expose the public source identifier for the current namespace.
+        snap.sources.retain(|(source, _)| source != "gemini");
+        for (source, _) in &mut snap.sources {
+            if source == GEMINI_SOURCE_CACHE_KEY {
+                *source = "gemini".into();
+            }
+        }
         let newest: Option<i64> =
             conn.query_row("SELECT MAX(updated_ms) FROM file_state", [], |r| r.get(0))?;
         let now = chrono::Local::now().timestamp_millis();

@@ -1,0 +1,15 @@
+{
+  "name": "usagebook-dashboard-assets",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Build tooling for the embedded Three.js dashboard; generate the ignored bundle before Cargo builds.",
+  "scripts": {
+    "build:dashboard3d": "esbuild crates/usagebook-cli/src/dashboard_3d.src.js --bundle --minify --format=iife --target=es2020 --outfile=crates/usagebook-cli/src/dashboard_3d.bundle.js"
+  },
+  "dependencies": {
+    "three": "^0.183.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.3"
+  }
+}

@@ -44,7 +44,7 @@ fn tmpdir(tag: &str) -> TmpGuard {
     TmpGuard(d)
 }
 
-/// serve 进程守卫:Drop 必杀——断言 panic 时不再泄漏孤儿 serve(它仍会周期扫描用户 HOME)。
+/// serve 进程守卫:Drop 必杀，所有日志测试均使用隔离 HOME 与临时统计。
 struct ServeGuard(Child);
 impl ServeGuard {
     /// 结束进程并收集 stdout/stderr。
@@ -94,7 +94,12 @@ fn spawn_serve_alive(data_dir: &Path, extra_env: &[(&str, &str)]) -> (ServeGuard
 
 fn spawn_serve(port: u16, data_dir: &Path, extra_env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(bin());
-    cmd.args(["serve", "--port", &port.to_string()])
+    cmd.args(["serve", "--temporary", "--port", &port.to_string()])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", data_dir.join("home"))
+        .env("XDG_CONFIG_HOME", data_dir.join("home/.config"))
+        .env("XDG_DATA_HOME", data_dir.join("home/.local/share"))
         .env("USAGEBOOK_DATA_DIR", data_dir.as_os_str())
         .env("USAGEBOOK_STATE_DB", data_dir.join("state.db"))
         .stdout(Stdio::piped())
@@ -131,6 +136,12 @@ fn isolated_report(data: &Path, claude: &Path) -> Command {
     std::fs::create_dir_all(claude.join("projects")).unwrap();
     let mut cmd = Command::new(bin());
     cmd.args(["--json", "--source", "claude"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", data.join("home"))
+        .env("XDG_CONFIG_HOME", data.join("home/.config"))
+        .env("XDG_DATA_HOME", data.join("home/.local/share"))
+        .env("USAGEBOOK_LEDGER_PATH", data.join("ledger.db"))
         .env("USAGEBOOK_DATA_DIR", data)
         .env("USAGEBOOK_STATE_DB", data.join("state.db"))
         .env("CLAUDE_CONFIG_DIR", claude);

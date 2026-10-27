@@ -11,6 +11,14 @@ pub struct Ledger {
     _writer: Option<Lease>,
     optimize_next: Instant,
     optimize_first: bool,
+    pub(crate) claude_readers: Option<super::ingest::ReaderSliceState>,
+}
+impl Drop for Ledger {
+    fn drop(&mut self) {
+        if let Some(state) = self.claude_readers.take() {
+            state.cancel(&self.path);
+        }
+    }
 }
 pub fn default_path() -> PathBuf {
     if let Some(p) = std::env::var_os("USAGEBOOK_LEDGER_PATH") {
@@ -170,15 +178,20 @@ fn configured_connection(path: &Path, write: bool) -> Result<Connection> {
 /// Its caller copies this handle into a private staging file before upgrading.
 pub(crate) fn open_restore_source(path: &Path) -> Result<Connection> {
     let c = configured_connection(path, false)?;
-    validate_versions(&c, &[1, 2])?;
+    validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7])?;
+    validate_historical_versions(&c)?;
     Ok(c)
 }
 pub(crate) fn open_connection(path: &Path, write: bool) -> Result<Connection> {
+    if write {
+        // Check every independently versioned contract before opening a writer
+        // or running migration/journal pragmas. Unsupported databases are not
+        // partially upgraded merely because their schema happens to be known.
+        drop(open_restore_source(path)?);
+    }
     let c = configured_connection(path, write)?;
     if write {
-        // A v1 ledger upgrades in place before validation; read-only opens of
-        // v1 stay UnsupportedVersion until any writer (serve/refresh) passes.
-        // Errors here (missing table, corrupt) fall through to validate().
+        validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7])?;
         let schema = c
             .query_row(
                 "SELECT schema_version FROM ledger_meta WHERE singleton=1",
@@ -190,10 +203,26 @@ pub(crate) fn open_connection(path: &Path, write: bool) -> Result<Connection> {
         if schema == 1 {
             migrate_v1_to_v2(&c)?;
         }
+        if schema == 1 || schema == 2 {
+            migrate_v2_to_v3(&c)?;
+        }
+        if schema <= 3 {
+            migrate_v3_to_v4(&c)?;
+        }
+        if schema <= 4 {
+            migrate_v4_to_v5(&c)?;
+        }
+        if schema <= 5 {
+            migrate_v5_to_v6(&c)?;
+        }
+        if schema <= 6 {
+            migrate_v6_to_v7(&c)?;
+        }
     }
     validate(&c)?;
     if write {
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+        ensure_read_caches(&c)?;
     }
     Ok(c)
 }
@@ -325,8 +354,363 @@ PRAGMA foreign_keys=ON;
     bump(c)?;
     Ok(())
 }
+/// v3 adds acquisition manifests and finality evidence without changing any
+/// existing fact. The observation table is rebuilt using the canonical DDL;
+/// its original AUTOINCREMENT watermark survives even after explicit forget.
+fn migrate_v2_to_v3(c: &Connection) -> Result<()> {
+    let canonical = include_str!("schema.sql");
+    let table_ddl = |name: &str| -> Result<&str> {
+        let start = canonical
+            .find(&format!("CREATE TABLE {name} ("))
+            .ok_or(LedgerError::CorruptLedger)?;
+        let end = canonical[start..]
+            .find(") STRICT;")
+            .ok_or(LedgerError::CorruptLedger)?
+            + start
+            + ") STRICT;".len();
+        Ok(&canonical[start..end])
+    };
+    c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        let sequence: Option<i64> = c
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='usage_observations'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        c.execute_batch(
+            &table_ddl("ledger_meta")?
+                .replace("CHECK(schema_version=7)", "CHECK(schema_version=3)")
+                .replacen(
+                    "CREATE TABLE ledger_meta (",
+                    "CREATE TABLE ledger_meta_v3 (",
+                    1,
+                ),
+        )?;
+        c.execute_batch("INSERT INTO ledger_meta_v3 SELECT singleton,3,ledger_uuid,epoch,commit_seq,derived_version,identity_version,normalization_version,report_timezone,tzdb_version,created_ms FROM ledger_meta; DROP TABLE ledger_meta; ALTER TABLE ledger_meta_v3 RENAME TO ledger_meta;")?;
+        c.execute_batch(&table_ddl("usage_observations")?.replacen(
+            "CREATE TABLE usage_observations (",
+            "CREATE TABLE usage_observations_v3 (",
+            1,
+        ))?;
+        let columns = super::ingest::OBSERVATION_COLUMNS;
+        c.execute_batch(&format!("INSERT INTO usage_observations_v3({columns}) SELECT {columns} FROM usage_observations; DROP TABLE usage_observations; ALTER TABLE usage_observations_v3 RENAME TO usage_observations;"))?;
+        if let Some(sequence) = sequence {
+            c.execute(
+                "UPDATE sqlite_sequence SET seq=MAX(seq,?1) WHERE name='usage_observations'",
+                [sequence],
+            )?;
+        }
+        for line in canonical
+            .lines()
+            .filter(|line| line.starts_with("CREATE INDEX observations_"))
+        {
+            c.execute_batch(line)?;
+        }
+        let trigger_start = canonical
+            .find("CREATE TRIGGER observations_immutable")
+            .ok_or(LedgerError::CorruptLedger)?;
+        let trigger_end = canonical[trigger_start..]
+            .find("END;")
+            .ok_or(LedgerError::CorruptLedger)?
+            + trigger_start
+            + 4;
+        c.execute_batch(&canonical[trigger_start..trigger_end])?;
+        c.execute_batch(include_str!("durable_schema.sql"))?;
+        c.execute_batch(include_str!("coverage_schema.sql"))?;
+        let violation: Option<String> = c
+            .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
+            .optional()?;
+        if violation.is_some() {
+            return Err(LedgerError::CorruptLedger);
+        }
+        bump(c)?;
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = c.execute_batch("ROLLBACK;");
+    }
+    c.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result
+}
+
+/// v4 decouples deletion/coverage controls from the lifetime of their support,
+/// and adds the bounded runtime, snapshot and explicit-adoption state. Ordinary
+/// observations and their selected numeric values are copied unchanged.
+fn migrate_v3_to_v4(c: &Connection) -> Result<()> {
+    let canonical = include_str!("schema.sql");
+    let table = |name: &str| -> Result<&str> {
+        let start = canonical
+            .find(&format!("CREATE TABLE {name} ("))
+            .ok_or(LedgerError::CorruptLedger)?;
+        let end = start
+            + canonical[start..]
+                .find(") STRICT;")
+                .ok_or(LedgerError::CorruptLedger)?
+            + ") STRICT;".len();
+        Ok(&canonical[start..end])
+    };
+    c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        let sequence: Option<i64> = c
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='suppression_rules'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        c.execute_batch(
+            &table("ledger_meta")?
+                .replace("CHECK(schema_version=7)", "CHECK(schema_version=4)")
+                .replacen(
+                    "CREATE TABLE ledger_meta (",
+                    "CREATE TABLE ledger_meta_v4 (",
+                    1,
+                ),
+        )?;
+        c.execute_batch("INSERT INTO ledger_meta_v4 SELECT singleton,4,ledger_uuid,epoch,commit_seq,derived_version,identity_version,normalization_version,report_timezone,tzdb_version,created_ms FROM ledger_meta; DROP TABLE ledger_meta; ALTER TABLE ledger_meta_v4 RENAME TO ledger_meta;")?;
+        c.execute_batch(&table("suppression_rules")?.replacen(
+            "CREATE TABLE suppression_rules (",
+            "CREATE TABLE suppression_rules_v4 (",
+            1,
+        ))?;
+        c.execute_batch("INSERT INTO suppression_rules_v4 SELECT * FROM suppression_rules; DROP TABLE suppression_rules; ALTER TABLE suppression_rules_v4 RENAME TO suppression_rules;")?;
+        if let Some(sequence) = sequence {
+            c.execute(
+                "UPDATE sqlite_sequence SET seq=MAX(seq,?1) WHERE name='suppression_rules'",
+                [sequence],
+            )?;
+        }
+        for line in canonical
+            .lines()
+            .filter(|line| line.starts_with("CREATE ") && line.contains("INDEX suppression_"))
+        {
+            c.execute_batch(line)?;
+        }
+        // v3 wrote the report channel into the native-tool slot. That channel
+        // has never represented a native tool, so these rules matched no CC
+        // request. Preserve their intended report-source/time restriction.
+        c.execute("UPDATE suppression_rules SET native_tool=NULL WHERE kind IN('source','window') AND report_source='ccswitch-rollup' AND native_tool='ccswitch-rollup'", [])?;
+        c.execute_batch("CREATE TEMP TABLE coverage_v3 AS SELECT * FROM durable_coverage; CREATE TEMP TABLE channels_v3 AS SELECT * FROM durable_channel_choices; DROP TABLE durable_coverage; DROP TABLE durable_channel_choices;")?;
+        c.execute_batch(include_str!("coverage_schema.sql"))?;
+        c.execute_batch("INSERT INTO durable_coverage SELECT * FROM coverage_v3; INSERT INTO durable_channel_choices SELECT * FROM channels_v3; DROP TABLE coverage_v3; DROP TABLE channels_v3;")?;
+        c.execute_batch(include_str!("runtime_schema.sql"))?;
+        c.execute_batch(include_str!("durable_snapshots_schema.sql"))?;
+        c.execute_batch(include_str!("adoption_schema.sql"))?;
+        let violation: Option<String> = c
+            .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
+            .optional()?;
+        if violation.is_some() {
+            return Err(LedgerError::CorruptLedger);
+        }
+        bump(c)?;
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = c.execute_batch("ROLLBACK;");
+    }
+    c.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result
+}
+
+/// v5 makes physical-row deletion controls a required protocol. An older v4
+/// writer must refuse this ledger instead of rebuilding a forgotten projection
+/// after its source row changes time or identity fields. No facts or epochs move.
+fn migrate_v4_to_v5(c: &Connection) -> Result<()> {
+    let canonical = include_str!("schema.sql");
+    let start = canonical
+        .find("CREATE TABLE ledger_meta (")
+        .ok_or(LedgerError::CorruptLedger)?;
+    let end = start
+        + canonical[start..]
+            .find(") STRICT;")
+            .ok_or(LedgerError::CorruptLedger)?
+        + ") STRICT;".len();
+    c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        c.execute_batch(
+            &canonical[start..end]
+                .replace("CHECK(schema_version=7)", "CHECK(schema_version=5)")
+                .replacen(
+                    "CREATE TABLE ledger_meta (",
+                    "CREATE TABLE ledger_meta_v5 (",
+                    1,
+                ),
+        )?;
+        c.execute_batch("INSERT INTO ledger_meta_v5 SELECT singleton,5,ledger_uuid,epoch,commit_seq,derived_version,identity_version,normalization_version,report_timezone,tzdb_version,created_ms FROM ledger_meta; DROP TABLE ledger_meta; ALTER TABLE ledger_meta_v5 RENAME TO ledger_meta;")?;
+        // Includes creation (never replacement) of the permanent projection
+        // tombstones, in the same transaction as the version gate.
+        ensure_read_caches(c)?;
+        validate_versions(c, &[5])?;
+        validate_v5_controls(c)?;
+        let violation: Option<String> = c
+            .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
+            .optional()?;
+        if violation.is_some() {
+            return Err(LedgerError::CorruptLedger);
+        }
+        bump(c)?;
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = c.execute_batch("ROLLBACK;");
+    }
+    c.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result
+}
+
+/// v6 requires immutable time-allocation evidence. Original observations,
+/// adopted values, epochs and controls are untouched; old writers fail closed.
+fn migrate_v5_to_v6(c: &Connection) -> Result<()> {
+    let canonical = include_str!("schema.sql");
+    let start = canonical
+        .find("CREATE TABLE ledger_meta (")
+        .ok_or(LedgerError::CorruptLedger)?;
+    let end = start
+        + canonical[start..]
+            .find(") STRICT;")
+            .ok_or(LedgerError::CorruptLedger)?
+        + ") STRICT;".len();
+    c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        validate_v5_controls(c)?;
+        c.execute_batch(
+            &canonical[start..end]
+                .replace("CHECK(schema_version=7)", "CHECK(schema_version=6)")
+                .replacen(
+                    "CREATE TABLE ledger_meta (",
+                    "CREATE TABLE ledger_meta_v6 (",
+                    1,
+                ),
+        )?;
+        c.execute_batch("INSERT INTO ledger_meta_v6 SELECT singleton,6,ledger_uuid,epoch,commit_seq,derived_version,identity_version,normalization_version,report_timezone,tzdb_version,created_ms FROM ledger_meta; DROP TABLE ledger_meta; ALTER TABLE ledger_meta_v6 RENAME TO ledger_meta;")?;
+        c.execute_batch(include_str!("time_allocation_schema.sql"))?;
+        validate_v6(c)?;
+        let violation: Option<String> = c
+            .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
+            .optional()?;
+        if violation.is_some() {
+            return Err(LedgerError::CorruptLedger);
+        }
+        bump(c)?;
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = c.execute_batch("ROLLBACK;");
+    }
+    c.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result
+}
+
+/// v7 adds sealed historical time revisions without changing any amount or
+/// original time evidence. Old binaries refuse the upgraded ledger.
+fn migrate_v6_to_v7(c: &Connection) -> Result<()> {
+    let canonical = include_str!("schema.sql");
+    let start = canonical
+        .find("CREATE TABLE ledger_meta (")
+        .ok_or(LedgerError::CorruptLedger)?;
+    let end = start
+        + canonical[start..]
+            .find(") STRICT;")
+            .ok_or(LedgerError::CorruptLedger)?
+        + ") STRICT;".len();
+    c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        validate_v6(c)?;
+        c.execute_batch(&canonical[start..end].replacen(
+            "CREATE TABLE ledger_meta (",
+            "CREATE TABLE ledger_meta_v7 (",
+            1,
+        ))?;
+        c.execute_batch("INSERT INTO ledger_meta_v7 SELECT singleton,7,ledger_uuid,epoch,commit_seq,derived_version,identity_version,normalization_version,report_timezone,tzdb_version,created_ms FROM ledger_meta; DROP TABLE ledger_meta; ALTER TABLE ledger_meta_v7 RENAME TO ledger_meta;")?;
+        c.execute_batch(include_str!("time_repair_schema.sql"))?;
+        super::time_repair::preserve_upgrade_capture(c)?;
+        validate(c)?;
+        let violation: Option<String> = c
+            .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
+            .optional()?;
+        if violation.is_some() {
+            return Err(LedgerError::CorruptLedger);
+        }
+        bump(c)?;
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = c.execute_batch("ROLLBACK;");
+    }
+    c.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result
+}
+
 pub(crate) fn validate(c: &Connection) -> Result<()> {
-    validate_versions(c, &[2])
+    validate_versions(c, &[7])?;
+    validate_v6(c)?;
+    c.prepare("SELECT parent_observation_id,version,provenance,member_count,parent_hash,policy_hash,evidence_json,manifest_hash,created_ms FROM durable_time_revisions LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
+    c.prepare("SELECT parent_observation_id,member_key,content_hash,occurred_ms,metrics_json,cost_units,cost_scale FROM durable_time_revision_members LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
+    c.prepare(
+        "SELECT parent_observation_id,basis,attempted_ms,reason FROM time_repair_attempts LIMIT 0",
+    )
+    .map_err(|_| LedgerError::CorruptLedger)?;
+    c.prepare("SELECT report_source,ledger_uuid,metadata_json,entry_count FROM time_repair_saved_sources LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
+    c.prepare("SELECT report_source,ordinal,entry_json FROM time_repair_saved_entries LIMIT 0")
+        .map_err(|_| LedgerError::CorruptLedger)?;
+    c.prepare("SELECT report_source,root_id,row_key,identity_family,namespace_key,layout_json,projection_json,row_hash FROM time_repair_saved_projection LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
+    let triggers:i64=c.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN('time_revision_immutable','time_revision_member_immutable','time_revision_member_sealed','time_revision_no_detach','time_revision_member_no_detach','time_revision_exclusive','time_allocation_exclusive')",[],|r|r.get(0))?;
+    if triggers != 7 {
+        return Err(LedgerError::CorruptLedger);
+    }
+    Ok(())
+}
+
+/// Derived caches are safe to discard and are epoch-bound. The projection DDL
+/// also declares permanent tombstones: only initialization/migration may create
+/// them; validation rejects a v5 ledger whose controls have disappeared.
+fn ensure_read_caches(c: &Connection) -> Result<()> {
+    let transaction = if c.is_autocommit() {
+        Some(c.unchecked_transaction()?)
+    } else {
+        None
+    };
+    c.execute_batch(include_str!("legacy_capture_schema.sql"))?;
+    c.execute_batch(include_str!("read_model_schema.sql"))?;
+    c.execute_batch(include_str!("source_projection_schema.sql"))?;
+    c.execute_batch(include_str!("minimax_model_schema.sql"))?;
+    let has_domain: bool = c
+        .prepare("PRAGMA table_info(source_projection_scopes)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "reader_domain");
+    if !has_domain {
+        c.execute_batch("ALTER TABLE source_projection_scopes ADD COLUMN reader_domain TEXT")?;
+    }
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn validate_v6(c: &Connection) -> Result<()> {
+    validate_versions(c, &[6, 7])?;
+    validate_v5_controls(c)?;
+    c.prepare("SELECT parent_observation_id,version,provenance,complete,member_count,manifest_hash,created_ms FROM durable_time_allocations LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
+    c.prepare("SELECT parent_observation_id,member_key,occurred_ms,metrics_json,cost_units,cost_scale FROM durable_time_members LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
+    let triggers:i64=c.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN('time_allocation_immutable','time_member_immutable','time_member_sealed','time_allocation_no_detach','time_member_no_detach')",[],|r|r.get(0))?;
+    if triggers != 5 {
+        return Err(LedgerError::CorruptLedger);
+    }
+    Ok(())
+}
+fn validate_v5_controls(c: &Connection) -> Result<()> {
+    c.prepare("SELECT root_id,table_name,row_key_hash FROM source_projection_tombstones LIMIT 0")
+        .map_err(|_| LedgerError::CorruptLedger)?;
+    Ok(())
 }
 fn validate_versions(c: &Connection, supported_schemas: &[i64]) -> Result<()> {
     let (schema,identity,normalization):(i64,i64,i64)=c.query_row("SELECT schema_version,identity_version,normalization_version FROM ledger_meta WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|LedgerError::CorruptLedger)?;
@@ -337,9 +721,54 @@ fn validate_versions(c: &Connection, supported_schemas: &[i64]) -> Result<()> {
     if bad != 0 {
         return Err(LedgerError::UpgradeRequiresDrain);
     }
-    let bad:i64=c.query_row("SELECT count(*) FROM source_roots WHERE identity_version<>1 OR parser_version<>'claude-ledger-v1'",[],|r|r.get(0))?;
-    if bad != 0 {
+    let versions: Vec<(String, String, i64)> = c
+        .prepare(
+            "SELECT identity_family,parser_version,identity_version FROM source_roots
+             UNION SELECT r.identity_family,o.parser_version,r.identity_version
+             FROM source_objects o JOIN source_roots r ON r.root_id=o.root_id",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if versions.iter().any(|(family, parser, identity)| {
+        !super::durable::supported_parser(family, parser, *identity)
+    }) {
         return Err(LedgerError::UnsupportedVersion);
+    }
+    let bad_checkpoint: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM source_objects WHERE checkpoint_format IS NOT NULL AND checkpoint_format NOT IN(1,2))", [], |r|r.get(0),
+    )?;
+    if bad_checkpoint {
+        return Err(LedgerError::UnsupportedVersion);
+    }
+    if schema >= 3 {
+        let versions: Vec<(String,String,i64,i64)> = c.prepare(
+            "SELECT DISTINCT r.identity_family,i.parser_version,i.identity_version,i.semantics_version FROM durable_imports i JOIN source_roots r ON r.root_id=i.root_id",
+        )?.query_map([], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+        if versions
+            .iter()
+            .any(|(family, parser, identity, semantics)| {
+                *semantics != 1 || !super::durable::supported_parser(family, parser, *identity)
+            })
+        {
+            return Err(LedgerError::UnsupportedVersion);
+        }
+    }
+    Ok(())
+}
+/// Historical parser/semantic versions are checked once at the read-only
+/// writer/restore boundary, before any DDL. Ordinary dashboard reads validate
+/// the current protocol metadata without rescanning the entire fact history.
+fn validate_historical_versions(c: &Connection) -> Result<()> {
+    let mut st = c.prepare("SELECT DISTINCT identity_family,parser_version,identity_version,semantics_version FROM usage_observations")?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        let family: String = r.get(0)?;
+        let parser: String = r.get(1)?;
+        let identity: i64 = r.get(2)?;
+        let semantics: i64 = r.get(3)?;
+        if semantics != 1 || !super::durable::supported_parser(&family, &parser, identity) {
+            return Err(LedgerError::UnsupportedVersion);
+        }
     }
     Ok(())
 }
@@ -383,8 +812,16 @@ impl Ledger {
             let c = Connection::open_with_flags(&temp, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
             c.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
             c.execute_batch(include_str!("schema.sql"))?;
+            c.execute_batch(include_str!("durable_schema.sql"))?;
+            c.execute_batch(include_str!("coverage_schema.sql"))?;
+            c.execute_batch(include_str!("runtime_schema.sql"))?;
+            c.execute_batch(include_str!("durable_snapshots_schema.sql"))?;
+            c.execute_batch(include_str!("adoption_schema.sql"))?;
+            c.execute_batch(include_str!("time_allocation_schema.sql"))?;
+            c.execute_batch(include_str!("time_repair_schema.sql"))?;
+            ensure_read_caches(&c)?;
             c.execute(
-                "INSERT INTO ledger_meta VALUES(1,2,?1,?2,0,1,1,1,?3,?4,?5)",
+                "INSERT INTO ledger_meta VALUES(1,7,?1,?2,0,1,1,1,?3,?4,?5)",
                 rusqlite::params![
                     new_epoch(),
                     new_epoch(),
@@ -456,6 +893,7 @@ impl Ledger {
             _writer: writer,
             optimize_next: Instant::now(),
             optimize_first: true,
+            claude_readers: None,
         })
     }
     pub fn connection(&self) -> &Connection {
@@ -571,8 +1009,16 @@ pub fn live_connection(timezone: &str) -> Result<Connection> {
     super::metrics::timezone(timezone)?;
     let c = Connection::open_in_memory()?;
     c.execute_batch(include_str!("schema.sql"))?;
+    c.execute_batch(include_str!("durable_schema.sql"))?;
+    c.execute_batch(include_str!("coverage_schema.sql"))?;
+    c.execute_batch(include_str!("runtime_schema.sql"))?;
+    c.execute_batch(include_str!("durable_snapshots_schema.sql"))?;
+    c.execute_batch(include_str!("adoption_schema.sql"))?;
+    c.execute_batch(include_str!("time_allocation_schema.sql"))?;
+    c.execute_batch(include_str!("time_repair_schema.sql"))?;
+    ensure_read_caches(&c)?;
     c.execute(
-        "INSERT INTO ledger_meta VALUES(1,2,?1,?2,0,1,1,1,?3,?4,?5)",
+        "INSERT INTO ledger_meta VALUES(1,7,?1,?2,0,1,1,1,?3,?4,?5)",
         rusqlite::params![
             new_epoch(),
             new_epoch(),

@@ -16,7 +16,7 @@ use std::{
     fs::{self, File, Metadata},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const SLICE_BYTES: u64 = 4 * 1024 * 1024;
@@ -32,6 +32,8 @@ pub struct RefreshSummary {
     pub verification_bytes: u64,
     pub identity_probes: u64,
     pub identity_probe_bytes: u64,
+    /// Reader heartbeats during bounded prefix/identity verification.
+    pub reader_progress: u64,
     pub inserted: u64,
     pub duplicates: u64,
     pub suppressed: u64,
@@ -286,7 +288,19 @@ impl Ledger {
             |r| r.get(0),
         )?;
         let inserted=tx.execute("INSERT INTO source_roots(root_id,identity_family,namespace_key,collector_key,report_source,native_tool,locator,enabled,identity_version,parser_version,route) VALUES(?1,'claude','unknown:claude','claude','claude','claude',?2,?5,1,?3,?4) ON CONFLICT DO NOTHING",params![id,locator,PARSER_VERSION,route,enabled])?;
-        if inserted > 0 {
+        // The finality-aware parser re-observes old files, but never rewrites
+        // published selections. Missing old files retain their saved evidence.
+        let upgraded = tx.execute(
+            "UPDATE source_roots SET parser_version=?2,enumeration_done=0 WHERE root_id=?1 AND parser_version='claude-ledger-v1'",
+            params![id, PARSER_VERSION],
+        )?;
+        if upgraded > 0 {
+            tx.execute(
+                "UPDATE source_objects SET parser_version=?2,state='replay_required',saved_offset=NULL,checkpoint_format=NULL,checkpoint=NULL,target_done=0,quick_fingerprint=NULL,object_revision=object_revision+1 WHERE root_id=?1",
+                params![id, PARSER_VERSION],
+            )?;
+        }
+        if inserted > 0 || upgraded > 0 {
             super::db::bump(&tx)?;
         }
         tx.commit()?;
@@ -294,25 +308,62 @@ impl Ledger {
     }
     /// A synchronous bounded scheduler; no full-history UsageRecord collection is created.
     pub fn refresh_claude(&mut self, roots: &[PathBuf], full: bool) -> Result<RefreshSummary> {
-        self.refresh_claude_inner(roots, full, true)
+        self.refresh_claude_inner(roots, full, true, None)
     }
     /// Polling honors backoff; explicit refresh bypasses it once without clearing failure history.
     pub fn poll_claude(&mut self, roots: &[PathBuf]) -> Result<RefreshSummary> {
-        self.refresh_claude_inner(roots, false, false)
+        self.refresh_claude_inner(roots, false, false, None)
+    }
+    /// Yield without cancelling stream readers or discarding their prefix hash.
+    pub fn poll_claude_budgeted(
+        &mut self,
+        roots: &[PathBuf],
+        budget: Duration,
+    ) -> Result<RefreshSummary> {
+        self.refresh_claude_inner(
+            roots,
+            false,
+            false,
+            Some(budget.max(Duration::from_millis(1))),
+        )
     }
     fn refresh_claude_inner(
         &mut self,
         roots: &[PathBuf],
         full: bool,
         explicit: bool,
+        budget: Option<Duration>,
     ) -> Result<RefreshSummary> {
         self.require_writer()?;
-        self.publish_pending()?;
+        let mut summary = RefreshSummary::default();
+        if let Some(state) = self.claude_readers.as_ref() {
+            let epoch: String = self.conn.query_row(
+                "SELECT epoch FROM ledger_meta WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?;
+            if state.epoch != epoch {
+                if let Some(state) = self.claude_readers.take() {
+                    state.cancel(&self.path);
+                }
+            }
+        }
+        if self.claude_readers.is_some() {
+            self.drain_readers(&mut summary, budget)?;
+            if budget.is_some() {
+                summary.pending=self.conn.query_row("SELECT COUNT(*) FROM source_objects o JOIN source_roots r USING(root_id) WHERE r.report_source='claude' AND (o.target_done=0 OR o.state IN('error','replay_required'))",[],|r|r.get::<_,i64>(0))? as u64;
+                return Ok(summary);
+            }
+        }
+        if budget.is_some() {
+            self.publish_some(100)?;
+        } else {
+            self.publish_pending()?;
+        }
         for root in roots {
             self.register_claude_root(root)?;
         }
         let registered:Vec<(String,String,bool,Option<i64>)>=self.conn.prepare("SELECT root_id,locator,enabled,retry_after_ms FROM source_roots WHERE identity_family='claude' AND namespace_key='unknown:claude' ORDER BY root_id")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
-        let mut summary = RefreshSummary::default();
         self.conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS acquisition_seen(object_id INTEGER PRIMARY KEY,probe_attempted INTEGER NOT NULL DEFAULT 0); DELETE FROM acquisition_seen; CREATE TEMP TABLE IF NOT EXISTS acquisition_queue(object_id INTEGER PRIMARY KEY,root_id TEXT NOT NULL,turn INTEGER NOT NULL,audit INTEGER NOT NULL,deferred INTEGER NOT NULL DEFAULT 0);DELETE FROM acquisition_queue;CREATE TEMP TABLE IF NOT EXISTS acquisition_proofs(object_id INTEGER PRIMARY KEY,prefix_len INTEGER NOT NULL,digest BLOB NOT NULL,target_len INTEGER NOT NULL,target_mtime INTEGER);DELETE FROM acquisition_proofs;CREATE INDEX IF NOT EXISTS temp.acquisition_queue_turn ON acquisition_queue(deferred,turn,root_id,object_id);")?;
         for (root_id, locator, enabled, retry) in registered {
             if !enabled {
@@ -380,7 +431,7 @@ impl Ledger {
             // SQL retains the pending set; file count never becomes an in-memory Object Vec.
             self.conn.execute("INSERT OR IGNORE INTO acquisition_queue(object_id,root_id,turn,audit) SELECT object_id,root_id,?2+object_id,?3 FROM source_objects WHERE root_id=?1 AND state<>'missing' AND target_done=0 AND object_id NOT IN(SELECT object_id FROM acquisition_seen) AND (?4 OR retry_after_ms IS NULL OR retry_after_ms<=?5)",params![root_id,turn,full,explicit,now_ms()])?;
         }
-        self.drain_readers(&mut summary)?;
+        self.drain_readers(&mut summary, budget)?;
         summary.pending=self.conn.query_row("SELECT COUNT(*) FROM source_objects o JOIN source_roots r USING(root_id) WHERE r.report_source='claude' AND (o.target_done=0 OR o.state IN('error','replay_required'))",[],|r|r.get::<_,i64>(0))? as u64;
         Ok(summary)
     }
@@ -428,8 +479,8 @@ impl Ledger {
                 // enter the ledger; a rewrite takes the existing replay path.
                 if !full
                     && o.state == "ready"
-                    && o.done
-                    && o.offset == o.len
+                    && o.offset > 0
+                    && (o.done || self.stream_checkpoint(&o)?.is_some())
                     && o.len >= PREFIX_SEAL_MIN_BYTES
                     && len > o.len
                     && o.audit_due > now_ms()
@@ -439,12 +490,17 @@ impl Ledger {
                         [o.id],
                         |r| r.get(0),
                     )?;
+                    let seal = if o.done {
+                        seal
+                    } else {
+                        seal.or(self.stream_checkpoint(&o)?.map(|s| s.digest))
+                    };
                     if let Some(seal) = seal {
                         // Keep the durable old checkpoint untouched until a reader
                         // proves it. A crash only loses this temporary plan.
                         self.conn.execute(
                             "INSERT INTO acquisition_proofs VALUES(?1,?2,?3,?4,?5)",
-                            params![o.id, o.len, seal, len, mtime],
+                            params![o.id, o.offset, seal, len, mtime],
                         )?;
                         o.done = false;
                         return Ok(o);
@@ -490,6 +546,7 @@ impl Ledger {
                     // In-memory SHA state cannot survive a crash/cancel. Replay a
                     // partial large file instead of certifying an unproved prefix.
                     || (!o.done && o.offset > 0 && o.len >= PREFIX_SEAL_MIN_BYTES
+                        && self.stream_checkpoint(&o)?.is_none()
                         && (explicit || !o.retry.is_some_and(|t| t > now_ms())))
                 {
                     self.conn.execute("UPDATE source_objects SET object_revision=object_revision+1,saved_offset=0,checkpoint_format=1,checkpoint=?2,target_generation=content_generation,target_end=byte_length,target_done=0,quick_fingerprint=NULL WHERE object_id=?1",params![o.id,checkpoint(&o.generation,0)])?;
@@ -565,6 +622,28 @@ impl Ledger {
         self.conn.execute("UPDATE source_objects SET state='error',error_code=?2,target_done=0,failure_count=?3,retry_after_ms=?4 WHERE object_id=?1",params![id,e.code(),n,now_ms()+backoff(n)])?;
         Ok(())
     }
+    fn stream_checkpoint(&self, o: &Object) -> Result<Option<reader::SavedStreamState>> {
+        let Some(v) =
+            super::collection::runtime_value(&self.conn, &format!("claude-stream/{}", o.id))?
+        else {
+            return Ok(None);
+        };
+        let epoch: String =
+            self.conn
+                .query_row("SELECT epoch FROM ledger_meta WHERE singleton=1", [], |r| {
+                    r.get(0)
+                })?;
+        if v["generation"] != o.generation || v["epoch"] != epoch {
+            return Ok(None);
+        }
+        let state: reader::SavedStreamState =
+            serde_json::from_value(v["state"].clone()).map_err(|_| LedgerError::CorruptLedger)?;
+        if state.offset != o.offset as u64 {
+            return Ok(None);
+        }
+        Ok(Some(state))
+    }
+    #[allow(clippy::too_many_arguments)] // Evidence and its resumable proof commit together.
     fn save_batch(
         &mut self,
         o: &mut Object,
@@ -572,6 +651,7 @@ impl Ledger {
         observations: &[Observation],
         offset: i64,
         done: bool,
+        stream_state: Option<&reader::SavedStreamState>,
         summary: &mut RefreshSummary,
     ) -> Result<()> {
         if observations.is_empty() && offset == o.offset && !done {
@@ -619,6 +699,16 @@ impl Ledger {
             super::maintenance::finish_incoming_suppression(&tx)?;
         }
         let new_revision:i64=tx.query_row("UPDATE source_objects SET saved_offset=?2,checkpoint_format=1,checkpoint=?3,object_revision=object_revision+1,target_done=?4,state=CASE WHEN ?4 OR state='replay_required' THEN 'ready' ELSE state END,error_code=CASE WHEN ?4 THEN NULL ELSE error_code END,failure_count=CASE WHEN ?4 THEN 0 ELSE failure_count END,retry_after_ms=CASE WHEN ?4 THEN NULL ELSE retry_after_ms END WHERE object_id=?1 RETURNING object_revision",params![o.id,offset,checkpoint(&o.generation,offset),done],|r|r.get(0))?;
+        if let Some(state) = stream_state {
+            if state.offset != offset as u64 {
+                return Err(LedgerError::StaleObservation);
+            }
+            super::collection::put_runtime_value(
+                &tx,
+                &format!("claude-stream/{}", o.id),
+                &serde_json::json!({"version":2,"generation":o.generation,"epoch":epoch,"state":state}),
+            )?;
+        }
         super::db::bump(&tx)?;
         super::types::regression_stop("t2_before_commit");
         tx.commit()?;
@@ -672,11 +762,17 @@ impl Ledger {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM source_objects o JOIN source_roots r USING(root_id) JOIN ledger_meta m ON m.singleton=1 WHERE o.object_id=?1 AND o.object_revision=?2 AND o.content_generation=?3 AND m.epoch=?4 AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?5 AND o.parser_version=?5 AND o.saved_offset=?6 AND o.byte_length=?6 AND o.quick_fingerprint=?7 AND o.target_done=1)",params![o.id,o.revision,o.generation,task.epoch,PARSER_VERSION,proof.len,proof.digest],|r|r.get(0))?;
+        let persisted=proof.resume.as_ref().map(|state|serde_json::json!({"version":2,"generation":o.generation,"epoch":task.epoch,"state":state}).to_string());
+        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM source_objects o JOIN source_roots r USING(root_id) JOIN ledger_meta m ON m.singleton=1 WHERE o.object_id=?1 AND o.object_revision=?2 AND o.content_generation=?3 AND m.epoch=?4 AND r.enabled=1 AND r.identity_version=1 AND r.parser_version=?5 AND o.parser_version=?5 AND o.saved_offset=?6 AND ((o.byte_length=?6 AND o.quick_fingerprint=?7 AND o.target_done=1) OR (o.target_done=0 AND o.byte_length>=?6 AND o.byte_length<=?9 AND EXISTS(SELECT 1 FROM ledger_runtime_state s WHERE s.state_key='claude-stream/'||o.object_id AND s.value_json=?8))))",params![o.id,o.revision,o.generation,task.epoch,PARSER_VERSION,proof.len,proof.digest,persisted,o.len],|r|r.get(0))?;
         if !valid {
             return Err(LedgerError::StaleObservation);
         }
-        if o.len != proof.len {
+        let changed_target: bool = tx.query_row(
+            "SELECT byte_length<>?2 OR mtime_ns IS NOT ?3 FROM source_objects WHERE object_id=?1",
+            params![o.id, o.len, o.mtime],
+            |r| r.get(0),
+        )?;
+        if changed_target {
             tx.execute("UPDATE source_objects SET byte_length=?2,mtime_ns=?3,object_revision=object_revision+1,target_generation=content_generation,target_end=?2,target_done=0,last_observed_ms=?4,error_code=NULL,retry_after_ms=NULL,quick_fingerprint=NULL WHERE object_id=?1",params![o.id,o.len,o.mtime,now_ms()])?;
             super::db::bump(&tx)?;
             o.revision += 1;
@@ -787,7 +883,22 @@ fn is_source_error(e: &LedgerError) -> bool {
 
 /// Exact rules only. A session rule removes accumulated session facts, not unrelated requests.
 pub(crate) fn exact_suppressed(conn: &rusqlite::Connection, o: &Observation) -> Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE (kind='source' AND report_source=?1 AND native_tool=?2) OR (kind='window' AND (?1=report_source OR report_source IS NULL) AND (?2=native_tool OR native_tool IS NULL) AND ?3>=start_ms AND ?3<end_ms) OR (kind='identity' AND identity_family=?4 AND namespace_key=?5 AND identity_key=?6) OR (kind='session' AND identity_family=?4 AND namespace_key=?5 AND session_key=?7 AND ?8 IN('session_total','session_cost')))",params![o.report_source,o.native_tool,o.occurred_ms,o.identity_family,o.namespace_key,o.identity_key,o.session_key,o.fact_kind],|r|r.get(0))?)
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM suppression_rules s WHERE
+         (s.kind='source' AND s.report_source=?1 AND (s.native_tool IS NULL OR s.native_tool=?2))
+         OR (s.kind='window' AND (s.report_source IS NULL OR s.report_source=?1)
+             AND (s.native_tool IS NULL OR s.native_tool=?2)
+             AND ((?3>=s.start_ms AND ?3<s.end_ms) OR (?9<s.end_ms AND ?10>s.start_ms)))
+         OR (s.kind='identity' AND s.identity_family=?4 AND s.namespace_key=?5
+             AND s.identity_key=?6)
+         OR (s.kind='session' AND s.identity_family=?4 AND s.namespace_key=?5 AND s.session_key=?7 AND ?8 IN('session_total','session_cost'))
+         OR (s.kind='consumption_interval' AND s.native_tool=?2 AND s.namespace_key=?5
+             AND ((?3>=s.start_ms AND ?3<s.end_ms) OR (?9<s.end_ms AND ?10>s.start_ms))))
+         OR EXISTS(SELECT 1 FROM adoption_forget_ranges f WHERE f.consumer_tool=?2
+             AND (f.identity_family IS NULL OR (f.identity_family=?4 AND f.namespace_key=?5))
+             AND ((?3>=f.start_ms AND ?3<f.end_ms) OR (?9<f.end_ms AND ?10>f.start_ms)))",
+        params![o.report_source,o.native_tool,o.occurred_ms,o.identity_family,o.namespace_key,o.identity_key,o.session_key,o.fact_kind,o.day_start_ms,o.day_end_ms], |r|r.get(0),
+    )?)
 }
 fn weak_link(conn: &rusqlite::Connection, o: &Observation) -> Result<bool> {
     if exact_suppressed(conn, o)? || o.fact_kind != "request" {
@@ -1445,6 +1556,24 @@ struct ActiveRead {
     proof: Option<reader::PrefixProof>,
     proof_verified: bool,
 }
+pub(crate) struct ReaderSliceState {
+    epoch: String,
+    active: std::collections::BTreeMap<String, ActiveRead>,
+    audit_state: Option<(i64, Sha256, i64)>,
+    identity_inflight: bool,
+    next_turn: i64,
+}
+impl ReaderSliceState {
+    pub(crate) fn cancel(self, path: &Path) {
+        let mut pool = reader::pool();
+        for task in self.active.keys() {
+            let _ = pool.cancel(task);
+        }
+        if pool.owner.as_deref() == Some(path) {
+            pool.owner = None;
+        }
+    }
+}
 impl Ledger {
     fn requeue_object(
         &self,
@@ -1457,21 +1586,65 @@ impl Ledger {
         self.conn.execute("INSERT OR REPLACE INTO acquisition_queue(object_id,root_id,turn,audit,deferred) VALUES(?1,?2,?3,?4,?5)", params![object.id,object.root,*turn,audit,deferred])?;
         Ok(())
     }
-    fn drain_readers(&mut self, summary: &mut RefreshSummary) -> Result<()> {
+    fn drain_readers(
+        &mut self,
+        summary: &mut RefreshSummary,
+        budget: Option<Duration>,
+    ) -> Result<()> {
+        let started = Instant::now();
         let mut pool = reader::pool();
-        let mut active = std::collections::BTreeMap::<String, ActiveRead>::new();
-        let mut audit_state: Option<(i64, Sha256, i64)> = None;
-        // At most one exceptional probe occupies a slot; the other native slot
-        // remains available to save and publish healthy objects.
-        let mut identity_inflight = false;
-        // Compute once: the dispatch index starts with `deferred`, so querying
-        // MAX(turn) on every slice would repeatedly scan the whole disk queue.
-        let mut next_turn: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(turn),0) FROM acquisition_queue",
-            [],
-            |r| r.get(0),
-        )?;
+        if pool
+            .owner
+            .as_deref()
+            .is_some_and(|owner| owner != self.path.as_path())
+        {
+            return Err(LedgerError::Busy);
+        }
+        pool.owner = None;
+        let epoch: String =
+            self.conn
+                .query_row("SELECT epoch FROM ledger_meta WHERE singleton=1", [], |r| {
+                    r.get(0)
+                })?;
+        let (mut active, mut audit_state, mut identity_inflight, mut next_turn) =
+            if let Some(mut state) = self.claude_readers.take() {
+                // The writer deliberately paused with a bounded event queue. That
+                // pause is backpressure, not a source's five-second I/O timeout.
+                for task in state.active.values_mut() {
+                    task.last_activity = Instant::now();
+                }
+                (
+                    state.active,
+                    state.audit_state,
+                    state.identity_inflight,
+                    state.next_turn,
+                )
+            } else {
+                let turn = self.conn.query_row(
+                    "SELECT COALESCE(MAX(turn),0) FROM acquisition_queue",
+                    [],
+                    |r| r.get(0),
+                )?;
+                (
+                    std::collections::BTreeMap::<String, ActiveRead>::new(),
+                    None,
+                    false,
+                    turn,
+                )
+            };
         loop {
+            if budget.is_some_and(|limit| started.elapsed() >= limit) {
+                pool.owner = Some(self.path.clone());
+                self.claude_readers = Some(ReaderSliceState {
+                    epoch,
+                    active,
+                    audit_state,
+                    identity_inflight,
+                    next_turn,
+                });
+                return Ok(());
+            }
+
             while active.len() < pool.slots {
                 let can_probe = !identity_inflight
                     && (pool.helper_available()
@@ -1487,11 +1660,25 @@ impl Ledger {
                 }
                 let mut object=self.conn.query_row("SELECT object_id,root_id,locator,content_generation,byte_length,mtime_ns,object_revision,COALESCE(saved_offset,0),target_done,state,retry_after_ms,audit_due_ms FROM source_objects WHERE object_id=?1",[id],object_row)?;
                 let plan: Option<(i64,Vec<u8>,i64,Option<i64>)> = self.conn.query_row("SELECT prefix_len,digest,target_len,target_mtime FROM acquisition_proofs WHERE object_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-                let proof = plan.map(|(len, digest, target_len, mtime)| {
+                let resume = self.stream_checkpoint(&object)?;
+                let mut proof = plan.map(|(len, digest, target_len, mtime)| {
                     object.len = target_len;
                     object.mtime = mtime;
-                    reader::PrefixProof { len, digest }
+                    reader::PrefixProof {
+                        len,
+                        digest,
+                        resume: resume.clone(),
+                    }
                 });
+                if proof.is_none() && object.offset > 0 {
+                    if let Some(saved) = resume {
+                        proof = Some(reader::PrefixProof {
+                            len: object.offset,
+                            digest: saved.digest.clone(),
+                            resume: Some(saved),
+                        });
+                    }
+                }
                 let epoch: String = self.conn.query_row(
                     "SELECT epoch FROM ledger_meta WHERE singleton=1",
                     [],
@@ -1570,6 +1757,7 @@ impl Ledger {
                 task.last_activity = Instant::now();
                 match event {
                     reader::Event::Progress { .. } => {
+                        summary.reader_progress += 1;
                         active.insert(key, task);
                     }
                     reader::Event::Prefix {
@@ -1642,6 +1830,7 @@ impl Ledger {
                         observations,
                         offset,
                         audit_bytes,
+                        stream_state,
                         ignored,
                         version,
                         ..
@@ -1719,6 +1908,7 @@ impl Ledger {
                                 &observations,
                                 offset,
                                 done,
+                                stream_state.as_ref(),
                                 summary,
                             )?;
                             if let Some(bytes) = audit_bytes {
@@ -1923,7 +2113,11 @@ impl Ledger {
                 return Err(LedgerError::IncompleteEvidence);
             }
         }
-        self.publish_pending()?;
+        if budget.is_some() {
+            self.publish_some(100)?;
+        } else {
+            self.publish_pending()?;
+        }
         Ok(())
     }
 }
@@ -2053,6 +2247,7 @@ pub fn stream_guard_regression(
         proof: Some(reader::PrefixProof {
             len: object.len,
             digest: digest.clone(),
+            resume: None,
         }),
         object,
         epoch,
@@ -2076,6 +2271,7 @@ pub fn stream_guard_regression(
                 &[],
                 offset,
                 true,
+                None,
                 &mut RefreshSummary::default(),
             )
         }
