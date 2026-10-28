@@ -481,6 +481,9 @@ pub fn load_completed_saved_sources(
     }
     merged.entries.extend(fresh.entries);
     merged.sources.extend(fresh.sources);
+    // retain+extend 可能等量替换(长度守卫盲区),本函数自建索引以防未来出现
+    // 不经 serve 合并路径就直接查询返回值的调用方(评审B P2-2;幂等,一次性代价)。
+    merged.build_index();
     Ok(merged)
 }
 fn load_legacy_inner(

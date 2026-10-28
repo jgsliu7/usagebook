@@ -462,7 +462,8 @@ impl LegacySnapshot {
     }
     /// 全量重建查询索引。调用纪律(方案 §3.4):load_legacy 装配末尾一次;
     /// serve 失败源合并(merge_failed_sources 改动 entries)之后、指纹/publish
-    /// 之前一次。任何未来在两构建点之外 mutate entries 的代码必须自带重建。
+    /// 之前一次;restore_capture_source 恢复 entries 后一次(共三处)。
+    /// 任何未来在这三处之外 mutate entries 的代码必须自带重建。
     pub fn build_index(&mut self) {
         let mut index = LegacyIndex {
             built_entries: self.entries.len(),
@@ -684,7 +685,8 @@ impl LegacySnapshot {
             // total (or an impossible subset). Query output uses this evaluator too.
             if super::metrics::evaluate(&fields).is_err() {
                 dropped += 1;
-                first_reason.get_or_insert("legacy usage exceeds signed 64-bit");
+                // evaluate 除溢出外还会拒绝负值/不可能子集,文案不得只标溢出(评审B P2-1)
+                first_reason.get_or_insert("legacy usage invalid for aggregation");
                 continue;
             }
             accepted.push(match record.caliber {
@@ -1072,7 +1074,7 @@ mod fingerprint_tests {
     type SnapMutator = (&'static str, Box<dyn Fn(&mut LegacySnapshot)>);
     /// 字段突变表规模守卫:新增 LegacyEntry/LegacyDay/UsageRecord/LegacySourceStatus
     /// 字段或新增 mutator 时必须同步更新(防止测试被静默削减)。
-    const EXPECTED_MUTATORS: usize = 41;
+    const EXPECTED_MUTATORS: usize = 45;
 
     fn rec() -> UsageRecord {
         UsageRecord {
@@ -1271,6 +1273,26 @@ mod fingerprint_tests {
                     }
                 }),
             ),
+            // 20261028 合流新增编码字段(远端 SessionTotal 结构):None→Some 翻转
+            // 判别位;载荷级鉴别由 fingerprint_distinguishes_option_payloads 覆盖。
+            (
+                "sess.projection",
+                Box::new(|e| {
+                    if let LegacyEntry::SessionTotal { projection, .. } = e {
+                        let mut slots = [None; 10];
+                        slots[3] = Some(7);
+                        *projection = Some(slots);
+                    }
+                }),
+            ),
+            (
+                "sess.reason",
+                Box::new(|e| {
+                    if let LegacyEntry::SessionTotal { reason, .. } = e {
+                        *reason = Some("r".into());
+                    }
+                }),
+            ),
         ]
     }
     fn snap_mutations() -> Vec<SnapMutator> {
@@ -1299,6 +1321,19 @@ mod fingerprint_tests {
                 "sources.last_scanned_ms",
                 Box::new(|s| {
                     s.sources.get_mut("claude").unwrap().last_scanned_ms = None;
+                }),
+            ),
+            // 20261028 合流新增编码字段(远端诊断计数)
+            (
+                "sources.unaccounted_rows",
+                Box::new(|s| {
+                    s.sources.get_mut("claude").unwrap().unaccounted_rows = 3;
+                }),
+            ),
+            (
+                "sources.unallocated_sessions",
+                Box::new(|s| {
+                    s.sources.get_mut("claude").unwrap().unallocated_sessions = 2;
                 }),
             ),
             (
