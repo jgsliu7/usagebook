@@ -124,6 +124,65 @@ fn begins_history_cycle(scan: Option<bool>, backlog: bool) -> bool {
     // force request or a newly idle periodic cycle starts another full audit.
     scan.is_some() && (!backlog || scan == Some(true))
 }
+/// serve 失败源合并(2026-10-28 合流:判据与回滚为远端演进版,自扫描闭包提取保持可测)。
+/// 输入容器缺失先标失败;stale/error 源回滚为上一轮完整读,上一轮无完整时间戳则
+/// 不回滚(失败不得伪装成成功空读);诊断计数与 warning 随上一轮保留。
+/// `warning`(按源降级:该源有单条坏行被跳过)不在失败判据中:坏行降级的源保留
+/// 本轮新鲜好数据,不回滚(见 docs/features/20261023-live快照管线加固与查询提速)。
+fn merge_failed_sources(snapshot: &mut LegacySnapshot, previous_for_merge: &LegacySnapshot) {
+    for (source, status) in &mut snapshot.sources {
+        if previous_for_merge.has_missing_input_containers(source) {
+            status.stale = true;
+            if status.error.as_deref() != Some("LOADING") {
+                status.error = Some("SOURCE_READ_FAILED".into());
+            }
+        }
+    }
+    let failed: Vec<String> = snapshot
+        .sources
+        .iter()
+        // A successful empty read replaces old rows. Only
+        // an explicit source failure may retain prior data.
+        .filter(|(_, status)| status.stale || status.error.is_some())
+        .map(|(source, _)| source.clone())
+        .collect();
+    for source in failed {
+        // Only a complete read supplies a successful timestamp.
+        // LOADING and first-failure placeholders are not retained
+        // data; a successful empty read is still a complete result.
+        let previous_complete = previous_for_merge
+            .sources
+            .get(&source)
+            .filter(|status| status.last_scanned_ms.is_some());
+        snapshot.entries.retain(|row| row.report_source() != source);
+        if previous_complete.is_some() {
+            snapshot.retain_input_containers(&source, previous_for_merge);
+            snapshot.entries.extend(
+                previous_for_merge
+                    .entries
+                    .iter()
+                    .filter(|row| row.report_source() == source)
+                    .cloned(),
+            );
+        }
+        if let Some(status) = snapshot.sources.get_mut(&source) {
+            // These rows still belong to the previous successful read.
+            // A failed attempt must not make retained data look current.
+            status.last_scanned_ms =
+                previous_complete.and_then(|previous| previous.last_scanned_ms);
+            if let Some(previous) = previous_complete {
+                status.unaccounted_rows = previous.unaccounted_rows;
+                status.unallocated_sessions = previous.unallocated_sessions;
+                status.warning = previous.warning.clone();
+            }
+            status.stale = true;
+            if status.error.as_deref() != Some("LOADING") {
+                status.error = Some("SOURCE_READ_FAILED".into());
+            }
+        }
+    }
+}
+
 struct Assets {
     index_html: String,
     dashboard_js: String,
@@ -250,6 +309,7 @@ pub fn run(
                 error: Some("LOADING".into()),
                 unaccounted_rows: 0,
                 unallocated_sessions: 0,
+                warning: None,
             });
     }
     let shared = Arc::new(Mutex::new(State {
@@ -471,56 +531,11 @@ pub fn run(
                             // The interim LOADING snapshot may carry a new route hash while
                             // still containing old live rows. Merge only against the snapshot
                             // captured before that transition, and only for sources still live.
-                            for (source, status) in &mut snapshot.sources {
-                                if previous_for_merge.has_missing_input_containers(source) {
-                                    status.stale = true;
-                                    if status.error.as_deref() != Some("LOADING") {
-                                        status.error = Some("SOURCE_READ_FAILED".into());
-                                    }
-                                }
-                            }
-                            let failed: Vec<String> = snapshot
-                                .sources
-                                .iter()
-                                // A successful empty read replaces old rows. Only
-                                // an explicit source failure may retain prior data.
-                                .filter(|(_, status)| status.stale || status.error.is_some())
-                                .map(|(source, _)| source.clone())
-                                .collect();
-                            for source in failed {
-                                // Only a complete read supplies a successful timestamp.
-                                // LOADING and first-failure placeholders are not retained
-                                // data; a successful empty read is still a complete result.
-                                let previous_complete = previous_for_merge
-                                    .sources
-                                    .get(&source)
-                                    .filter(|status| status.last_scanned_ms.is_some());
-                                snapshot.entries.retain(|row| row.report_source() != source);
-                                if previous_complete.is_some() {
-                                    snapshot.retain_input_containers(&source, &previous_for_merge);
-                                    snapshot.entries.extend(
-                                        previous_for_merge
-                                            .entries
-                                            .iter()
-                                            .filter(|row| row.report_source() == source)
-                                            .cloned(),
-                                    );
-                                }
-                                if let Some(status) = snapshot.sources.get_mut(&source) {
-                                    // These rows still belong to the previous successful read.
-                                    // A failed attempt must not make retained data look current.
-                                    status.last_scanned_ms = previous_complete
-                                        .and_then(|previous| previous.last_scanned_ms);
-                                    if let Some(previous) = previous_complete {
-                                        status.unaccounted_rows = previous.unaccounted_rows;
-                                        status.unallocated_sessions = previous.unallocated_sessions;
-                                    }
-                                    status.stale = true;
-                                    if status.error.as_deref() != Some("LOADING") {
-                                        status.error = Some("SOURCE_READ_FAILED".into());
-                                    }
-                                }
-                            }
+                            merge_failed_sources(&mut snapshot, &previous_for_merge);
+                            // 合并可能改动 entries(retain+extend),索引必须在其后、
+                            // 指纹/publish 之前重建(方案 M2 双构建点之二)。后续
+                            // ledger 续跑对 snapshot 条目只读,不再变动 entries。
+                            snapshot.build_index();
                             if let Some(ledger) = writer.as_mut() {
                                 ledger
                                     .reconcile_and_activate_sources(&snapshot, None)
@@ -968,5 +983,95 @@ fn handle(mut req: Request, conn: &rusqlite::Connection, ctx: &ServerContext) {
             "application/json; charset=utf-8",
             e.http_status(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use usagebook_core::ledger::legacy::{LegacyEntry, LegacySourceStatus};
+    use usagebook_core::model::{Caliber, UsageRecord};
+
+    fn entry(source: &'static str, ts: i64) -> LegacyEntry {
+        LegacyEntry::Request {
+            record: UsageRecord {
+                source,
+                session_id: "s".into(),
+                agent: None,
+                model: "m".into(),
+                ts_ms: ts,
+                caliber: Caliber::RequestDelta,
+                input_uncached: 1,
+                cache_read: 0,
+                cache_write: 0,
+                cache_write_1h: 0,
+                output: 0,
+                reasoning_output: 0,
+                cost_usd: None,
+                request_count: 1,
+                dedup_key: format!("k-{ts}"),
+            },
+            native_tool: source.into(),
+            namespace: None,
+            known_fields: 0,
+        }
+    }
+
+    fn snap_of(source: &'static str, ts: i64) -> LegacySnapshot {
+        let mut s = LegacySnapshot::new("g".into(), "r".into());
+        s.entries.push(entry(source, ts));
+        s.sources.insert(
+            source.into(),
+            LegacySourceStatus {
+                last_scanned_ms: Some(1),
+                stale: false,
+                error: None,
+                unaccounted_rows: 0,
+                unallocated_sessions: 0,
+                warning: None,
+            },
+        );
+        s
+    }
+
+    fn ts_of(s: &LegacySnapshot, source: &str) -> i64 {
+        s.entries
+            .iter()
+            .find(|e| e.report_source() == source)
+            .map(|e| match e {
+                LegacyEntry::Request { record, .. } | LegacyEntry::SessionTotal { record, .. } => {
+                    record.ts_ms
+                }
+                LegacyEntry::Day(_) => -1,
+            })
+            .unwrap_or(-1)
+    }
+
+    #[test]
+    fn warning_only_source_keeps_fresh_entries() {
+        let previous = snap_of("claude", 1);
+        let mut current = snap_of("claude", 2);
+        current.sources.get_mut("claude").unwrap().warning =
+            Some("skipped 1 record(s); first: legacy model exceeds 1024 bytes".into());
+        merge_failed_sources(&mut current, &previous);
+        assert_eq!(ts_of(&current, "claude"), 2, "降级源的新鲜好数据不得回滚");
+        let st = &current.sources["claude"];
+        assert!(
+            st.error.is_none() && !st.stale,
+            "不得标为 SOURCE_READ_FAILED"
+        );
+        assert!(st.warning.is_some(), "warning 在合并后幸存");
+    }
+
+    #[test]
+    fn error_source_rolls_back_to_previous() {
+        let previous = snap_of("claude", 1);
+        let mut current = snap_of("claude", 2);
+        current.sources.get_mut("claude").unwrap().error = Some("boom".into());
+        merge_failed_sources(&mut current, &previous);
+        assert_eq!(ts_of(&current, "claude"), 1, "真失败源回滚到上一轮条目");
+        let st = &current.sources["claude"];
+        assert_eq!(st.error.as_deref(), Some("SOURCE_READ_FAILED"));
+        assert!(st.stale);
     }
 }

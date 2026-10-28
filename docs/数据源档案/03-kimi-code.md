@@ -144,7 +144,7 @@
 - **Kimi Work ≠ Kimi Code**(两个产品):Work = 桌面版知识工作平台(内置智能体代号 daimon);Code = 编程 CLI。但 daimon 的执行引擎**内嵌完整 kimi-code 运行时**,数据路径自证:`…/daimon-share/daimon/runtime/kimi-code/home`。
 - **桌面版数据根(macOS 实证)**:`~/Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home`(应用支持目录,路径含空格;位于 Electron user-data 旁,不随 app 更新漂移)。
 - 与 `~/.kimi-code` **互不相通**(各自独立 device_id/credentials;6 月的 `~/.kimi → ~/.kimi-code` 迁移不涉及桌面根)。
-- Windows 桌面版数据根**未实证**,暂以 `KIMI_WORK_HOME` 环境变量手工指定(全源均未在 Windows 验证)。
+- Windows 桌面版数据根**已实证(2026-10-21)**:`%APPDATA%\kimi-desktop\daimon-share\daimon\runtime\kimi-code\home`(与 macOS 应用支持目录同构;详见 §10.4)。适配器 discover_roots 的 Windows 分支待补,补齐前以 `KIMI_WORK_HOME` 指定。
 
 ### 10.2 布局与格式(与 CLI 新格式的异同)
 
@@ -162,6 +162,13 @@
 - **拆两个源 id**:`kimi`(CLI,双根 ~/.kimi-code + ~/.kimi + KIMI_CODE_HOME)与 `kimi-work`(桌面根 + KIMI_WORK_HOME)。理由:产品口径分开呈现;引擎/格式/计费同源,无需第二套解析。
 - **共用扫描核**:kimi.rs 抽出 `scan_kimi_wire(source_id, empty_note, roots, max_files)`;source_id 同时用作记录 source、增量缓存命名空间、去重键前缀(`kimi-work:{session}:{agent}:{line}:{ordinal}`),两源互不串扰;报表"按工具"维度天然分行。
 - **PARSER_VERSION 6→7**:收编 `tools.register_user_tool` 改变投影白名单行为(未知→已知,L1 缓存内容变化),按不变式 8 bump,触发一次全量重建(~12s,语义不变)。
+
+### 10.4 Windows 增记 —— 2026-10-21 实证
+
+- **数据根**:`%APPDATA%\kimi-desktop\daimon-share\daimon\runtime\kimi-code\home`(Roaming,与 macOS 应用支持目录同构降位);布局 `sessions/wd_<slug>_<hash>/{conv-*,ctitle-*}/agents/main/wire.jsonl` 与 §10.2 一致。
+- **解析层逐位对账**:全根 13 条,四桶 78535/180796/0/4040(当日新增 4 条:16709/51456/0/1108),与手工扫全部 wire.jsonl 顶层 usage 行**逐位全等**。
+- **双投影陷阱(手工对账必读)**:每条请求的 usage 在 wire.jsonl 落**两行同值投影**——事件包装行 `{type,event:{…usage…}}` 与顶层 usage 行 `{type,model,usage,usageScope}`;适配器按 usage 行只计一次。本根实证:26 处 usage 子串 ↔ 13 条入账,朴素全扫会得 **2×**。
+- **遗留**:discover_roots 仅认 macOS Library 路径(+`KIMI_WORK_HOME`),Windows 分支待补(照 qoder Windows 适配流程立项);补齐前 Windows 以 `KIMI_WORK_HOME` 指定上述根。
 
 ## 11. R5 分叉会话计量归属（2026-10-25，v1.1）
 

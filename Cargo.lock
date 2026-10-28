@@ -914,6 +914,7 @@ dependencies = [
  "chunked_transfer",
  "clap",
  "httparse",
+ "iana-time-zone",
  "regex",
  "rusqlite",
  "serde_json",

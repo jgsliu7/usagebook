@@ -30,9 +30,18 @@ fn timezone_of(json: &str) -> String {
 
 #[test]
 fn ledger_init_defaults_to_host_timezone() {
-    let (json, code) = init_with("default", &[("TZ", "America/New_York")], &[]);
-    assert_eq!(code, Some(0), "default init should succeed: {json}");
-    assert_eq!(timezone_of(&json), "America/New_York");
+    // TZ 伪造主机时区仅 Unix 生效(Windows 的 iana-time-zone 走系统 API,忽略 TZ);
+    // Windows 改为与测试进程同源推断对账:缺省时区 == 系统时区,硬编码无法通过。
+    if cfg!(unix) {
+        let (json, code) = init_with("default", &[("TZ", "America/New_York")], &[]);
+        assert_eq!(code, Some(0), "default init should succeed: {json}");
+        assert_eq!(timezone_of(&json), "America/New_York");
+    } else {
+        let (json, code) = init_with("default-win", &[], &[]);
+        assert_eq!(code, Some(0), "default init should succeed: {json}");
+        let host = iana_time_zone::get_timezone().expect("host timezone");
+        assert_eq!(timezone_of(&json), host);
+    }
 }
 
 #[test]

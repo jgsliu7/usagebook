@@ -3,6 +3,7 @@
 > 取证快照:· 本机 `~/.dsh` 33M(67 会话 + 52 projcache 账目)
 > 三方取证:本机 ✅ 字段级(全语料 67 文件解压 + jq 复算)/ 开源实现 ✅(tokscale `sessions/dsh.rs` 1426 行为实现蓝本、juejin、TokenTracker)/ 网络资料 ✅(官方 GitHub 开源 + 社区实测)
 > 官方仓库:github.com/deepseek-ai/deepseek-harness(2026-08 开源,**开发者预览版,官方明示可能有破坏兼容性更新**)
+> Windows 实证(2026-10-21):✅ Windows 本机闭环——默认根 `%USERPROFILE%\.dsh` 自动发现(无需 env/DSH_HOME);`session.v4.jsonl.zstd` 解析正常;1 会话 10 条 deepseek-flash,四桶 13849/146176/0/9782 与 projcache `tokenUsage.totals` 四桶 + `last.step=10` **逐位全等**(适配器逐请求 vs 官方会话账目双口径互证)。
 
 ---
 

@@ -1,11 +1,14 @@
-//! Qoder 适配器 —— 依据 docs/数据源档案/27-qoder.md(Community,本机未实证)。
+//! Qoder 适配器 —— 依据 docs/数据源档案/27-qoder.md(Windows 本机实证 2026-10-20)。
 //!
-//! 三通道(§1):IDE local.db(Qoder/QoderCN 两变体,roots 直接是 db 文件)+
-//!     ~/.qoder/projects 与 ~/.qoderwork/projects 的 *.jsonl(CLI)
+//! 双通道(§1):IDE local.db(Qoder/QoderCN 两变体,roots 直接是 db 文件;
+//!     macOS ~/Library/Application Support 与 Windows %APPDATA% 双基)+
+//!     ~/.qoder/projects、~/.qoderwork/projects、~/.qoder-cn/projects、
+//!     ~/.qoderwake-cn/qodercli/projects 的 *.jsonl(CLI)
 //! scan_roots 按形态分流:文件 → IDE;目录 → CLI
 //! IDE(§2):chat_message.role=='assistant',token_info {prompt−cached inclusive,completion};
 //!     model_info {model_key>model};gmt_create 毫秒/秒容错
 //! CLI(§3):type=="assistant" 且 message.usage Anthropic 原生五桶直通
+//!     (qfmodel 网关当前不下发计数,本机转录 usage 全 0 → 0 条;格式兼容,下发即生效)
 //! 去重键(§4):qoder:ide:{db}:{id} / qoder:{message.id}
 
 use crate::common::{for_each_line, home, iso_to_ms, json_u64, secs_or_ms, walk_with};
@@ -161,16 +164,31 @@ impl UsageSource for QoderSource {
     }
 
     /// roots 混合:IDE db 文件 + CLI projects 目录(§1)。
+    /// IDE:macOS ~/Library/Application Support 与 Windows %APPDATA% 双基;
+    /// CLI:.qoder(-work/-cn) 与 .qoderwake-cn/qodercli 四目录。
     fn discover_roots(&self) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
-        let base = home().join("Library/Application Support");
-        for v in ["Qoder", "QoderCN"] {
-            let db = base.join(v).join("SharedClientCache/cache/db/local.db");
-            if db.is_file() {
-                roots.push(db);
+        let mut bases = vec![home().join("Library/Application Support")];
+        // Windows:Roaming 基(roocode.rs 同款先例;本机实证 2026-10-20)
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                bases.push(PathBuf::from(appdata.trim()));
             }
         }
-        for v in [".qoder", ".qoderwork"] {
+        for base in &bases {
+            for v in ["Qoder", "QoderCN"] {
+                let db = base.join(v).join("SharedClientCache/cache/db/local.db");
+                if db.is_file() {
+                    roots.push(db);
+                }
+            }
+        }
+        for v in [
+            ".qoder",
+            ".qoderwork",
+            ".qoder-cn",
+            ".qoderwake-cn/qodercli",
+        ] {
             let d = home().join(v).join("projects");
             if d.is_dir() {
                 roots.push(d);
@@ -188,7 +206,7 @@ impl UsageSource for QoderSource {
         if roots.is_empty() {
             stats
                 .notes
-                .push("未发现 Qoder/QoderCN local.db 或 ~/.qoder(~work)/projects".into());
+                .push("未发现 Qoder/QoderCN local.db 或 ~/.qoder(~work/-cn)/projects、~/.qoderwake-cn/qodercli/projects".into());
             return (vec![], stats);
         }
 

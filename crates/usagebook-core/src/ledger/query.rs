@@ -359,7 +359,7 @@ fn decimal(n: i128, scale: u32) -> String {
         &raw[split..]
     )
 }
-fn model_id(key: &str) -> String {
+pub(crate) fn model_id(key: &str) -> String {
     if key.is_empty() {
         "m1:u".into()
     } else {
@@ -943,35 +943,140 @@ impl<'a> QueryService<'a> {
             callback(f, usable)?;
             ctx.budget()?;
         }
-        for row in self.live_facts()?.iter() {
-            seen += 1;
-            if seen % 512 == 0 {
-                ctx.budget()?;
-            }
-            let f = &row.fact;
-            if !allows_normalized(&q.sources, &f.source)
-                || !allows_normalized(&q.models, &model_id(&f.model))
-            {
-                continue;
-            }
-            if f.kind == "request" {
-                if f.time.is_some_and(|t| t >= start && t < end) {
-                    callback(f.clone(), true)?;
+        if let Some(legacy) = self.legacy {
+            // 索引可用走组级预筛(零字符串分配);索引缺失/过期回退顺序扫描并每快照
+            // 告警一次(方案 M2;两条路径的最终 JSON 一致性由 query 差分测试锁定)。
+            if legacy.index_usable() {
+                let index = &legacy.index;
+                debug_assert_eq!(
+                    index.built_entries,
+                    legacy.entries.len(),
+                    "index_usable 保证长度一致"
+                );
+                for ((sid, mid), ids) in &index.groups {
+                    let source = index.sources[*sid as usize].as_str();
+                    let model_id_str = index.model_ids[*mid as usize].as_str();
+                    if routes.get(source).is_some_and(|r| r == "ledger")
+                        || !allows_normalized(&q.sources, source)
+                        || !allows_normalized(&q.models, model_id_str)
+                    {
+                        continue;
+                    }
+                    for &ei in ids {
+                        let e = &legacy.entries[ei as usize];
+                        seen += 1;
+                        if seen % 512 == 0 {
+                            ctx.budget()?;
+                        }
+                        match e {
+                            // SessionTotal 现状即不参与 visit 聚合(由 session_totals
+                            // 路径直读消费),此处显式空臂保持语义(方案 §3.2)。
+                            LegacyEntry::SessionTotal { .. } => {}
+                            LegacyEntry::Request { .. } => {
+                                let f = legacy_fact(e)?;
+                                if f.time.is_some_and(|t| t >= start && t < end) {
+                                    callback(f, true)?;
+                                }
+                            }
+                            LegacyEntry::Day(..) => {
+                                let f = legacy_fact(e)?;
+                                if self.day_covered(&f, &routes)? {
+                                    continue;
+                                }
+                                let relevant = match (f.start, f.end) {
+                                    (Some(s), Some(e)) => e > start && s < end,
+                                    _ => true,
+                                };
+                                if relevant {
+                                    let usable = self.day_usable(&f, start, end, ctx)?;
+                                    if !usable {
+                                        ctx.excluded_days.set(true);
+                                    }
+                                    callback(f, usable)?;
+                                }
+                            }
+                        }
+                    }
                 }
-            } else if f.kind == "day" {
-                if self.day_covered(f, &routes)? {
+            } else {
+                legacy.warn_stale_index();
+                for e in &legacy.entries {
+                    seen += 1;
+                    if seen % 512 == 0 {
+                        ctx.budget()?;
+                    }
+                    let (source, model) = match e {
+                        LegacyEntry::Request { record, .. }
+                        | LegacyEntry::SessionTotal { record, .. } => (
+                            record.source,
+                            std::borrow::Cow::Owned(model_key(&record.model)),
+                        ),
+                        LegacyEntry::Day(day) => (
+                            day.report_source.as_str(),
+                            std::borrow::Cow::Borrowed(day.model_key.as_str()),
+                        ),
+                    };
+                    if routes.get(source).is_some_and(|r| r == "ledger")
+                        || !allows_normalized(&q.sources, source)
+                        || !allows_normalized(&q.models, &model_id(&model))
+                    {
+                        continue;
+                    }
+                    let f = legacy_fact(e)?;
+                    if f.kind == "request" {
+                        if f.time.is_some_and(|t| t >= start && t < end) {
+                            callback(f, true)?;
+                        }
+                    } else if f.kind == "day" {
+                        if self.day_covered(&f, &routes)? {
+                            continue;
+                        }
+                        let relevant = match (f.start, f.end) {
+                            (Some(s), Some(e)) => e > start && s < end,
+                            _ => true,
+                        };
+                        if relevant {
+                            let usable = self.day_usable(&f, start, end, ctx)?;
+                            if !usable {
+                                ctx.excluded_days.set(true);
+                            }
+                            callback(f, usable)?;
+                        }
+                    }
+                }
+            }
+        } else {
+            // 读模型路径(legacy 为 None):live_facts() 物化缓存,一次构造多趟复用
+            for row in self.live_facts()?.iter() {
+                seen += 1;
+                if seen % 512 == 0 {
+                    ctx.budget()?;
+                }
+                let f = &row.fact;
+                if !allows_normalized(&q.sources, &f.source)
+                    || !allows_normalized(&q.models, &model_id(&f.model))
+                {
                     continue;
                 }
-                let relevant = match (f.start, f.end) {
-                    (Some(s), Some(e)) => e > start && s < end,
-                    _ => true,
-                };
-                if relevant {
-                    let usable = self.day_usable(f, start, end, ctx)?;
-                    if !usable {
-                        ctx.excluded_days.set(true);
+                if f.kind == "request" {
+                    if f.time.is_some_and(|t| t >= start && t < end) {
+                        callback(f.clone(), true)?;
                     }
-                    callback(f.clone(), usable)?;
+                } else if f.kind == "day" {
+                    if self.day_covered(f, &routes)? {
+                        continue;
+                    }
+                    let relevant = match (f.start, f.end) {
+                        (Some(s), Some(e)) => e > start && s < end,
+                        _ => true,
+                    };
+                    if relevant {
+                        let usable = self.day_usable(f, start, end, ctx)?;
+                        if !usable {
+                            ctx.excluded_days.set(true);
+                        }
+                        callback(f.clone(), usable)?;
+                    }
                 }
             }
         }
@@ -1069,7 +1174,7 @@ impl<'a> QueryService<'a> {
             .ok_or_else(|| QueryError::invalid("day overflow"))?;
         Ok(a >= midnight(ctx.tz, day)? && b <= midnight(ctx.tz, next)? && b > a)
     }
-    fn day_covered(&self, f: &Fact, _routes: &BTreeMap<String, String>) -> QueryResult<bool> {
+    fn day_covered(&self, f: &Fact, routes: &BTreeMap<String, String>) -> QueryResult<bool> {
         let (Some(start), Some(end)) = (f.start, f.end) else {
             return Ok(false);
         };
@@ -1089,18 +1194,65 @@ impl<'a> QueryService<'a> {
         if suppressed {
             return Ok(true);
         }
-        for row in self.live_facts()?.iter() {
-            let request = &row.fact;
-            if !owned
-                && request.kind == "request"
-                && request.native == f.native
-                && request.namespace == f.namespace
-                && request.time.is_some_and(|time| time >= start && time < end)
-            {
-                return Ok(true);
+        if let Some(l) = self.legacy {
+            // 与 visit 同款双轨:索引命中后仍逐候选复查 routes(routes 是每查询
+            // 状态,不可烘进索引;入表条件=Request 且 namespace=Some,方案 §3.3);
+            // owned=持久覆盖规则已持有该日,与远端语义一致地不计 live 命中。
+            if l.index_usable() {
+                let index = &l.index;
+                // 元组键无元素级 Borrow,此处 clone 两个短串;day 事实每查询很少,可接受
+                if let Some(cands) = index.coverage.get(&(f.native.clone(), f.namespace.clone())) {
+                    let lo = cands.partition_point(|(ts, _)| *ts < start);
+                    for (ts, ei) in &cands[lo..] {
+                        if *ts >= end {
+                            break;
+                        }
+                        if let LegacyEntry::Request { record, .. } = &l.entries[*ei as usize] {
+                            if !owned && !routes.get(record.source).is_some_and(|r| r == "ledger") {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+                Ok(false)
+            } else {
+                l.warn_stale_index();
+                for e in &l.entries {
+                    if let LegacyEntry::Request {
+                        record,
+                        native_tool,
+                        namespace,
+                        ..
+                    } = e
+                    {
+                        if !owned
+                            && !routes.get(record.source).is_some_and(|r| r == "ledger")
+                            && native_tool == &f.native
+                            && namespace.as_deref() == Some(f.namespace.as_str())
+                            && record.ts_ms >= start
+                            && record.ts_ms < end
+                        {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
             }
+        } else {
+            // 读模型路径(legacy 为 None):live_facts() 物化缓存
+            for row in self.live_facts()?.iter() {
+                let request = &row.fact;
+                if !owned
+                    && request.kind == "request"
+                    && request.native == f.native
+                    && request.namespace == f.namespace
+                    && request.time.is_some_and(|time| time >= start && time < end)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
-        Ok(false)
     }
     pub fn status(&self) -> QueryResult<Status> {
         let (_guard, ctx) = self.snapshot(None)?;
@@ -1187,7 +1339,7 @@ impl<'a> QueryService<'a> {
                     .as_ref()
                     .and_then(|l| l.sources.get(info.id))
                     .cloned();
-                sources.push(json!({"id":info.id,"route":"live","state":if state.as_ref().is_some_and(|s|s.error.as_deref()==Some("LOADING")){"collecting"}else if state.as_ref().is_some_and(|s|s.stale){"stale"}else if state.as_ref().is_some_and(|s|s.error.is_some()){"error"}else if state.is_some(){"ready"}else{"collecting"},"pending_identities":"0","conflicted_identities":"0","saved_candidates":"0","identity_link_blocked_objects":"0","source_readable":state.as_ref().is_some_and(|s|s.error.is_none()),"isolated_objects":"0","failed_roots":"0","incomplete_objects":"0","next_retry_at_ms":null,"last_published_at_ms":null,"publishing":false,"audit_last_completed_ms":null,"audit_overdue":false,"last_saved_at_ms":state.as_ref().and_then(|s|s.last_scanned_ms).map(|n|n.to_string()),"error":state.as_ref().and_then(|s|s.error.clone())}));
+                sources.push(json!({"id":info.id,"route":"live","state":if state.as_ref().is_some_and(|s|s.error.as_deref()==Some("LOADING")){"collecting"}else if state.as_ref().is_some_and(|s|s.stale){"stale"}else if state.as_ref().is_some_and(|s|s.error.is_some()){"error"}else if state.is_some(){"ready"}else{"collecting"},"pending_identities":"0","conflicted_identities":"0","saved_candidates":"0","identity_link_blocked_objects":"0","source_readable":state.as_ref().is_some_and(|s|s.error.is_none()),"isolated_objects":"0","failed_roots":"0","incomplete_objects":"0","next_retry_at_ms":null,"last_published_at_ms":null,"publishing":false,"audit_last_completed_ms":null,"audit_overdue":false,"last_saved_at_ms":state.as_ref().and_then(|s|s.last_scanned_ms).map(|n|n.to_string()),"error":state.as_ref().and_then(|s|s.error.clone()),"warning":state.as_ref().and_then(|s|s.warning.clone())}));
             }
         }
         for source in &mut sources {
@@ -1347,7 +1499,12 @@ impl<'a> QueryService<'a> {
                     ctx.incomplete.insert(info.id.into());
                     ctx.warnings.insert("SESSION_USAGE_UNALLOCATED".into());
                 }
-                if live.as_ref().is_none_or(|s| s.stale || s.error.is_some()) {
+                // warning(按源降级:该源有被跳过的坏行)同样意味着数据不完整,
+                // 与 stale/error 一致地披露 SOURCE_READ_GAP(对账可见性优先)。
+                if live
+                    .as_ref()
+                    .is_none_or(|s| s.stale || s.error.is_some() || s.warning.is_some())
+                {
                     ctx.incomplete.insert(info.id.into());
                     ctx.warnings.insert("SOURCE_READ_GAP".into());
                 }
@@ -3115,20 +3272,56 @@ impl QueryService<'_> {
             }
             ctx.budget()?;
         }
-        for row in self.live_facts()?.iter() {
-            let fact = &row.fact;
-            if !sources.contains(&fact.source)
-                && (fact.kind == "request" && fact.time.is_some_and(|time| time <= ctx.asof)
-                    || fact.kind == "day"
-                        && self.day_usable(fact, start, end, ctx)?
-                        && !self.day_covered(fact, &routes)?)
-            {
-                sources.insert(fact.source.clone());
+        if let Some(legacy) = self.legacy {
+            // Request/SessionTotal 只需 (source, ts) 两个派生值,免构造完整 Fact
+            // (SessionTotal 的 kind 两分支均不命中,现状即不入 catalog);Day 的
+            // day_usable/day_covered 需要 namespace/timezone/start/end 全套,
+            // 保留 legacy_fact 全量构造(条目量小)。条件文本与原逐字一致。
+            for entry in &legacy.entries {
+                let hit = match entry {
+                    LegacyEntry::Request { record, .. } => {
+                        !routes
+                            .get(record.source)
+                            .is_some_and(|route| route == "ledger")
+                            && !sources.contains(record.source)
+                            && record.ts_ms <= ctx.asof
+                    }
+                    LegacyEntry::SessionTotal { .. } => false,
+                    LegacyEntry::Day { .. } => {
+                        let fact = legacy_fact(entry)?;
+                        !routes
+                            .get(&fact.source)
+                            .is_some_and(|route| route == "ledger")
+                            && !sources.contains(&fact.source)
+                            && self.day_usable(&fact, start, end, ctx)?
+                            && !self.day_covered(&fact, &routes)?
+                    }
+                };
+                if hit {
+                    sources.insert(entry.report_source().to_string());
+                }
+                if sources.len() > GROUP_LIMIT {
+                    return Err(QueryError::limit("catalog source budget exceeded"));
+                }
+                ctx.budget()?;
             }
-            if sources.len() > GROUP_LIMIT {
-                return Err(QueryError::limit("catalog source budget exceeded"));
+        } else {
+            // 读模型路径(legacy 为 None):live_facts() 物化缓存
+            for row in self.live_facts()?.iter() {
+                let fact = &row.fact;
+                if !sources.contains(&fact.source)
+                    && (fact.kind == "request" && fact.time.is_some_and(|time| time <= ctx.asof)
+                        || fact.kind == "day"
+                            && self.day_usable(fact, start, end, ctx)?
+                            && !self.day_covered(fact, &routes)?)
+                {
+                    sources.insert(fact.source.clone());
+                }
+                if sources.len() > GROUP_LIMIT {
+                    return Err(QueryError::limit("catalog source budget exceeded"));
+                }
+                ctx.budget()?;
             }
-            ctx.budget()?;
         }
         Ok(sources)
     }
@@ -3738,5 +3931,330 @@ fn diagnostic_bundle(f: &Fact) -> QueryResult<Value> {
             Ok(bundle)
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod index_differential_tests {
+    use super::*;
+    use crate::ledger::legacy::{LegacyDay, LegacyEntry, LegacySnapshot, LegacySourceStatus};
+    use crate::model::{Caliber, UsageRecord};
+    use serde_json::json;
+
+    fn ms(rfc3339: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn rec(source: &'static str, model: &str, ts: i64, input: u64) -> UsageRecord {
+        UsageRecord {
+            source,
+            session_id: "sess".into(),
+            agent: None,
+            model: model.into(),
+            ts_ms: ts,
+            caliber: Caliber::RequestDelta,
+            input_uncached: input,
+            cache_read: 0,
+            cache_write: 0,
+            cache_write_1h: 0,
+            output: 0,
+            reasoning_output: 0,
+            cost_usd: None,
+            request_count: 1,
+            dedup_key: format!("dk-{source}-{model}-{input}"),
+        }
+    }
+
+    /// 九类构型(方案 §7 T4):三变体混合、Day(None,None)、Day 跨窗、SessionTotal
+    /// 混入、空 model 名、Include/Exclude 选择器、asof 截断、ledger 路由源(经空
+    /// DB 的 routes 恒空谓词保持)、带 namespace 的 Request(day_covered 索引命中)。
+    fn fixture_snapshot(conn: &rusqlite::Connection) -> LegacySnapshot {
+        let routing = QueryService::routing_hash(conn).unwrap();
+        let mut s = LegacySnapshot::new("g".into(), routing);
+        let in_win = ms("2026-10-05T10:00:00+08:00");
+        let old = ms("2026-01-05T10:00:00+08:00");
+        // Request:常规/空模型/窗口外/带 namespace(供 day_covered 索引命中)
+        s.entries.push(LegacyEntry::Request {
+            record: rec("claude", "glm-4.7", in_win, 100),
+            native_tool: "claude".into(),
+            namespace: None,
+            known_fields: 0,
+        });
+        s.entries.push(LegacyEntry::Request {
+            record: rec("claude", "", in_win, 200),
+            native_tool: "claude".into(),
+            namespace: None,
+            known_fields: 0,
+        });
+        s.entries.push(LegacyEntry::Request {
+            record: rec("kimi", "k2", in_win, 300),
+            native_tool: "kimi".into(),
+            namespace: None,
+            known_fields: 0,
+        });
+        s.entries.push(LegacyEntry::Request {
+            record: rec("claude", "glm-4.7", old, 400),
+            native_tool: "claude".into(),
+            namespace: None,
+            known_fields: 0,
+        });
+        let mut ns_rec = rec("claude", "glm-4.7", ms("2026-10-05T11:00:00+08:00"), 500);
+        ns_rec.dedup_key = "dk-ns".into();
+        s.entries.push(LegacyEntry::Request {
+            record: ns_rec,
+            native_tool: "claude".into(),
+            namespace: Some("acct-1".into()),
+            known_fields: 0,
+        });
+        // codex 已路由 ledger:r6 使 visit 组过滤的 ledger 分支命中(整组跳过),
+        // 同时使 d4 的 day_covered 复查走到"候选是 ledger 路由→不构成覆盖"分支
+        s.entries.push(LegacyEntry::Request {
+            record: rec("codex", "glm-4.7", ms("2026-10-08T11:00:00+08:00"), 600),
+            native_tool: "kimi".into(),
+            namespace: Some("acct-2".into()),
+            known_fields: 0,
+        });
+        // SessionTotal 混入(visit 两路径都必须不产生回调)
+        s.entries.push(LegacyEntry::SessionTotal {
+            record: UsageRecord {
+                caliber: Caliber::SessionTotal,
+                ..rec("claude", "glm-4.7", in_win, 999)
+            },
+            known_fields: 0,
+            projection: None,
+            reason: None,
+        });
+        // Day:None/None(ccswitch 形态)、跨窗区间、窄窗带 namespace(day_covered 目标)
+        s.entries.push(LegacyEntry::Day(LegacyDay {
+            row_key: "rk-1".into(),
+            report_source: "ccswitch-rollup".into(),
+            native_tool: "claude".into(),
+            namespace: None,
+            model_key: "n:glm-4.7".into(),
+            model_display: "GLM".into(),
+            native_date: "2026-10-05".into(),
+            timezone: None,
+            start_ms: None,
+            end_ms: None,
+            projection: [None; 10],
+        }));
+        s.entries.push(LegacyEntry::Day(LegacyDay {
+            row_key: "rk-2".into(),
+            report_source: "ccswitch-rollup".into(),
+            native_tool: "kimi".into(),
+            namespace: None,
+            model_key: "n:k2".into(),
+            model_display: "K2".into(),
+            native_date: "2026-10-06".into(),
+            timezone: None,
+            start_ms: Some(ms("2026-09-01T00:00:00+08:00")),
+            end_ms: Some(ms("2026-11-15T00:00:00+08:00")),
+            projection: [None; 10],
+        }));
+        s.entries.push(LegacyEntry::Day(LegacyDay {
+            row_key: "rk-3".into(),
+            report_source: "ccswitch-rollup".into(),
+            native_tool: "claude".into(),
+            namespace: Some("acct-1".into()),
+            model_key: "n:glm-4.7".into(),
+            model_display: "GLM".into(),
+            native_date: "2026-10-05".into(),
+            timezone: Some("Asia/Shanghai".into()),
+            start_ms: Some(ms("2026-10-05T00:00:00+08:00")),
+            end_ms: Some(ms("2026-10-06T00:00:00+08:00")),
+            projection: [None; 10],
+        }));
+        s.entries.push(LegacyEntry::Day(LegacyDay {
+            row_key: "rk-4".into(),
+            report_source: "ccswitch-rollup".into(),
+            native_tool: "kimi".into(),
+            namespace: Some("acct-2".into()),
+            model_key: "n:k2".into(),
+            model_display: "K2".into(),
+            native_date: "2026-10-08".into(),
+            timezone: Some("Asia/Shanghai".into()),
+            start_ms: Some(ms("2026-10-08T00:00:00+08:00")),
+            end_ms: Some(ms("2026-10-09T00:00:00+08:00")),
+            projection: [None; 10],
+        }));
+        for src in ["claude", "kimi", "ccswitch-rollup"] {
+            s.sources.insert(
+                src.into(),
+                LegacySourceStatus {
+                    last_scanned_ms: Some(1),
+                    stale: false,
+                    error: None,
+                    unaccounted_rows: 0,
+                    unallocated_sessions: 0,
+                    warning: None,
+                },
+            );
+        }
+        s
+    }
+
+    fn request_defs() -> Vec<serde_json::Value> {
+        let q_all = json!({
+            "window": {"kind": "all"},
+            "report_timezone": "Asia/Shanghai",
+            "sources": {"mode": "all"},
+            "models": {"mode": "all"},
+            "metric": "total",
+            "group_by": "none",
+        });
+        let q_cal = json!({
+            "window": {"kind": "calendar", "start_date": "2026-10-01", "end_date_exclusive": "2026-11-01"},
+            "report_timezone": "Asia/Shanghai",
+            "sources": {"mode": "all"},
+            "models": {"mode": "all"},
+            "metric": "total",
+            "group_by": "none",
+        });
+        let q_sel = json!({
+            "window": {"kind": "all"},
+            "report_timezone": "Asia/Shanghai",
+            "sources": {"mode": "include", "ids": ["claude"]},
+            "models": {"mode": "exclude", "ids": [format!("m1:n:{}", URL_SAFE_NO_PAD.encode("glm-4.7"))]},
+            "metric": "total",
+            "group_by": "source",
+        });
+        let mut q_asof = q_all.clone();
+        q_asof["as_of_ms"] = json!(ms("2026-10-02T00:00:00+08:00").to_string());
+        vec![
+            json!({"kind": "totals", "query": q_all}),
+            json!({"kind": "dashboard", "query": q_cal.clone(), "series_unit": "day", "max_points": 100, "table_limit": 10}),
+            json!({"kind": "dashboard", "query": q_sel, "series_unit": "day", "max_points": 100, "table_limit": 10}),
+            json!({"kind": "dashboard", "query": q_asof, "series_unit": "day", "max_points": 100, "table_limit": 10}),
+            json!({"kind": "day", "query": {
+                "window": {"kind": "calendar", "start_date": "2026-10-05", "end_date_exclusive": "2026-10-06"},
+                "report_timezone": "Asia/Shanghai",
+                "sources": {"mode": "all"},
+                "models": {"mode": "all"},
+                "metric": "total",
+                "group_by": "none",
+            }, "date": "2026-10-05"}),
+            json!({"kind": "session_totals", "sources": {"mode": "all"}, "models": {"mode": "all"}, "page": {"limit": 10}}),
+        ]
+    }
+
+    /// 序列化前剥离易变字段(as_of_ms 是查询时刻墙钟,query_key 含之;两轮
+    /// 差分运行必然不同,与路径等价性无关)。
+    fn canonical<T: serde::Serialize>(v: &T) -> String {
+        let mut val = serde_json::to_value(v).unwrap();
+        if let serde_json::Value::Object(map) = &mut val {
+            map.remove("as_of_ms");
+            map.remove("query_key");
+        }
+        serde_json::to_string(&val).unwrap()
+    }
+    fn run_all(snap: &LegacySnapshot, conn: &rusqlite::Connection) -> Vec<String> {
+        let svc = QueryService::new(conn, Some(snap));
+        let mut out = Vec::new();
+        for req in request_defs() {
+            let parsed: QueryRequest = serde_json::from_value(req).unwrap();
+            let resp = svc.query(parsed).expect("query must succeed");
+            out.push(canonical(&resp));
+        }
+        for dim in ["source", "model"] {
+            let cat: CatalogRequest = serde_json::from_value(json!({
+                "dimension": dim, "search": "", "page": {"limit": 50}
+            }))
+            .unwrap();
+            out.push(canonical(&svc.catalog(cat).unwrap()));
+        }
+        out.push(canonical(&svc.status().unwrap()));
+        out
+    }
+
+    fn temp_ledger(tag: &str) -> (std::path::PathBuf, crate::ledger::db::Ledger) {
+        let dir = std::env::temp_dir().join(format!("ub-m2-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = crate::ledger::db::Ledger::init(dir.join("l.db"), "Asia/Shanghai").unwrap();
+        // codex 路由为 ledger:使 visit 组级过滤与 day_covered 查询期复查的
+        // "ledger 路由"分支在差分中获得真实执行(空库下两分支恒不命中)
+        ledger
+            .connection()
+            .execute(
+                "INSERT INTO source_roots (root_id, identity_family, namespace_key, collector_key,
+                 report_source, native_tool, locator, enabled, identity_version, parser_version, route)
+                 VALUES ('r1','f','n','c','codex','codex','loc',1,1,'p','ledger')",
+                [],
+            )
+            .unwrap();
+        (dir, ledger)
+    }
+
+    #[test]
+    fn indexed_and_sequential_agree() {
+        let (dir, ledger) = temp_ledger("diff");
+        let conn = ledger.connection();
+        let seq = fixture_snapshot(conn); // 不 build_index → 走顺序扫描回退路径
+        assert!(!seq.index_usable());
+        let mut idx = fixture_snapshot(conn);
+        idx.build_index();
+        assert!(idx.index_usable());
+        let a = run_all(&seq, conn);
+        let b = run_all(&idx, conn);
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x, y, "差分不一致:第 {i} 个响应\nseq={x}\nidx={y}");
+        }
+        assert_eq!(a.len(), b.len());
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indexed_path_actually_used() {
+        // 索引生效可观测性(方案 §7 评审意见):建索引跑全量查询后 warned 仍为
+        // false 且组非空——证明走的是 indexed 而非静默回退。
+        let (dir, ledger) = temp_ledger("used");
+        let conn = ledger.connection();
+        let mut s = fixture_snapshot(conn);
+        s.build_index();
+        assert!(!s.index.groups.is_empty());
+        let _ = run_all(&s, conn);
+        assert!(
+            !s.index.warned.load(std::sync::atomic::Ordering::Relaxed),
+            "索引已构建却发生回退告警"
+        );
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_index_falls_back_and_includes_new_records() {
+        // T5 毒化守卫:build 后再 push(不重建)→ 必须回退顺序扫描且结果包含新记录
+        let (dir, ledger) = temp_ledger("poison");
+        let conn = ledger.connection();
+        let mut s = fixture_snapshot(conn);
+        s.build_index();
+        let in_win = ms("2026-10-07T10:00:00+08:00");
+        s.push_records("claude", vec![rec("claude", "glm-4.7", in_win, 777)], 2)
+            .unwrap();
+        assert!(!s.index_usable(), "push 后索引必须判过期");
+        let svc = QueryService::new(conn, Some(&s));
+        let parsed: QueryRequest = serde_json::from_value(json!({
+            "kind": "totals",
+            "query": {
+                "window": {"kind": "all"},
+                "report_timezone": "Asia/Shanghai",
+                "sources": {"mode": "all"},
+                "models": {"mode": "all"},
+                "metric": "total",
+                "group_by": "none",
+            }
+        }))
+        .unwrap();
+        let text = serde_json::to_string(&svc.query(parsed).unwrap()).unwrap();
+        assert!(
+            text.contains("\"2277\""),
+            "回退路径必须包含新记录(1500+777): {text}"
+        );
+        assert!(s.index.warned.load(std::sync::atomic::Ordering::Relaxed));
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

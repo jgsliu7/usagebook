@@ -540,6 +540,7 @@ fn load_legacy_inner(
                             error: Some("SOURCE_READ_FAILED".into()),
                             unaccounted_rows: 0,
                             unallocated_sessions: 0,
+                            warning: None,
                         },
                     );
                 }
@@ -552,6 +553,7 @@ fn load_legacy_inner(
                         error: None,
                         unaccounted_rows: 0,
                         unallocated_sessions: 0,
+                        warning: None,
                     },
                 );
             }
@@ -593,6 +595,8 @@ fn load_legacy_inner(
                     ),
                     unaccounted_rows: 0,
                     unallocated_sessions: 0,
+                    // stats.failed 是比按源降级更强的失败信号,整条覆盖含 warning(方案 §2 取舍)
+                    warning: None,
                 },
             );
         }
@@ -601,6 +605,9 @@ fn load_legacy_inner(
     if removed > 0 {
         tracing::info!(removed, "已按删除范围过滤兼容统计");
     }
+    // 装配末尾构建查询索引(方案 M2 双构建点之一;serve 侧合并变异后有第二处)。
+    // 必须位于 filter_suppressed 等一切 entries 变异之后。
+    snapshot.build_index();
     Ok(snapshot)
 }
 pub fn report(args: ReportArgs, json_output: bool) {

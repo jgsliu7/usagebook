@@ -4,6 +4,7 @@
 > **实装记录**:①`~/.copilot/session-store.db` 的 **assistant_usage_events 逐请求表真实存在**(3 行,turn_index/total_nano_aiu/finish_reason 全部如逆向 DDL);②**双通道逐位互证**:Σledger(input 73374/output 215/cacheRead 61952/nano 378144000) == shutdown.modelMetrics 全等;③**inclusive 一手定稿**:官方 shutdown 自带裸输入明细 tokenDetails.input=11422==inputTokens−cacheReadTokens;④**ephemeral 契约证实**:事件流无 assistant.usage/model.call_* 行;⑤session.usage_checkpoint
 > **2026-10-17 裁决**：v1 不消费 checkpoint/compaction_complete——shutdown 差分 + assistant_usage_events 已覆盖，另计有双计风险，包含关系未取证。 每 turn 后一条;⑥sessionStartTime Unix 毫秒 ✅。
 > **适配器状态:✅ 已升级并对账**:session-store.db 逐请求通道落地(requests 1→3),nano-AIU 换算生效($0.00378144),五桶逐位命中(11422/61952/215/0)。
+> **Windows 实证(2026-10-21)**:✅ Windows 本机闭环——npm `@github/copilot` 装 **1.0.101**,`%USERPROFILE%\.copilot` 默认根自动发现;6 次真实请求五桶/请求数与 SQL 直查逐位全等(18191/44362/39276/240/647),inclusive 减除与 output−reasoning 双口径实库坐实,CLI 自报 Tokens 与 SQL 行互证。**⚠️ 格式漂移**:created_at 由 1.0.92 naive UTC `"YYYY-MM-DD HH:MM:SS"` 变为 1.0.101 **RFC3339 带毫秒 Z**(`2026-10-21T08:53:39.180Z`),致旧解析 ts=0 全落 1970-01-01(缺陷 docs/bugs/20261021-copilot时间戳漂移落1970/,双格式修复+PARSER_VERSION bump 8 当日);模型新增 gpt-6-luna。
 > 证据链:ccusage `rust/adapters/copilot/`(paths.rs:55-62、parser.rs:455-519、loader.rs:87-164)/ juejin `parsers/copilot.ts:50`/ **官方 Schema 与二进制逆向(一手)**。
 > 注:github.com/github/copilot-cli 是闭源二进制的分发/issue 仓库(专有许可),**不是源码**。
 

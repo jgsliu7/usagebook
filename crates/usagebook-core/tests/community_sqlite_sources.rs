@@ -119,13 +119,33 @@ fn copilot_session_store_channel() {
          INSERT INTO assistant_usage_events VALUES(2,'csess',1,'','mai-code-1.1-flash',
            24448,64,24320,0,0,58880000,'2026-10-07 02:24:20');
          INSERT INTO assistant_usage_events VALUES(3,'csess',2,'sub','gpt-5.2',
-           0,0,0,0,0,0,'2026-10-07 02:24:30');",
+           0,0,0,0,0,0,'2026-10-07 02:24:30');
+         INSERT INTO assistant_usage_events VALUES(4,'csess2',0,'','gpt-6-luna',
+           17081,82,9052,8026,38,113507000,'2026-10-21T08:55:24.390Z');
+         INSERT INTO assistant_usage_events VALUES(5,'csess3',0,'','x',
+           100,10,0,0,0,0,'not-a-date');",
     )
     .unwrap();
     drop(conn);
 
     let (records, stats) = copilot::CopilotSource.scan_roots(std::slice::from_ref(&root), None);
-    assert_eq!(records.len(), 2, "全零行跳过;notes: {:?}", stats.notes);
+    assert_eq!(
+        records.len(),
+        3,
+        "全零行与坏时间戳行跳过;bad={};notes: {:?}",
+        stats.lines_bad_json,
+        stats.notes
+    );
+    // 坏时间戳走行级 notes 披露而非 lines_bad_json:装配层把后者当整源失败信号
+    // (该源全部新鲜数据会被冻结)——2026-10-28 合流时的刻意取舍。
+    assert!(
+        stats
+            .notes
+            .iter()
+            .any(|n| n.contains("created_at") && n.contains("跳过 1 行")),
+        "坏时间戳须 notes 上报跳过计数: {:?}",
+        stats.notes
+    );
     let r1 = records.iter().find(|r| r.ts_ms == 1791339843000).unwrap();
     // 双减除(§7.3):24379 − 13184 − 0 = 11195
     assert_eq!(
@@ -136,6 +156,21 @@ fn copilot_session_store_channel() {
     assert!(
         (r1.cost_usd.unwrap() - 0.00254108).abs() < 1e-12,
         "nano→美元换算(§7.3)"
+    );
+    // 1.0.101+ RFC3339 带毫秒 Z(Windows 实证 2026-10-21):ts 正确,五桶双减除
+    let r4 = records
+        .iter()
+        .find(|r| r.ts_ms == 1792572924390)
+        .expect("RFC3339 时间戳应正确解析");
+    assert_eq!(
+        (
+            r4.input_uncached,
+            r4.cache_read,
+            r4.cache_write,
+            r4.output,
+            r4.reasoning_output
+        ),
+        (3, 9052, 8026, 44, 38)
     );
     let _ = std::fs::remove_dir_all(root);
 }
@@ -317,6 +352,53 @@ fn opencode_v2_and_json_fallback() {
         (10, 2, 1, 5, 1)
     );
     assert_eq!(om1.cost_usd, Some(0.01));
+
+    // 通道 A':新版 v2 schema —— type 是 SQL 列,data blob 不内嵌 type/role
+    // (2026-10-19 Windows 实库实证形态;旧 blob 子串预过滤在此形态下全漏,修复回归)
+    let dir_a2 = root.join("a2");
+    std::fs::create_dir_all(&dir_a2).unwrap();
+    let conn = Connection::open(dir_a2.join("opencode.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT,
+           seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+         CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+         INSERT INTO session_message VALUES('nm1','nsess1','assistant',0,1750000000000,1750000000000,
+           '{\"model\":{\"providerID\":\"zhipuai-coding-plan\",\"id\":\"glm-5\"},
+             \"tokens\":{\"input\":67,\"cache\":{\"read\":11456,\"write\":0},\"output\":37,\"reasoning\":0},
+             \"time\":{\"created\":1773917345472},\"cost\":0.0021}');
+         INSERT INTO session_message VALUES('nm2','nsess1','user',1,1750000000001,1750000000001,
+           '{\"text\":\"hi\",\"time\":{\"created\":1773917345000}}');
+         INSERT INTO message VALUES('nm1','nsess1',
+           '{\"role\":\"assistant\",\"modelID\":\"legacy-model\",\"total\":11560,
+             \"tokens\":{\"input\":67,\"cache\":{\"read\":11456,\"write\":0},\"output\":37,\"reasoning\":0},
+             \"time\":{\"created\":1773917345472}}');",
+    )
+    .unwrap();
+    drop(conn);
+    let (records_new, stats_new) =
+        opencode::OpencodeSource.scan_roots(std::slice::from_ref(&dir_a2), None);
+    assert_eq!(
+        records_new.len(),
+        1,
+        "新版 v2:type 列判别,blob 无 type/role 也能入账;notes: {:?}",
+        stats_new.notes
+    );
+    let nm1 = &records_new[0];
+    assert_eq!(
+        (
+            nm1.input_uncached,
+            nm1.cache_read,
+            nm1.cache_write,
+            nm1.output
+        ),
+        (67, 11456, 0, 37)
+    );
+    assert_eq!(
+        nm1.model, "glm-5",
+        "v2 blob model.id 通道(§3),不被 v1 通道分流"
+    );
+    assert_eq!(nm1.cost_usd, Some(0.0021));
+    assert_eq!(nm1.ts_ms, 1773917345472);
 
     // 通道 B:无 db → JSON storage/message 兜底
     let dir_b = root.join("b");

@@ -943,10 +943,10 @@ fn unique_existing(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         .filter(|p| seen.insert(p.clone()))
         .collect()
 }
-fn official_path_config(home: &Path) -> Option<PathBuf> {
+fn official_path_config(_home: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        Some(home.join("Library/Application Support/com.ccswitch.desktop/app_paths.json"))
+        Some(_home.join("Library/Application Support/com.ccswitch.desktop/app_paths.json"))
     }
     #[cfg(target_os = "windows")]
     {
@@ -958,7 +958,7 @@ fn official_path_config(home: &Path) -> Option<PathBuf> {
         Some(
             std::env::var_os("XDG_DATA_HOME")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".local/share"))
+                .unwrap_or_else(|| _home.join(".local/share"))
                 .join("com.ccswitch.desktop/app_paths.json"),
         )
     }

@@ -14,11 +14,14 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+/// 18:Windows 适配线并入——copilot created_at 双格式(naive+RFC3339,1.0.101 漂移落1970 修复,
+/// 移植到 assistant_usage_events 新通道)、qoder Windows %APPDATA% 双基发现、claude 跨会话
+/// 重放副本合并;旧缓存需全量重建(缺陷 20261021-copilot时间戳漂移落1970 及同线各修复)。
 /// 13:Gemini 自定义 home 根与 Qwen 协议桶映射修正，旧解析结果不得复用。
 /// 12:JSONL 读取/编码故障传播；旧 source_state 部分成功缓存必须失效。
 /// 11:OpenCode v2 fork 按边界剔除复制前缀，旧缓存不得继续贡献重复用量。
 /// 10:minimax 源 model 回填 + 模型名去 provider 前缀(8/9 为未发布中间版本)。
-pub const PARSER_VERSION: &str = "17";
+pub const PARSER_VERSION: &str = "18";
 const SCHEMA_VERSION: i32 = 2;
 const LOCK_PROTOCOL_VERSION: u32 = 1;
 
