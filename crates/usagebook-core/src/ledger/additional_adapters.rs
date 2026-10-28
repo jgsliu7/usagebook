@@ -1498,9 +1498,15 @@ fn read_database_batch(
                 continue;
             }
             match kind.as_deref() {
-                Some("user") => continue,
                 Some("assistant") => {}
-                _ => {
+                // user/system/idle/synthetic/compaction 等非计量行:与 live 适配器
+                // (sources/opencode.rs"SQL type 权威,非 assistant 不计")同语义,
+                // 跳过不计、不构成证据缺口——否则正常库的会话生命周期行会让整源
+                // 永久 SOURCE_EVIDENCE_GAP(本机实库 133 行 system/idle/synthetic/
+                // compaction 踩中,2026-10-28)。
+                Some(_) => continue,
+                // 必要 type 列出现 NULL 值仍是坏行:显式缺口
+                None => {
                     gap = true;
                     continue;
                 }
