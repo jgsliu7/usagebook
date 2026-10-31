@@ -98,6 +98,34 @@ pub(crate) fn canonical_path(path: &Path) -> Result<PathBuf> {
 pub fn exists_or_recoverable(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok() || path.with_extension("install.json").exists()
 }
+/// A main database that is missing while its WAL/SHM/journal sidecars remain is
+/// not a fresh installation: publishing a new database beside them lets SQLite
+/// replay the old WAL into the new file. Refuse instead of guessing.
+fn check_orphaned_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = sidecar_path(path, suffix);
+        match sidecar.symlink_metadata() {
+            Ok(_) => {
+                return Err(LedgerError::InvalidInput(format!(
+                    "ledger sidecar {} exists but the main ledger file is missing; restore a backup with ledger rescue, or remove all -wal/-shm/-journal files for this path and retry (do not copy only a main file next to these sidecars)",
+                    sidecar.display()
+                )));
+            }
+            // A missing path is the normal fresh-install case. Any other
+            // metadata error must not be mistaken for "no sidecar".
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+/// Append a SQLite sidecar suffix without `Path::with_extension`, which would
+/// replace the database extension instead of preserving the complete name.
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
 pub(crate) fn private_file(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -878,6 +906,7 @@ impl Ledger {
         if path.exists() {
             return Err(LedgerError::AlreadyInitialized);
         }
+        check_orphaned_sidecars(path)?;
         let temp = path.with_extension(format!("{}.init.tmp", new_epoch()));
         let f = std::fs::OpenOptions::new()
             .write(true)
@@ -1157,5 +1186,49 @@ mod tests {
         if let Some(name) = super::host_timezone_hint() {
             assert!(super::super::metrics::timezone(&name).is_ok(), "{name}");
         }
+    }
+
+    #[test]
+    fn init_refuses_sidecars_without_main_database() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "usagebook-orphan-sidecars-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage-ledger.db");
+
+        // Any stale sidecar must block a fresh install before SQLite can
+        // associate it with the new main database.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            std::fs::write(super::sidecar_path(&path, suffix), b"stale").unwrap();
+            let result = super::Ledger::init(&path, "UTC");
+            assert!(
+                matches!(result, Err(crate::ledger::LedgerError::InvalidInput(_))),
+                "suffix {suffix} must be rejected"
+            );
+            assert!(!path.exists(), "init must not publish a database");
+            std::fs::remove_file(super::sidecar_path(&path, suffix)).unwrap();
+        }
+
+        // With the sidecars gone, the same path initializes normally.
+        let ledger = super::Ledger::init(&path, "UTC").unwrap();
+        drop(ledger);
+
+        // An existing main database still returns the established error; the
+        // orphan guard must not preempt or hide the normal-open path.
+        std::fs::write(super::sidecar_path(&path, "-wal"), b"stale").unwrap();
+        let result = super::Ledger::init(&path, "UTC");
+        assert!(matches!(
+            result,
+            Err(crate::ledger::LedgerError::AlreadyInitialized)
+        ));
+        std::fs::remove_file(super::sidecar_path(&path, "-wal")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -120,7 +120,7 @@ USAGEBOOK_DATA_DIR=/absolute/path/usagebook-data "$HOME/.local/bin/usagebook" se
 
 `USAGEBOOK_DATA_DIR` 不会改变数据来源或复制原始日志。
 
-长期账本与缓存分开，serve 默认自动初始化，操作见 [README 的长期账本步骤](README.md#长期账本)；默认位于 macOS 的 `~/Library/Application Support/usagebook/usage-ledger.db` 或 Linux 的 `${XDG_DATA_HOME:-~/.local/share}/usagebook/usage-ledger.db`，也可用 `USAGEBOOK_LEDGER_PATH` 指定完整路径。清理 `~/.usagebook/` 扫描缓存不会清理它；删除账本文件则会丢失已保存的历史，请先用 `usagebook ledger backup` 备份。
+长期账本与缓存分开，serve 默认自动初始化，操作见 [README 的长期账本步骤](README.md#长期账本)；默认位于 macOS 的 `~/Library/Application Support/usagebook/usage-ledger.db` 或 Linux 的 `${XDG_DATA_HOME:-~/.local/share}/usagebook/usage-ledger.db`，也可用 `USAGEBOOK_LEDGER_PATH` 指定完整路径。清理 `~/.usagebook/` 扫描缓存不会清理它；删除账本文件则会丢失已保存的历史，请先用 `usagebook ledger backup` 备份。重置、移动或手动恢复账本时须整组处理主文件与 `-wal`、`-shm`、`-journal`，不要只复制主文件；备份恢复请用 `usagebook ledger restore`，主文件已缺失时用 `usagebook ledger rescue` 到新路径。主文件缺失但 sidecar 仍在时不会自动新建空库。
 
 ## 4. 终端报表与导出
 

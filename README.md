@@ -137,7 +137,7 @@ usagebook serve
 
 账本仅保存白名单用量元数据，不保存对话正文。已确认的历史在原文件被清理后仍保留；未读取就消失的记录无法恢复。未变化的文件跳过正文，坏文件或不可读子目录隔离并显示缺口，健康目录继续入账；局部发现失败时保留旧历史，完整扫描恢复后再判断文件是否消失。已发布的贡献遇到后来出现的矛盾候选时仍保留原工具、模型、日期和用量，并标记冲突；尚未发布且无法裁决的候选暂不计入。
 
-数据保存在独立的 `usage-ledger.db`：macOS 为 `~/Library/Application Support/usagebook/`，Linux 为 `${XDG_DATA_HOME:-~/.local/share}/usagebook/`，Windows 为 `%LOCALAPPDATA%\usagebook\`。可用 `USAGEBOOK_LEDGER_PATH` 指定完整文件路径。请求明细长期保留；按天汇总可随时由明细重算。账本与旧扫描缓存分开，关闭或清理旧缓存不清除账本。
+数据保存在独立的 `usage-ledger.db`：macOS 为 `~/Library/Application Support/usagebook/`，Linux 为 `${XDG_DATA_HOME:-~/.local/share}/usagebook/`，Windows 为 `%LOCALAPPDATA%\usagebook\`。可用 `USAGEBOOK_LEDGER_PATH` 指定完整文件路径。请求明细长期保留；按天汇总可随时由明细重算。账本与旧扫描缓存分开，关闭或清理旧缓存不清除账本。重置、移动或手动恢复账本时必须整组处理主文件与 `-wal`、`-shm`、`-journal`，不要只复制主文件；备份恢复请优先使用 `ledger restore`，主文件已缺失时用 `ledger rescue` 到新路径。主文件缺失而 sidecar 仍在时，`ledger init`/`serve` 会拒绝新建，避免旧 WAL 被重放进新库。
 
 维护前停止 `serve` 及其他连接。同一账本只允许一个采集写入者；备份、恢复、忘记历史和时区重建需独占锁。升级后首次运行服务或其他可能写入账本的命令前，先运行下方备份命令，保留旧版本备份；其他写入入口不会自动创建升级前备份：
 
