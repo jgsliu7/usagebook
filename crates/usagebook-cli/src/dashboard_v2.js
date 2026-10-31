@@ -16,6 +16,7 @@ const modelColorIndices = new Map();
 const previousCatalogIds = {source:null,model:null};
 const catalogSequences={source:0,model:0};
 const catalogJobs={source:null,model:null};
+let catalogTurnSignal=null;
 const catalogRevisions={source:0,model:0},catalogSynced={source:0,model:0};
 let catalogFailureSince=null;
 const filterPanels = {source:null,model:null};
@@ -30,6 +31,8 @@ const selector = (sel,dim) => {
 };
 const catalogItems = dim => catalogs[dim].items;
 const stampKey = stamp => JSON.stringify(stamp);
+const queryBundleDetail = () => v2Status?.capabilities?.query_bundle_metrics===true?'metrics':'full';
+const capturedBundleDetail = query => query?.bundle_detail==='metrics'?'metrics':'full';
 const catalogComplete = dim => !!catalogs[dim].stamp&&!!v2Status?.stamp&&stampKey(catalogs[dim].stamp)===stampKey(v2Status.stamp);
 const setScanningText = txt => { $('#scanning-txt').textContent = txt; };
 function showSelectionIssue(kind,dimension='model') {
@@ -89,6 +92,7 @@ function validateSelection(dim,sel) {
 }
 
 // Only chart geometry becomes Number. Text, tooltips, totals and ratios use decimal strings/BigInt.
+const integerFormatter = new Intl.NumberFormat('en-US');
 function formatInteger(value, compact = true) {
   if (value == null) return '—';
   const n = BigInt(value), negative = n < 0n, abs = negative ? -n : n;
@@ -99,7 +103,7 @@ function formatInteger(value, compact = true) {
     const base = 10n ** BigInt(digits), rounded = (abs * base + scale / 2n) / scale;
     return (negative?'-':'') + (rounded/base).toString() + '.' + (rounded%base).toString().padStart(digits,'0') + suffix;
   }
-  return n.toLocaleString('en-US');
+  return integerFormatter.format(n);
 }
 function metricText(value, compact = true) {
   if (!value || value.state === 'unknown' || value.known_value == null) return words('未知','Unknown');
@@ -180,8 +184,8 @@ async function apiV2(path,body,signal) {
     return await Promise.race([
       (async()=>{
         const response=await fetch('/api/v2/'+path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:encoded,cache:'no-store',signal:controller.signal});
-        let value;try{value=await response.json();}catch(e){if(e.name==='AbortError')throw e;throw new Error(`HTTP ${response.status}`);}
-        if(!response.ok){const detail=typeof value.error==='object'?value.error:{code:value.error,message:value.message};const e=new Error(detail?.message||`HTTP ${response.status}`);e.code=detail?.code;throw e;}
+        let value;try{value=await response.json();}catch(e){if(e.name==='AbortError')throw e;const error=new Error(`HTTP ${response.status}`);error.httpStatus=response.status;throw error;}
+        if(!response.ok){const detail=typeof value?.error==='object'?value.error:{code:value?.error,message:value?.message};const e=new Error(detail?.message||`HTTP ${response.status}`);e.code=detail?.code;e.httpStatus=response.status;throw e;}
         return value;
       })(),
       new Promise((_,reject)=>{timeout=setTimeout(()=>{controller.abort();reject(new Error(words('请求超时，请重试','Request timed out; please retry')));},15000);}),
@@ -281,11 +285,11 @@ function hiddenBarSeries(id,namespace,ids) {
   return new Set(ids.filter(entity=>entry.hidden.has(barSeriesKey(namespace,entity))));
 }
 function currentQueryKey() {
-  return JSON.stringify([state.win,state.rs,state.re,localDayStr(),_selKey(state.srcSel),_selKey(state.mdlSel),state.metric,state.group,v2Status?.stamp?.report_timezone]);
+  return JSON.stringify([state.win,state.rs,state.re,localDayStr(),_selKey(state.srcSel),_selKey(state.mdlSel),state.metric,state.group,v2Status?.stamp?.report_timezone,queryBundleDetail()]);
 }
 function buildQuery(windowOverride,overrides={}) {
   const bounds=rangeBounds();
-  return {window:windowOverride||(bounds?{kind:'calendar',start_date:bounds[0],end_date_exclusive:addDay(bounds[1],1)}:{kind:'all'}),report_timezone:v2Status.stamp.report_timezone,as_of_ms:null,sources:selector(Object.hasOwn(overrides,'source')?overrides.source:state.srcSel,'source'),models:selector(Object.hasOwn(overrides,'model')?overrides.model:state.mdlSel,'model'),metric:METRIC_IDS[state.metric],group_by:state.group};
+  return {window:windowOverride||(bounds?{kind:'calendar',start_date:bounds[0],end_date_exclusive:addDay(bounds[1],1)}:{kind:'all'}),report_timezone:v2Status.stamp.report_timezone,as_of_ms:null,sources:selector(Object.hasOwn(overrides,'source')?overrides.source:state.srcSel,'source'),models:selector(Object.hasOwn(overrides,'model')?overrides.model:state.mdlSel,'model'),metric:METRIC_IDS[state.metric],group_by:state.group,...(queryBundleDetail()==='metrics'?{bundle_detail:'metrics'}:{})};
 }
 function comparisonSpec() {
   if(state.win==='all')return null;
@@ -340,33 +344,49 @@ function catalogTask(dim,stamp) {
   job.promise=readFullCatalog(dim,controller.signal,stamp).finally(()=>{if(catalogJobs[dim]===job)catalogJobs[dim]=null;});
   catalogJobs[dim]=job;return job.promise;
 }
+function catalogReadTurn(signal,isCurrent) {
+  // Do not enqueue SQL for directories that a rapid next click will discard.
+  // Once dispatched, aborting fetch cannot guarantee server work is stopped.
+  return new Promise(resolve=>{
+    let timer;
+    const finish=active=>{signal.removeEventListener('abort',cancel);if(catalogTurnSignal===signal)catalogTurnSignal=null;resolve(active);};
+    const cancel=()=>{clearTimeout(timer);finish(false);};
+    if(signal.aborted){resolve(false);return;}
+    catalogTurnSignal=signal;
+    signal.addEventListener('abort',cancel,{once:true});
+    timer=setTimeout(()=>finish(!signal.aborted&&isCurrent()),150);
+  });
+}
 function syncSelections(dimensions=['source','model']) {
   for(const dim of dimensions){
     const key=dim==='source'?'srcSel':'mdlSel',ids=catalogItems(dim).map(x=>x.id),previous=previousCatalogIds[dim];
     let sel=state[key],solo=state[dim==='source'?'srcSolo':'mdlSolo'];
     // Stable model IDs contain case-sensitive base64url; only source IDs have legacy case aliases.
     const matchKey=id=>dim==='source'?id.toLowerCase():id;
+    if(!catalogComplete(dim)||catalogs[dim].next!==null||!ids.every(id=>typeof id==='string'))return false;
+    const oldSel=sel,oldSolo=solo;
     if(solo!==null){
       const match=ids.find(id=>matchKey(id)===matchKey(solo));
       // Source catalogs depend on the cutoff and successful source scans, so even
       // a complete first directory cannot prove that a saved target is invalid.
       // Models are invalidated only by the global server check after the query.
-      solo=match??solo;if(!setSelection(dim,new Set([solo]),solo))return false;
-      previousCatalogIds[dim]=new Set(ids);
-      continue;
-    }
-    if(sel&&ids.length&&!sel.exclude){
+      solo=match??solo;sel=new Set([solo]);
+    }else if(sel&&ids.length&&!sel.exclude){
       if(sel.size){
         const known=new Map(ids.map(id=>[matchKey(id),id]));
         // A directory can omit a selected source at its cutoff, or a model
         // selected from a newer table while the directory is still catching up.
         const alive=new Set([...sel].map(id=>known.get(matchKey(id))??id));
-        if(previous)for(const id of ids)if(!previous.has(id))alive.add(id);
-        sel=alive.size===ids.length&&ids.every(id=>alive.has(id))?null:alive;
+        if(previous)for(const id of ids)if(!previous.has(matchKey(id)))alive.add(id);
+        sel=alive;
       }
-      if(!setSelection(dim,sel))return false;
     }
-    previousCatalogIds[dim]=new Set(ids);
+    // Do not advance the baseline when the proposed selection cannot be used.
+    if(!validateSelection(dim,sel))return false;
+    if((_selKey(sel)!==_selKey(oldSel)||solo!==oldSolo)&&!setSelection(dim,sel,solo))return false;
+    const seen=new Set(previous||[]);
+    for(const id of ids)seen.add(matchKey(id));
+    previousCatalogIds[dim]=seen;
   }
   return true;
 }
@@ -393,7 +413,7 @@ async function fetchDashboard(signal) {
   let day=payload.selected_day??payload.latest_day,sourceTable=payload.source_table,modelTable=payload.model_table;
   // Future-dated facts and daily evidence can become eligible as time advances
   // without changing the data stamp. Totals must share this query's cutoff.
-  const globalKey=stampKey(response.stamp)+'|'+response.as_of_ms;
+  const globalKey=stampKey(response.stamp)+'|'+response.as_of_ms+'|'+capturedBundleDetail(query);
   const isGlobal=query.window.kind==='all'&&query.sources.mode==='all'&&query.models.mode==='all';
   let globalMetrics=payload.global_metrics??(isGlobal?payload.totals.metrics:globalTotalsCache?.key===globalKey?globalTotalsCache.metrics:null);
   if((payload.global_metrics||isGlobal)&&!signal?.aborted)globalTotalsCache={key:globalKey,metrics:globalMetrics};
@@ -423,12 +443,15 @@ function verifyStamp(expected,actual) {
 async function load(passive,signal) {
   clearTimeout(wakeConfirmTimer);wakeConfirmTimer=null;
   const seq=++loadSeq,intentRevision=chartIntentRevision;pendingQueryKey=currentQueryKey();v2Controller?.abort();const controller=v2Controller=new AbortController();
+  if(v2View&&v2View.key!==pendingQueryKey)for(const dim of ['source','model']){
+    cancelFilterRead(dim);catalogJobs[dim]?.controller.abort();
+  }
   const abort=()=>controller.abort();
   if(signal?.aborted)controller.abort();else signal?.addEventListener('abort',abort,{once:true});
   clearTimeout(coldRetryTimer);coldRetryTimer=null;
   try {
     if(DATA?.ready)renderStatus();
-    let status=await readStatusV2('status?arf='+(passive===true?'':state.arf),controller.signal,()=>seq===loadSeq);
+    let status=await readStatusV2('dashboard/status?arf='+(passive===true?'':state.arf),controller.signal,()=>seq===loadSeq);
     if(seq!==loadSeq||controller.signal.aborted)return {ok:false,superseded:true};
     let scanIssue=observeScanStatus(status);
     registerLabels('source',(status.sources||[]).map(s=>({id:s.id,label:s.label||s.id})));
@@ -444,17 +467,11 @@ async function load(passive,signal) {
       return {ok:false,pending:true};
     }
     if(!validateSelection('model',state.mdlSel)||!validateSelection('source',state.srcSel))return validationFailureKind==='query'?{ok:false,queryLimited:true}:{ok:false,selectionLimited:true};
-    // Source membership is as-of dependent; model names are snapshot metadata.
-    if(catalogJobs.model&&catalogJobs.model.key!==stampKey(status.stamp))catalogJobs.model.controller.abort();
-    const changedCatalogs=['source','model'].filter(dim=>dim==='source'||!catalogs[dim].stamp||stampKey(catalogs[dim].stamp)!==stampKey(status.stamp));
-    // Directory pagination is independent metadata. A busy catalog must not
-    // prevent a complete, consistent dashboard response from being displayed.
-    const catalogWork=changedCatalogs.map(dim=>({dim,promise:catalogTask(dim,status.stamp).then(ok=>({ok}),error=>({error}))}));
     pendingQueryKey=currentQueryKey();
     let next;
     for(let attempt=0;attempt<2;attempt++){
       try{next=await fetchDashboard(controller.signal);break;}
-      catch(e){if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){status=await readStatusV2('status?arf=',controller.signal,()=>seq===loadSeq);scanIssue=observeScanStatus(status);continue;}throw e;}
+      catch(e){if(attempt===0&&['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){status=await readStatusV2('dashboard/status?arf=',controller.signal,()=>seq===loadSeq);scanIssue=observeScanStatus(status);continue;}throw e;}
     }
     if(seq!==loadSeq||controller.signal.aborted||intentRevision!==chartIntentRevision||next.key!==currentQueryKey())return {ok:false,superseded:true};
     let selectionConfirmationDeferred=false;
@@ -499,6 +516,12 @@ async function load(passive,signal) {
     refreshTimedOut=false;
     $('#scanning').hidden=true;$('#app').hidden=false;
     prepareDays();next.key=currentQueryKey();renderPayload();
+    // Give the selected dashboard the query workers before directory reads.
+    // Source membership is as-of dependent; model names are snapshot metadata.
+    if(catalogJobs.model&&catalogJobs.model.key!==stampKey(status.stamp))catalogJobs.model.controller.abort();
+    const changedCatalogs=['source','model'].filter(dim=>dim==='source'||!catalogs[dim].stamp||stampKey(catalogs[dim].stamp)!==stampKey(status.stamp));
+    const catalogTurn=catalogReadTurn(controller.signal,()=>seq===loadSeq&&intentRevision===chartIntentRevision);
+    const catalogWork=changedCatalogs.map(dim=>({dim,promise:catalogTurn.then(active=>active?catalogTask(dim,status.stamp):false).then(ok=>({ok}),error=>({error}))}));
     if(!recoveryUntil&&(status.refreshing||scanIssue)){recoveryUntil=Date.now()+RETRY_WAIT_MS;recoveryBase=status.refresh_generation;}
     if(recoveryUntil){
       if(!status.refreshing&&!scanIssue&&(recoveryBase===null||status.refresh_generation!==recoveryBase)){recoveryUntil=0;recoveryBase=null;clearTimeout(coldRetryTimer);coldRetryTimer=null;}
@@ -510,7 +533,7 @@ async function load(passive,signal) {
       const before=currentQueryKey();if(!syncSelections([dim]))return;catalogSynced[dim]=catalogRevisions[dim];
       if(currentQueryKey()!==before){load(true);return;}
       renderSelectorButtons();
-      if(filterPanels[dim]&&JSON.stringify(filterPanels[dim].items)!==JSON.stringify(catalogItems(dim)))buildFilterPanel(dim);
+      syncFilterCatalog(dim);
     };
     // A complete model directory can be displayed while an unrelated source
     // directory is still loading, without changing the saved selection yet.
@@ -519,7 +542,7 @@ async function load(passive,signal) {
       clearSelectionIssue('catalog',dim);
       if(dim!=='model')return;
       renderSelectorButtons();
-      if(filterPanels.model&&JSON.stringify(filterPanels.model.items)!==JSON.stringify(catalogItems('model')))buildFilterPanel('model');
+      syncFilterCatalog('model');
     });
     void Promise.all(catalogWork.map(work=>work.promise)).then(results=>{
       if(seq!==loadSeq||controller.signal.aborted||intentRevision!==chartIntentRevision)return;
@@ -541,7 +564,15 @@ async function load(passive,signal) {
 }
 function render() {
   setWinSegUi();renderSelectorButtons();
-  if(v2View&&v2View.key===currentQueryKey()){renderPayload();return;}
+  if(v2View&&v2View.key===currentQueryKey()){
+    renderPayload();
+    // Returning to a displayed range may have cancelled its cold directory
+    // before dispatch. Recover even when the intervening query already failed.
+    const missingCatalog=['source','model'].some(dim=>!catalogComplete(dim)&&
+      (!catalogTurnSignal||catalogTurnSignal.aborted)&&(!catalogJobs[dim]||catalogJobs[dim].controller.signal.aborted));
+    if(pendingQueryKey!==currentQueryKey()&&(pendingQueryKey!==null||missingCatalog))load(true);
+    return;
+  }
   if(pendingQueryKey!==currentQueryKey())load(true);
 }
 function prepareDays() {
@@ -570,7 +601,7 @@ function renderPayload() {
   if(!loadFailed){$('#ledger-note').textContent='';$('#ledger-note').hidden=true;}
   for(const dimension of ['source','model']){
     const panel=filterPanels[dimension];if(panel&&!panel.element.hidden){
-      if(panel.key!==filterWindowKey())buildFilterPanel(dimension);else renderFilterList(dimension);
+      if(panel.controller.signal.aborted||panel.key!==filterWindowKey())buildFilterPanel(dimension);else renderFilterList(dimension);
     }
   }
   requestAnimationFrame(()=>{for(const chart of Object.values(charts))try{chart.resize();}catch{}loadVisibleTablePages();});
@@ -601,15 +632,43 @@ function renderCards() {
   items.push([t('card.output'),m.output_combined,hasTotal?ratioText(m.output_combined,m.total)+t('card.reasonShare',ratioText(m.reasoning_output,m.output_combined)):'—']);
   $('#cards').innerHTML=items.map(([label,value,detail,highlight,delta])=>`<div class="card${highlight?' hl':''}"><div class="k">${escapeHtml(label)}</div><div class="v" title="${escapeHtml(metricTitle(value))}">${escapeHtml(metricText(value))}</div><div class="sub">${escapeHtml(detail)}${delta||''}</div></div>`).join('');
 }
+function invalidateBundleDetail(previous,signal) {
+  if(previous===queryBundleDetail())return;
+  globalTotalsCache=null;tableLimitBlocks.clear();
+  for(const dim of ['source','model']){
+    selectionIssues.delete('table:'+dim);selectionIssues.delete('panel:'+dim);
+    cancelFilterRead(dim);catalogJobs[dim]?.controller.abort();
+    const panel=filterPanels[dim];
+    if(panel){panel.key='';panel.stats.clear();panel.statsNext=null;panel.statsDone=false;renderFilterList(dim);}
+    // Keep the previous values visible during recovery, but their cursor
+    // belongs to a different request contract and must never be resumed.
+    if(v2View&&capturedBundleDetail(v2View.query)!==queryBundleDetail())v2View.tables[dim].next_cursor=null;
+    $('#more-'+dim).hidden=true;
+  }
+  renderSelectionIssue();
+  // The owning load has not built its query yet and can continue with the
+  // new capability. An independent status read (including arf=0) must
+  // replace any old load, page reads and filter work with a fresh first page.
+  if((!signal||signal!==v2Controller?.signal)&&(v2View||pendingQueryKey!==null)){
+    v2Controller?.abort();void load(true);
+  }
+}
 async function readStatusV2(path,signal,isCurrent) {
   const sequence=++statusRequestSeq;
   const current=()=>sequence===statusRequestSeq&&!signal?.aborted&&isCurrent();
   try {
-    const result=await apiV2(path,undefined,signal);
+    let result;
+    try{result=await apiV2(path,undefined,signal);}
+    catch(error){
+      if(error.httpStatus!==404||!/^dashboard\/status(?:\?|$)/.test(path)||!current())throw error;
+      result=await apiV2(path.replace(/^dashboard\//,''),undefined,signal);
+    }
     if(!result||typeof result!=='object'||!Array.isArray(result.sources))throw new Error('Invalid status response');
     if(current()){
+      const previous=queryBundleDetail();
       v2Status=result;statusReachable=true;statusFailureSince=null;
       clearTimeout(statusNoticeTimer);statusNoticeTimer=null;
+      invalidateBundleDetail(previous,signal);
       if(DATA?.ready)renderStatus();
     }
     return result;
@@ -636,8 +695,9 @@ function renderStatus() {
   if(selectionIssue)details.push(selectionIssueDetail);
   const scanNotice=scanIssueSince!==null&&Date.now()-scanIssueSince>=NOTICE_DELAY_MS;
   const connectionFailed=statusReachable===false&&statusFailureSince!==null&&Date.now()-statusFailureSince>=NOTICE_DELAY_MS;
+  const captureSaveFailure=typeof v2Status?.refresh_error==='string'&&v2Status.refresh_error.startsWith('CAPTURE_SAVE_FAILED:');
   if(connectionFailed)details.push(t('status.connFail'));
-  if(loadFailed||connectionFailed)details.push(t('st.connFailShow'));else if(v2Status?.refresh_error&&scanNotice)details.push(t('st.scanFailShow'));
+  if(loadFailed||connectionFailed)details.push(t('st.connFailShow'));else if(v2Status?.refresh_error&&!captureSaveFailure&&scanNotice)details.push(t('st.scanFailShow'));
   if(stale)details.push(t('st.waitData'));
   const key=currentQueryKey(),mismatched=!!(v2View&&v2View.key!==key);
   const reading=pendingQueryKey===key,pending=mismatched&&reading;
@@ -650,6 +710,8 @@ function renderStatus() {
   if((reading||refreshBusy)&&!state.arf)details.push(t('st.readingSaved'));
   const isolated=(v2Status?.sources||[]).reduce((n,s)=>n+BigInt(s.isolated_objects||'0'),0n);
   if(isolated)details.push(words(`${isolated} 个文件已隔离`,`${isolated} files isolated`));
+  const pendingHistory=(v2Status?.sources||[]).reduce((n,s)=>n+BigInt(s.pending_compatibility_observations||'0'),0n);
+  if(pendingHistory)details.push(words(`${pendingHistory} 条历史用量待核对，尚未计入新增。`,`${pendingHistory} historical usage observations need review and are not included as new usage.`));
   for(const source of v2Status?.sources||[])if(source.accounting?.state==='partial'){
     const count=source.accounting.unallocated_sessions||'0';
     details.push(words(`${srcLabel(source.id)}：${count} 个会话存在未能归入请求的累计用量。`,
@@ -668,8 +730,8 @@ function renderStatus() {
   const saved=loadFailed||connectionFailed||refreshTimedOut||stale||(mismatched&&!pending)||isolated>0n||(scanNotice&&(v2Status?.refresh_error||failed));
   const persistenceFailure=(v2Status?.sources||[]).find(s=>['save_error','publish_error','recovery_unverified'].includes(s.state));
   const storageFailure=v2Status?.storage?.error;
-  const failureText=storageFailure||persistenceFailure?.state==='save_error'?words('保存失败','Save failed'):persistenceFailure?.state==='publish_error'?words('入账失败','Publish failed'):persistenceFailure?words('待恢复','Recovery pending'):null;
-  const el=$('#status'),text=failureText||(selectionIssue?words(selectionIssue==='storage'?'未保存':selectionIssue==='catalog'?'目录受限':['query','table','panel'].includes(selectionIssue)?'查询受限':'筛选受限',selectionIssue==='storage'?'Not saved':selectionIssue==='catalog'?'Directory limited':['query','table','panel'].includes(selectionIssue)?'Query limited':'Filter limited'):t(updating?'st.shortUpdating':saved?'st.shortSaved':'st.shortReady'));
+  const failureText=storageFailure||captureSaveFailure||persistenceFailure?.state==='save_error'?words('保存失败','Save failed'):persistenceFailure?.state==='publish_error'?words('入账失败','Publish failed'):persistenceFailure?words('待恢复','Recovery pending'):null;
+  const el=$('#status'),text=failureText||(selectionIssue?words(selectionIssue==='storage'?'未保存':selectionIssue==='catalog'?'目录受限':['query','table','panel'].includes(selectionIssue)?'查询受限':'筛选受限',selectionIssue==='storage'?'Not saved':selectionIssue==='catalog'?'Directory limited':['query','table','panel'].includes(selectionIssue)?'Query limited':'Filter limited'):pendingHistory?words('待核对','Review pending'):t(updating?'st.shortUpdating':saved?'st.shortSaved':'st.shortReady'));
   if(el.dataset.last!==text){el.textContent=text;el.dataset.last=text;}
   el.classList.toggle('st-scan',updating);
   el.title=[...new Set([...details,...dataNotes(),...(v2Status?.sources||[]).filter(s=>s.error).map(s=>`${srcLabel(s.id)}: ${s.error}`),v2Status?.refresh_error||'',v2Status?.storage?.error||''].filter(Boolean))].join('\n');
@@ -823,7 +885,7 @@ function renderCharts() {
   renderDoughnut();
 }
 function dateInReportZone(ms,reportTimezone) {
-  const parts=new Intl.DateTimeFormat('en-US',{timeZone:reportTimezone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(Number(ms)));
+  const parts=calendarDayFormatter(reportTimezone).formatToParts(new Date(Number(ms)));
   const get=type=>parts.find(p=>p.type===type).value;return `${get('year')}-${get('month')}-${get('day')}`;
 }
 function renderDoughnut() {
@@ -849,7 +911,10 @@ function sourceCacheReadShareHTML(metrics) {
   return ` <span style="color:var(--muted)">(${ratioText(read,total)})</span>`;
 }
 function renderDetailTable(dim) {
-  const page=v2View.tables[dim],model=dim==='model',cw=cwVisible(),sel=model?state.mdlSel:state.srcSel;
+  const page=v2View.tables[dim],elId='tbl-'+dim;
+  $('#more-'+dim).hidden=!page.next_cursor;
+  if(tblMemoKey()===_tblKeys[elId])return;
+  const model=dim==='model',cw=cwVisible(),sel=model?state.mdlSel:state.srcSel;
   let html=model?`<tr><th>${t('tbl.model')}</th><th style="text-align:left">${t('tbl.source')}</th><th>${t('tbl.input')}</th><th>${t('tbl.cr')}</th>${cw?`<th>${t('tbl.cw')}</th>`:''}<th>${t('tbl.output')}</th><th>${t('tbl.sum')}</th><th>${t('tbl.share')}</th><th>${t('tbl.requests')}</th></tr>`:`<tr><th>${t('tbl.source')}</th><th>${t('tbl.requests')}</th><th>${t('tbl.input')}</th><th>${t('tbl.cr')}</th>${cw?`<th>${t('tbl.cw')}</th>`:''}<th>${t('tbl.output')}</th><th>${t('tbl.sum')}</th></tr>`;
   for(const row of page.rows){const m=row.bundle.metrics,on=selected(sel,row.id),cls=(model?'mrow':'srcrow')+(sel?(on?' solo-on':' solo-off'):'');
     const name=model?escapeHtml(row.label):`<span class="srcdot" style="background:${srcColor(row.id)}"></span>${escapeHtml(row.label)}`;
@@ -864,8 +929,7 @@ function renderDetailTable(dim) {
     html+='</tr>';
   }
   if(!page.rows.length)html+=`<tr><td colspan="${(model?8:6)+(cw?1:0)}" class="empty-tip">${t(model?'empty.noSel':'empty.noRange')}</td></tr>`;
-  setTableHTML('tbl-'+dim,html);
-  $('#more-'+dim).hidden=!page.next_cursor;
+  setTableHTML(elId,html);
 }
 function shareText(share) {
   if(share?.ratio_decimal==null)return '—';
@@ -876,7 +940,7 @@ function shareTitle(share) {
   return shareText(share);
 }
 async function loadTablePage(dim) {
-  const view=v2View,signal=v2Controller?.signal;if(!view||view.tableBusy.has(dim)||!view.tables[dim].next_cursor)return;
+  const view=v2View,signal=v2Controller?.signal;if(!view||view.key!==currentQueryKey()||view.tableBusy.has(dim)||!view.tables[dim].next_cursor)return;
   const block=tableLimitBlocks.get(dim);
   if(block?.blocked&&block.key===view.key&&block.stamp===stampKey(view.response.stamp))return;
   view.tableBusy.add(dim);renderDetailTable(dim);
@@ -899,13 +963,29 @@ function renderSelectorButtons() {
     button.classList.toggle('filter-on',!!sel);button.innerHTML=`<span class="lbl">${escapeHtml(label)}</span> <span class="cnt">${sub?escapeHtml(sub)+' · ':''}▾</span>`;
   }
 }
-function filterWindowKey(){return JSON.stringify([rangeBounds(),v2View?.response.stamp,v2View?.response.as_of_ms]);}
+function filterRankingQuery(view) {
+  return {...view.query,as_of_ms:view.response.as_of_ms,sources:{mode:'all'},models:{mode:'all'},metric:'total'};
+}
+function filterWindowKey(){return v2View?JSON.stringify([v2View.key,filterRankingQuery(v2View),v2View.response.stamp,v2View.response.as_of_ms]):'';}
+function syncFilterCatalog(dim) {
+  const panel=filterPanels[dim];if(!panel||panel.element.hidden)return;
+  if(panel.controller.signal.aborted||panel.key!==filterWindowKey()){buildFilterPanel(dim);return;}
+  // The directory only supplies identities/labels; it does not invalidate the
+  // current-window ranking already being read from the displayed snapshot.
+  panel.items=catalogItems(dim);
+  panel.element.querySelector('.ms-search').placeholder=t('ms.search',catalogs[dim].total);
+  renderFilterList(dim);
+}
+function cancelFilterRead(dim) {
+  const panel=filterPanels[dim];if(!panel)return;
+  panel.controller.abort();panel.sequence++;panel.busy=false;
+}
 function buildFilterPanel(dim) {
   if(!v2View)return;
   const element=$(dim==='source'?'#src-ms-panel':'#mdl-ms-panel'),previous=filterPanels[dim];
   const scroll=element.querySelector('.ms-list')?.scrollTop||0;
   previous?.controller.abort();
-  const panel=filterPanels[dim]={element,key:filterWindowKey(),search:element.dataset.q||'',items:catalogItems(dim),next:null,stats:new Map(),statsNext:null,statsDone:false,busy:false,sequence:0,visibleLimit:previous?.visibleLimit||200,controller:new AbortController()};
+  const panel=filterPanels[dim]={element,key:filterWindowKey(),view:v2View,query:filterRankingQuery(v2View),search:element.dataset.q||'',items:catalogItems(dim),next:null,stats:new Map(),statsNext:null,statsDone:false,busy:false,sequence:0,visibleLimit:previous?.visibleLimit||200,controller:new AbortController()};
   // Retain active inputs and controls across refreshes, including an unfinished IME composition.
   if(!previous)element.innerHTML=`<div class="ms-head"><input class="ms-search" placeholder="${escapeHtml(t('ms.search',catalogs[dim].total))}" value="${escapeHtml(panel.search)}"><button class="ms-act" data-act="all">${t('ms.all')}</button><button class="ms-act" data-act="none">${t('ms.none')}</button></div><div class="ms-list"></div><div class="ms-error" role="status" style="color:var(--muted);padding:0 8px"></div>`;
   const input=element.querySelector('.ms-search');input.placeholder=t('ms.search',catalogs[dim].total);
@@ -918,21 +998,23 @@ function buildFilterPanel(dim) {
   element.querySelector('.ms-error').textContent='';
   renderFilterList(dim);list.scrollTop=scroll;
   // Only compact current-window summaries are read, when a selector is opened.
-  (async()=>{await readFilterPage(dim,false);while(panel===filterPanels[dim]&&!panel.controller.signal.aborted&&panel.statsNext)await readFilterPage(dim,true);})();
+  (async()=>{await readFilterPage(dim,false);while(panel===filterPanels[dim]&&!panel.controller.signal.aborted&&panel.key===filterWindowKey()&&panel.view.key===currentQueryKey()&&panel.statsNext)await readFilterPage(dim,true);})();
 }
 async function readFilterPage(dim,append) {
   const panel=filterPanels[dim];if(!panel||panel.busy)return;
-  const seq=++panel.sequence,view=v2View;panel.busy=true;
+  const view=panel.view;
+  if(panel.key!==filterWindowKey()||view.key!==currentQueryKey()||panel.controller.signal.aborted)return;
+  const seq=++panel.sequence;panel.busy=true;
   try{
-    const query={...view.query,sources:{mode:'all'},models:{mode:'all'},metric:'total'};
+    const query=panel.query;
     const ranking=await apiV2('query',{kind:'table',query,dimension:dim,scope:'facet',page:{limit:200,cursor:append?panel.statsNext:null}},panel.controller.signal);
-    if(panel!==filterPanels[dim]||seq!==panel.sequence)return;
+    if(panel!==filterPanels[dim]||seq!==panel.sequence||panel.key!==filterWindowKey()||view.key!==currentQueryKey())return;
     verifyStamp(view.response,ranking);
     const data=ranking.payload.data;if(!append)panel.stats.clear();
     for(const row of data.rows)panel.stats.set(row.id,row);
     panel.statsNext=data.next_cursor;panel.statsDone=!data.next_cursor;registerLabels(dim,data.rows);
     panel.element.querySelector('.ms-error').textContent='';clearSelectionIssue('panel',dim);
-  }catch(e){if(panel===filterPanels[dim]&&seq===panel.sequence&&e.name!=='AbortError'){
+  }catch(e){if(panel===filterPanels[dim]&&seq===panel.sequence&&panel.key===filterWindowKey()&&view.key===currentQueryKey()&&e.name!=='AbortError'){
     panel.statsNext=null;
     if(['CURSOR_STALE','TIMEZONE_CHANGED'].includes(e.code)){panel.key='';load(true);}else if(['QUERY_LIMIT','BODY_TOO_LARGE'].includes(e.code)){showSelectionIssue('panel',dim);}else{
       panel.element.querySelector('.ms-error').textContent=words('用量稍后更新，筛选仍可使用。','Usage will update later; filters remain available.');

@@ -215,6 +215,20 @@ pub enum GroupBy {
     Model,
     None,
 }
+/// Metrics-only bundles omit session and cost metadata and its validation.
+/// The default full representation preserves pre-existing query/cursor identities.
+#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleDetail {
+    #[default]
+    Full,
+    Metrics,
+}
+impl BundleDetail {
+    pub fn is_full(&self) -> bool {
+        *self == Self::Full
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Query {
@@ -225,6 +239,8 @@ pub struct Query {
     pub models: Selector,
     pub metric: Metric,
     pub group_by: GroupBy,
+    #[serde(default, skip_serializing_if = "BundleDetail::is_full")]
+    pub bundle_detail: BundleDetail,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

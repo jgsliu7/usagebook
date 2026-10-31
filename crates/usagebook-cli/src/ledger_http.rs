@@ -33,6 +33,7 @@ struct State {
     durable_backlog: bool,
     durable_errors: Value,
     time_repair_error: Option<String>,
+    writer_stopped: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum CollectionMode {
@@ -52,10 +53,25 @@ impl State {
     // forced scan starts coalesce; requests arriving during it require one more.
     // All transitions use the same State mutex as status publication.
     fn request_refresh(&mut self) {
+        if self.writer_stopped {
+            return;
+        }
         self.pending_force = true;
         self.refreshing = true;
     }
+    fn stop_writer(&mut self, code: &str) {
+        self.writer_stopped = true;
+        self.pending_force = false;
+        self.refreshing = false;
+        self.durable_backlog = false;
+        self.durable_errors["ledger"] = serde_json::json!(code);
+        self.error = Some(code.to_owned());
+        self.refresh_generation = self.refresh_generation.saturating_add(1);
+    }
     fn begin_scan(&mut self, now: i64, first: bool, due: bool) -> Option<bool> {
+        if self.writer_stopped {
+            return None;
+        }
         let forced = self.pending_force;
         if !(first || forced || (due && self.periodic_allowed())) {
             return None;
@@ -88,7 +104,9 @@ impl State {
             || self.last_request_ms >= self.last_scan_started_ms
     }
     fn collection_state(&self) -> &'static str {
-        if self.refreshing || self.pending_force {
+        if self.writer_stopped {
+            "idle"
+        } else if self.refreshing || self.pending_force {
             "scanning"
         } else if self.periodic_allowed() {
             "waiting"
@@ -267,6 +285,7 @@ pub fn run(
         durable_backlog: durable_at_start,
         durable_errors: json!({}),
         time_repair_error: None,
+        writer_stopped: false,
     }));
     {
         let shared = shared.clone();
@@ -285,6 +304,19 @@ pub fn run(
             let mut last_time_repair = None::<Instant>;
             let mut time_repair_interval = Duration::from_secs(1);
             loop {
+                // Install/retry optional indexes only between writer batches.
+                // Fatal cleanup errors stop and drop this connection entirely;
+                // independent readers can still serve committed history.
+                if let Some(ledger) = writer.as_mut() {
+                    if let Err(error) = ledger.maintain_query_indexes_if_due() {
+                        tracing::error!(
+                            code = error.code(),
+                            "查询索引维护失败，已停止后台写入；请重启服务后重试"
+                        );
+                        shared.lock().unwrap().stop_writer(error.code());
+                        return;
+                    }
+                }
                 // Historical time recovery consumes only committed ledger
                 // evidence. It is independent of page views, source discovery,
                 // and the source backlog, and cannot mark collection as busy.
@@ -592,7 +624,7 @@ pub fn run(
                     };
                     // Hashing is proportional to live history; do it outside the
                     // shared status lock so readers can keep using the old snapshot.
-                    let fingerprint = snapshot.content_fingerprint();
+                    let mut fingerprint = snapshot.content_fingerprint();
                     let mut snapshot = snapshot;
                     let mut error = error;
                     let capture_changed = {
@@ -608,11 +640,23 @@ pub fn run(
                     if let Some(ledger) = writer.as_mut() {
                         if let Err(e) = ledger.publish_compatibility_capture(&snapshot) {
                             error = Some(format!("CAPTURE_SAVE_FAILED:{}", e.code));
-                        } else if capture_changed {
-                            // New retained evidence may resolve an old pending
-                            // bucket. The persisted per-source gate still skips
-                            // unrelated or unchanged repair dependencies.
-                            last_time_repair = None;
+                        } else {
+                            // Publication may preserve historical compatibility
+                            // rows absent from the scan. Keep the in-memory
+                            // snapshot and its fingerprint aligned with the
+                            // exact version committed to the read model.
+                            match LegacySnapshot::restore_capture(ledger.connection()) {
+                                Ok(Some(saved)) => {
+                                    snapshot = saved;
+                                    fingerprint = snapshot.content_fingerprint();
+                                    if capture_changed {
+                                        // A new capture can resolve a pending bucket.
+                                        last_time_repair = None;
+                                    }
+                                }
+                                Ok(None) => error = Some("CAPTURE_READ_FAILED".into()),
+                                Err(e) => error = Some(format!("CAPTURE_READ_FAILED:{}", e.code)),
+                            }
                         }
                     }
                     let mut state = shared.lock().unwrap();
@@ -804,7 +848,17 @@ fn handle(mut req: Request, conn: &rusqlite::Connection, ctx: &ServerContext) {
     }
     let path = req.url().split('?').next().unwrap_or("/").to_owned();
     if path == "/api/v2/refresh" && req.method() == &Method::Post {
-        shared.lock().unwrap().request_refresh();
+        let mut state = shared.lock().unwrap();
+        if state.writer_stopped {
+            let code = state
+                .error
+                .clone()
+                .unwrap_or_else(|| "STORAGE_ERROR".into());
+            drop(state);
+            return error(req, 503, &code);
+        }
+        state.request_refresh();
+        drop(state);
         return response(
             req,
             json!({"refreshing":true}).to_string(),
@@ -812,9 +866,11 @@ fn handle(mut req: Request, conn: &rusqlite::Connection, ctx: &ServerContext) {
             202,
         );
     }
+    let status_request = matches!(path.as_str(), "/api/v2/status" | "/api/v2/dashboard/status")
+        && req.method() == &Method::Get;
     let (snapshot, refreshing, refresh_error, refresh_status) = {
         let mut s = shared.lock().unwrap();
-        if path == "/api/v2/status" && req.method() == &Method::Get {
+        if status_request {
             s.viewed(req.url());
         }
         (
@@ -843,9 +899,22 @@ fn handle(mut req: Request, conn: &rusqlite::Connection, ctx: &ServerContext) {
     )
     .with_catalog_cache(catalog_cache);
     let result: std::result::Result<Value, usagebook_core::ledger::query_types::QueryError> =
-        if path == "/api/v2/status" && req.method() == &Method::Get {
-            service.status().map(|mut s| {
+        if status_request {
+            let status = if path == "/api/v2/dashboard/status" {
+                usagebook_core::ledger::dashboard_status::read(
+                    conn,
+                    if durable_at_start {
+                        None
+                    } else {
+                        Some(&snapshot)
+                    },
+                )
+            } else {
+                service.status()
+            };
+            status.map(|mut s| {
                 s["capabilities"] = json!({
+                    "query_bundle_metrics": true,
                     "model_selector_exact": true,
                     "model_selector_max_ids": usagebook_core::ledger::query_types::MAX_MODEL_SELECTOR_IDS,
                     "model_selector_large_threshold": usagebook_core::ledger::query_types::LARGE_SELECTOR_THRESHOLD,
@@ -935,6 +1004,7 @@ fn handle(mut req: Request, conn: &rusqlite::Connection, ctx: &ServerContext) {
             let known = matches!(
                 path.as_str(),
                 "/api/v2/status"
+                    | "/api/v2/dashboard/status"
                     | "/api/v2/query"
                     | "/api/v2/catalog"
                     | "/api/v2/refresh"

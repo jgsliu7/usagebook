@@ -63,6 +63,19 @@ pub enum LedgerCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    /// 从备份救援到新目录；不读取或覆盖损坏账本
+    Rescue {
+        #[arg(long)]
+        input: PathBuf,
+        /// 尚不存在的目标目录，父目录必须存在
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// 接受备份之后的隐私规则和记录可能丢失
+        #[arg(long, requires = "apply")]
+        accept_unknown_controls: bool,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
     Restore {
         #[arg(long)]
         input: PathBuf,
@@ -264,14 +277,32 @@ fn execute(command: LedgerCommand) -> usagebook_core::ledger::Result<()> {
                 let summary = l.refresh_claude(&roots(), full)?;
                 l.track_claude_imports()?;
                 l.publish_pending()?;
-                let snapshot = load_legacy(l.connection())
-                    .map_err(|e| LedgerError::InvalidInput(e.to_string()))?;
-                l.reconcile_and_activate_sources(&snapshot, Some("claude"))?;
-                l.continue_selected_legacy(&snapshot, Some("claude"))?;
-                println!("{}", json!(summary));
-                if summary.errors > 0 || summary.pending > 0 {
+                let native_complete = summary.errors == 0 && summary.pending == 0;
+                let has_previous =
+                    LegacySnapshot::restore_capture_source(l.connection(), Some("claude"))
+                        .map_err(|e| LedgerError::InvalidInput(e.to_string()))?
+                        .is_some_and(|snapshot| {
+                            snapshot
+                                .sources
+                                .get("claude")
+                                .and_then(|s| s.last_scanned_ms)
+                                .is_some()
+                        });
+                if !native_complete && !has_previous {
+                    println!("{}", json!(summary));
                     std::process::exit(5);
                 }
+                let snapshot = load_legacy(l.connection())
+                    .map_err(|e| LedgerError::InvalidInput(e.to_string()))?;
+                if !publish_refresh_capture(&mut l, &snapshot, Some("claude"), native_complete)? {
+                    eprintln!("SOURCE_READ_FAILED: Claude compatibility capture was not complete");
+                    println!("{}", json!(summary));
+                    std::process::exit(5);
+                }
+                l.reconcile_and_activate_sources(&snapshot, Some("claude"))?;
+                l.continue_selected_legacy(&snapshot, Some("claude"))?;
+                align_refresh_capture_route(&mut l)?;
+                println!("{}", json!(summary));
                 return Ok(());
             }
             if full {
@@ -339,13 +370,32 @@ fn execute(command: LedgerCommand) -> usagebook_core::ledger::Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
             };
+            // Optional index deferrals are successful outcomes. A fatal
+            // maintenance error must drop this writer before any more writes.
+            l.maintain_query_indexes_if_due()?;
             if let Err(e) = l.optimize_if_due() {
                 tracing::warn!("查询统计维护暂未完成，将在空闲时重试: {e}");
             }
             let snapshot = load_legacy(l.connection())
                 .map_err(|e| LedgerError::InvalidInput(e.to_string()))?;
+            let claude_root_error: bool = l.connection().query_row("SELECT EXISTS(SELECT 1 FROM source_roots WHERE report_source='claude' AND enabled=1 AND error_code IS NOT NULL)", [], |r| r.get(0))?;
+            let claude_native_complete = !summary.backlog
+                && !claude_root_error
+                && !source_errors.contains_key("claude")
+                && !source_errors.contains_key("ledger");
+            if !publish_refresh_capture(
+                &mut l,
+                &snapshot,
+                source.as_deref(),
+                claude_native_complete,
+            )? {
+                source_errors
+                    .entry("claude".into())
+                    .or_insert_with(|| "SOURCE_READ_FAILED".into());
+            }
             let reconciliation = l.reconcile_and_activate_sources(&snapshot, source.as_deref())?;
             let continuation = l.continue_selected_legacy(&snapshot, source.as_deref())?;
+            align_refresh_capture_route(&mut l)?;
             collector.finish(&mut l)?;
             let imports = l.status_durable_imports()?;
             let mut failed_roots = l.connection().prepare("SELECT report_source,MAX(error_code) FROM source_roots WHERE enabled=1 AND error_code IS NOT NULL AND (?1 IS NULL OR report_source=?1) GROUP BY report_source")?;
@@ -375,6 +425,23 @@ fn execute(command: LedgerCommand) -> usagebook_core::ledger::Result<()> {
         LedgerCommand::Backup { output } => {
             Maintenance::open(&path)?.backup(&output)?;
             json!({"backup":output,"complete":true})
+        }
+        LedgerCommand::Rescue {
+            input,
+            output_dir,
+            accept_unknown_controls,
+            confirm,
+        } => {
+            if confirm.apply && !accept_unknown_controls {
+                return Err(LedgerError::InvalidInput(
+                    "rescue requires --accept-unknown-controls when applying".into(),
+                ));
+            }
+            usagebook_core::ledger::maintenance::rescue_backup(
+                &input,
+                &output_dir,
+                confirm.token(),
+            )?
         }
         LedgerCommand::Restore { input, confirm } => {
             json!(Maintenance::open(&path)?.restore(&input, confirm.token())?)
@@ -603,6 +670,114 @@ fn load_legacy_inner(
     }
     Ok(snapshot)
 }
+
+/// Publish complete compatibility views only for the requested source scope,
+/// retaining existing unrelated views and explicit per-source failure status.
+fn publish_refresh_capture(
+    ledger: &mut Ledger,
+    snapshot: &LegacySnapshot,
+    source: Option<&str>,
+    claude_native_complete: bool,
+) -> usagebook_core::ledger::Result<bool> {
+    let previous = LegacySnapshot::restore_capture(ledger.connection())
+        .map_err(|e| LedgerError::InvalidInput(e.to_string()))?;
+    let first_capture = previous.is_none();
+    let mut saved =
+        previous.unwrap_or_else(|| LegacySnapshot::new(new_epoch(), snapshot.routing_hash.clone()));
+    let claude_selected = source.is_none_or(|source| source == "claude");
+    let mut claude_complete = !claude_selected;
+    for (id, status) in &snapshot.sources {
+        // A selected refresh may update only its requested source; a full
+        // refresh updates every complete source independently.
+        if source.is_some_and(|source| source != id) {
+            continue;
+        }
+        let complete = !status.stale
+            && status.error.is_none()
+            && status.last_scanned_ms.is_some()
+            && !snapshot.has_missing_input_containers(id)
+            && !saved.has_missing_input_containers(id)
+            && (id != "claude" || !claude_selected || claude_native_complete);
+        if id == "claude" && claude_selected {
+            claude_complete = complete;
+        }
+        if complete {
+            saved.entries.retain(|entry| entry.report_source() != id);
+            saved.entries.extend(
+                snapshot
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.report_source() == id)
+                    .cloned(),
+            );
+            saved.sources.insert(id.clone(), status.clone());
+            saved.retain_input_containers(id, snapshot);
+        } else {
+            // A failed scan cannot replace an earlier complete baseline or
+            // advance its timestamp; retain its status and mark the error.
+            let prior = saved.sources.get(id).cloned().unwrap_or_default();
+            if id == "claude" && !first_capture && prior.last_scanned_ms.is_some() {
+                // Native and compatibility readers may have recovered valid
+                // requests from other files while one input failed. Treat
+                // those rows only as candidates: the core publisher restores
+                // the previous baseline and applies Claude's identity and
+                // lifecycle proof before adding anything.
+                saved.entries.retain(|entry| entry.report_source() != id);
+                saved.entries.extend(
+                    snapshot
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.report_source() == id)
+                        .cloned(),
+                );
+            }
+            saved.sources.insert(
+                id.clone(),
+                LegacySourceStatus {
+                    stale: true,
+                    error: Some(
+                        status
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "SOURCE_READ_FAILED".into()),
+                    ),
+                    ..prior
+                },
+            );
+        }
+    }
+    // An already-adopted ledger route does not need a compatibility capture.
+    if claude_selected && !snapshot.sources.contains_key("claude") {
+        claude_complete = ledger.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_roots WHERE report_source='claude' AND route='ledger')",
+            [], |r| r.get(0))?;
+    }
+    saved.routing_hash = QueryService::routing_hash(ledger.connection())
+        .map_err(|e| LedgerError::InvalidInput(e.to_string()))?;
+    ledger
+        .publish_compatibility_capture(&saved)
+        .map_err(|e| LedgerError::InvalidInput(e.to_string()))?;
+    Ok(claude_complete)
+}
+
+/// Reconciliation may change routing after the capture transaction. Publish a
+/// matching token without touching the retained records or rescanning sources.
+fn align_refresh_capture_route(ledger: &mut Ledger) -> usagebook_core::ledger::Result<()> {
+    let Some(mut saved) = LegacySnapshot::restore_capture(ledger.connection())
+        .map_err(|e| LedgerError::InvalidInput(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let route = QueryService::routing_hash(ledger.connection())
+        .map_err(|e| LedgerError::InvalidInput(e.to_string()))?;
+    if saved.routing_hash != route {
+        saved.routing_hash = route;
+        ledger
+            .publish_compatibility_capture(&saved)
+            .map_err(|e| LedgerError::InvalidInput(e.to_string()))?;
+    }
+    Ok(())
+}
 pub fn report(args: ReportArgs, json_output: bool) {
     if let Err((message, code)) = report_inner(args, json_output) {
         fail(message, code)
@@ -682,9 +857,31 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
             "LEDGER_NOT_INITIALIZED：当前扫描未受历史保护；运行 usagebook ledger init 初始化。"
         );
     }
-    let snapshot = load_legacy(conn).map_err(|e| (e.to_string(), 3))?;
+    // A durable report must read the same committed compatibility projection
+    // as the dashboard. Scanning source files here can silently discard saved
+    // history when those files have been cleaned up.
+    let snapshot = if ledger.is_none() {
+        Some(load_legacy(conn).map_err(|e| (e.to_string(), 3))?)
+    } else {
+        let has_projection: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM query_live_state s JOIN ledger_meta m ON m.singleton=s.singleton AND m.ledger_uuid=s.ledger_uuid AND m.epoch=s.epoch)",
+            [], |row| row.get(0),
+        ).map_err(|e| (e.to_string(), 3))?;
+        if has_projection {
+            None
+        } else if let Some(mut saved) = LegacySnapshot::restore_capture(conn).map_err(query_exit)? {
+            saved.routing_hash = QueryService::routing_hash(conn).map_err(query_exit)?;
+            Some(saved)
+        } else {
+            // An initialized ledger must not show a one-off live scan as if it
+            // were saved history. Ledger-routed sources remain queryable; live
+            // sources are reported as incomplete by the query coverage layer.
+            eprintln!("LIVE_CAPTURE_NOT_SAVED：兼容来源尚未保存，请运行 usagebook ledger refresh 后重试。");
+            None
+        }
+    };
     let cache = ModelCatalogCache::default();
-    let service = QueryService::new(conn, Some(&snapshot)).with_catalog_cache(&cache);
+    let service = QueryService::new(conn, snapshot.as_ref()).with_catalog_cache(&cache);
     if let Some(path) = args.query_file {
         let bytes = read_query_file(&path).map_err(|e| (e.to_string(), 2))?;
         let request = QueryRequest::from_json(&bytes).map_err(|e| (e.to_string(), 2))?;
@@ -748,6 +945,7 @@ fn report_inner(args: ReportArgs, json_output: bool) -> std::result::Result<(), 
         Selector::Include { ids: args.model }
     };
     let mut query = Query {
+        bundle_detail: Default::default(),
         window,
         report_timezone: timezone,
         as_of_ms: asof.map(|v| v.to_string()),

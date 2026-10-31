@@ -346,12 +346,24 @@ fn create_database_file(dest: &Path) -> Result<()> {
     drop(f);
     Ok(())
 }
+// Older snapshots cannot pass current-schema semantic checks until migration.
+// Check their physical integrity and foreign keys without changing their schema.
+fn check_backup_snapshot(c: &Connection) -> Result<()> {
+    let schema: i64 = c.query_row(
+        "SELECT schema_version FROM ledger_meta WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if schema == 8 {
+        check_conn(c)
+    } else {
+        check_integrity(c)
+    }
+}
 fn copy_database(c: &Connection, dest: &Path) -> Result<()> {
-    create_database_file(dest)?;
     db::private_file(dest)?;
     let target = copy_database_contents(c, dest)?;
-    // Ordinary backups still require the complete current-version checks.
-    check_conn(&target)?;
+    check_backup_snapshot(&target)?;
     checkpoint(&target)?;
     drop(target);
     clean_sidecars(dest)?;
@@ -474,10 +486,18 @@ impl Maintenance {
     }
     pub fn backup(&self, output: &Path) -> Result<()> {
         let output = backup_target(&self.path, output)?;
-        let c = db::open_connection(&self.path, true)?;
-        check_conn(&c)?;
+        // A backup requested before upgrading must preserve the old schema.
+        // The maintenance and writer leases prevent other Usagebook processes
+        // from migrating the source while the snapshot is being copied.
+        let c = db::open_restore_source(&self.path)?;
+        check_backup_snapshot(&c)?;
         let temp = output.with_extension(format!("{}.backup.tmp", new_epoch()));
+        // Only remove a temporary file after this invocation has created it.
+        create_database_file(&temp)?;
         if let Err(error) = copy_database(&c, &temp) {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", temp.display())));
+            }
             let _ = std::fs::remove_file(&temp);
             return Err(error);
         }
@@ -517,6 +537,23 @@ impl Maintenance {
         validate_registered(&c, scope)?;
         c.execute_batch("CREATE TEMP TABLE delete_ids(id INTEGER PRIMARY KEY); CREATE TEMP TABLE affected_units(family TEXT,namespace TEXT,publish_key TEXT,visible INTEGER,PRIMARY KEY(family,namespace,publish_key));")?;
         select_scope(&c, scope)?;
+        let has_claude_pending: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='claude_protection_pending')",
+            [],
+            |r| r.get(0),
+        )?;
+        if scope.identity.is_some()
+            && has_claude_pending
+            && c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM usage_observations WHERE report_source='claude' AND observation_id IN (SELECT id FROM delete_ids)) AND EXISTS(SELECT 1 FROM claude_protection_pending)",
+                [],
+                |r| r.get(0),
+            )?
+        {
+            return Err(LedgerError::InvalidInput(
+                "single-identity deletion cannot safely partition retained Claude compatibility candidates; select a source or time range".into(),
+            ));
+        }
         validate_indivisible_days(&c, scope)?;
         super::adoption::validate_forget(&c, scope)?;
         super::adoption::before_forget(&c)?;
@@ -531,12 +568,21 @@ impl Maintenance {
             [],
         )?;
         let staged_removed = expand_deletion(&c, &op, false)?;
+        // Apply the same committed deletion controls to unresolved Claude
+        // evidence, without discarding candidates outside the selected scope.
+        let pending_removed = super::legacy::scrub_claude_pending(&c)
+            .map_err(|e| LedgerError::InvalidInput(e.message))?;
         super::source_projection::retain_suppressed_row_keys(&c)?;
         let retained_capture = clear_forgotten_read_caches(&c, scope)?;
         validate_indivisible_days(&c, scope)?;
         let mut preview = preview(&c, "forget", &operation)?;
         if staged_removed > 0 {
             preview.warnings.push(format!("{staged_removed} matching rows are also removed from sealed snapshot checkpoints; unrelated unread rows remain."));
+        }
+        if pending_removed > 0 {
+            preview.warnings.push(format!(
+                "{pending_removed} matching unresolved Claude candidates are also removed."
+            ));
         }
         if scope.start_ms.is_some() {
             let uncovered = uncovered_time(&c, scope)?;
@@ -1105,6 +1151,25 @@ impl Maintenance {
             super::time_repair::validate_restore(&current, &c)?;
             c.execute(&format!("INSERT INTO delete_ids SELECT observation_id FROM usage_observations o WHERE {EXACT_RULES}"),[])?;
             expand_deletion(&c, "restore-protection", true)?;
+            super::legacy::scrub_claude_pending(&c)
+                .map_err(|e| LedgerError::InvalidInput(e.message))?;
+            let has_claude_pending: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='claude_protection_pending')",
+                [],
+                |r| r.get(0),
+            )?;
+            if has_claude_pending
+                && c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM claude_protection_pending)",
+                    [],
+                    |r| r.get(0),
+                )?
+            {
+                // New identity or projection controls cannot safely be
+                // reconciled against compatibility candidates without an
+                // established identity mapping. Refuse the restore instead.
+                reject_ambiguous_restore_controls(&c, "claude", "claude")?;
+            }
             super::source_projection::retain_suppressed_row_keys(&c)?;
             super::ccswitch::scrub_snapshot_checkpoints(&c, |o| {
                 super::ingest::exact_suppressed(&c, o)
@@ -1851,4 +1916,79 @@ fn change_epoch_preserving_read_caches(c: &Connection) -> Result<String> {
         }
     }
     Ok(next)
+}
+
+/// Recover a standalone backup into a newly-created directory, without opening
+/// or changing the damaged ledger. Failures leave the new directory for review.
+pub fn rescue_backup(
+    input: &Path,
+    output_dir: &Path,
+    apply: Option<&str>,
+) -> Result<serde_json::Value> {
+    let name = output_dir
+        .file_name()
+        .ok_or_else(|| LedgerError::InvalidInput("invalid rescue directory".into()))?;
+    let parent = output_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .canonicalize()?;
+    let output_dir = parent.join(name);
+    if output_dir.symlink_metadata().is_ok() {
+        return Err(LedgerError::InvalidInput(
+            "rescue directory already exists; choose a new directory".into(),
+        ));
+    }
+    let dir_name = output_dir
+        .to_str()
+        .ok_or_else(|| LedgerError::InvalidInput("rescue directory must be valid UTF-8".into()))?;
+    let input = std::fs::canonicalize(input)?;
+    check_backup_wal(&input)?;
+    let input_hash = hash_file(&input)?;
+    let source = db::open_restore_source(&input)?;
+    check_integrity(&source)?;
+    drop(source);
+    check_backup_wal(&input)?;
+    if hash_file(&input)? != input_hash {
+        return Err(LedgerError::StaleObservation);
+    }
+    let token = hash_parts("rescue-backup/v1", &[&input_hash, dir_name]);
+    let warning = "The damaged ledger is not inspected. Changes since this backup, including deletion, suppression and routing controls, may be lost; deleted history may reappear. Review controls before collecting or displaying data.";
+    if let Some(given) = apply {
+        if given != token {
+            return Err(LedgerError::InvalidInput(
+                "preview expired; preview again".into(),
+            ));
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&output_dir)?;
+        let path = output_dir.join("usage-ledger.db");
+        // An interrupted or failed operation never removes an artifact it has
+        // published: the user can inspect or remove this isolated directory.
+        drop(db::Ledger::init(&path, "UTC")?);
+        check_backup_wal(&input)?;
+        if hash_file(&input)? != input_hash {
+            return Err(LedgerError::StaleObservation);
+        }
+        let maintenance = Maintenance::open(&path)?;
+        let preview = maintenance.restore(&input, None)?;
+        maintenance.restore(&input, Some(&preview.preview_token))?;
+        check_backup_wal(&input)?;
+        if hash_file(&input)? != input_hash {
+            return Err(LedgerError::StaleObservation);
+        }
+        maintenance.check()?;
+        Ok(
+            serde_json::json!({"operation":"rescue", "complete":true, "path":path, "warning":warning}),
+        )
+    } else {
+        Ok(
+            serde_json::json!({"operation":"rescue", "preview_token":token, "output_directory":output_dir, "backup_sha256":input_hash, "warning":warning, "validation":"SQLite integrity, foreign keys and supported schema checked; application-level validation occurs during apply"}),
+        )
+    }
 }

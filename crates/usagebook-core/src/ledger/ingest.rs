@@ -1513,6 +1513,17 @@ impl Ledger {
         if routes != 1 {
             return Err(LedgerError::RouteInconsistent);
         }
+        let protected_live: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_roots WHERE report_source='claude' AND route='live') AND (EXISTS(SELECT 1 FROM legacy_capture_entries WHERE report_source='claude') OR EXISTS(SELECT 1 FROM claude_protection_pending))",
+            [],
+            |r| r.get(0),
+        )?;
+        if protected_live {
+            return Err(LedgerError::InvalidInput(
+                "Claude displayed history requires member-level reconciliation before route change"
+                    .into(),
+            ));
+        }
         let count = |sql: &str| -> Result<u64> {
             Ok(tx.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
         };

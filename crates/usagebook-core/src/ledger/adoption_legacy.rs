@@ -505,6 +505,15 @@ fn adopt(
     if source == "ccswitch-rollup" || !super::DURABLE_EVIDENCE_SOURCES.contains(&source) {
         return Err(LedgerError::SourceNotProtected);
     }
+    if source == "claude"
+        && c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_roots WHERE report_source='claude' AND route='live') AND (EXISTS(SELECT 1 FROM legacy_capture_entries WHERE report_source='claude') OR EXISTS(SELECT 1 FROM claude_protection_pending))",
+            [],
+            |r| r.get(0),
+        )?
+    {
+        return Err(invalid("Claude displayed history requires member-level reconciliation before route change"));
+    }
     let cutoff = if let Some(preview) = frozen {
         preview.cutoff
     } else {

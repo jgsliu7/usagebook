@@ -94,7 +94,22 @@ After stopping the server, `ledger pause --source claude` pauses new collection,
 
 The default `usage-ledger.db` lives in `~/Library/Application Support/usagebook/` on macOS, `$XDG_DATA_HOME/usagebook/` (default `~/.local/share/usagebook/`) on Linux, and `%LOCALAPPDATA%\usagebook\` on Windows. Override the complete filename with `USAGEBOOK_LEDGER_PATH`. The legacy scan-cache settings do not disable or delete this ledger.
 
-Stop the server before maintenance. Use `ledger backup --output FILE`, `ledger check`, and `ledger restore --input FILE --dry-run`. `ledger forget --source claude --from DATE --to DATE --dry-run` previews deletion. Apply a reviewed preview with `--apply --preview-token TOKEN`. Restoring an old backup preserves current deletion controls. A corrupt ledger produces an error; it is never silently replaced with an empty database.
+Stop `serve` and other connections before maintenance. Before first starting a new version or running any command that may write to the ledger, run `ledger backup --output FILE` to preserve the old format; other write commands do not automatically create a pre-upgrade backup. Use `ledger backup --output FILE`, `ledger check`, and `ledger restore --input FILE --dry-run`. `ledger forget --source claude --from DATE --to DATE --dry-run` previews deletion. Apply a reviewed preview with `--apply --preview-token TOKEN`. Restoring an old backup preserves current deletion controls. A corrupt ledger produces an error; it is never silently replaced with an empty database. If the current ledger is corrupt, ordinary restore may fail even with a healthy backup. Use the offline recovery steps below. A successful restore retains a copy of the old ledger, which may contain previously deleted history.
+
+For offline recovery, stop all usagebook services and other database access. Preserve the damaged database and its accompanying `-wal`, `-shm`, `-journal` and other files, as well as the backup. **Recovery to a new path uses only the backup state: records and deletion, suppression, routing and other controls changed after the backup may be missing, and deleted history may reappear.** Verify the trusted backup and its date, then review those controls before collecting or showing data again. The preview does not read the damaged ledger and cannot list its differences from the backup.
+
+On macOS/Linux, replace the backup path below with its actual absolute path. The destination directory must not exist and its parent must already exist:
+
+```bash
+usagebook ledger rescue --input /absolute/path/usage-backup.db --output-dir "$HOME/usagebook-rescue" --dry-run
+# Review the preview and risk, then replace TOKEN with its preview_token.
+usagebook ledger rescue --input /absolute/path/usage-backup.db --output-dir "$HOME/usagebook-rescue" --apply --preview-token TOKEN --accept-unknown-controls
+export USAGEBOOK_LEDGER_PATH="$HOME/usagebook-rescue/usage-ledger.db"
+usagebook ledger check
+```
+
+On Windows PowerShell use the same commands with local paths and set `$env:USAGEBOOK_LEDGER_PATH` to the full recovered database path. Preview checks SQLite integrity, foreign keys and supported schema; application-level checks run during apply. Failure may leave the isolated directory for inspection; choose another new directory to retry. The restored ledger uses the backup's timezone. To use it, set the same `USAGEBOOK_LEDGER_PATH` in the environment that starts usagebook; other terminals and startup services do not automatically inherit this setting. If any step fails, stop and preserve the original files and backup. Do not overwrite the original path or manually delete its companion files; seek support.
+
 
 API changes: `/api/data` returns 410. The dashboard uses `/api/v2/status`, `/api/v2/query`, and `/api/v2/catalog`; integer values are decimal strings. `report --json` streams NDJSON pages; `report --query-file FILE` accepts the query DTO. Exit code 5 means readable results were emitted with incomplete source coverage.
 
@@ -150,4 +165,4 @@ Troubleshooting: attach that directory when reporting issues (redact first — p
 
 Apache-2.0. See [LICENSE](LICENSE) and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
-Explicit `ledger adopt-legacy` previews can freeze a supported legacy reporting basis. Limited CC history selection supports strongly identified OpenCode records and complete Pi daily ranges. These contributions remain source-reported; they are not promoted to verified requests. See [History preservation](docs/历史用量保存.md) for admission, query, and maintenance boundaries. Back up before upgrading to schema v4; older binaries cannot open the new schema.
+Explicit `ledger adopt-legacy` previews can freeze a supported legacy reporting basis. Limited CC history selection supports strongly identified OpenCode records and complete Pi daily ranges. These contributions remain source-reported; they are not promoted to verified requests. See [History preservation](docs/历史用量保存.md) for admission, query, and maintenance boundaries. Back up before upgrading to schema v8; older binaries cannot open the new schema.

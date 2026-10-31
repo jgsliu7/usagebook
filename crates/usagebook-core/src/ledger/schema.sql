@@ -1,8 +1,8 @@
--- Canonical schema v7. Migrations must also preserve every deletion control.
+-- Canonical schema v8. Migrations must also preserve every deletion control.
 PRAGMA foreign_keys=ON;
 CREATE TABLE ledger_meta (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
- schema_version INTEGER NOT NULL CHECK(schema_version=7),
+ schema_version INTEGER NOT NULL CHECK(schema_version=8),
  ledger_uuid TEXT NOT NULL, epoch TEXT NOT NULL,
  commit_seq INTEGER NOT NULL CHECK(commit_seq>=0),
  derived_version INTEGER NOT NULL CHECK(derived_version>0),

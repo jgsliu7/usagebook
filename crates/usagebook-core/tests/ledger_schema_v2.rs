@@ -1,4 +1,4 @@
-//! Original schema v2 migration gate, followed through the current v7 schema:
+//! Original schema v2 migration gate, followed through the current v8 schema:
 //! a v1 database upgrades in place
 //! on the first write open with every fact, derived row, and suppression rule
 //! preserved. The frozen v1 DDL lives beside this file; the rebuilt tables
@@ -92,7 +92,7 @@ fn v1_migrates_in_place_and_preserves_data() {
     let schema: i64 = c
         .query_row("SELECT schema_version FROM ledger_meta", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(schema, 7);
+    assert_eq!(schema, 8);
 
     let object_cols = columns(c, "source_objects");
     for dead in ["audit_generation", "audit_offset", "audit_digest"] {
@@ -139,8 +139,8 @@ fn v1_migrates_in_place_and_preserves_data() {
         .query_row("SELECT commit_seq FROM ledger_meta", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        seq, 6,
-        "each migration from v1 through v7 must bump commit_seq so stale cursors die"
+        seq, 7,
+        "each migration from v1 through v8 must bump commit_seq so stale cursors die"
     );
 
     {

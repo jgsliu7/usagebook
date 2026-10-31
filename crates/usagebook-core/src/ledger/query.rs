@@ -126,6 +126,24 @@ struct CatalogModel {
 }
 const FACT_COLUMNS:&str="o.observation_id,o.identity_family,o.namespace_key,e.identity_key,o.fact_kind,o.report_source,o.native_tool,o.model_key,o.model_display,o.session_key,o.occurred_ms,o.native_date,o.native_timezone,o.day_start_ms,o.day_end_ms,o.input_uncached,o.cache_read,o.cache_write,o.output_normal,o.output_reasoning,o.input_total,o.output_total,o.total_tokens,o.cache_write_1h,o.request_count,o.cost_state,o.cost_units,o.cost_scale,o.cost_currency,o.parser_version='reported-history-v1'";
 
+type DayCoverageKey = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    bool,
+);
+const DAY_COVERAGE_CACHE_BYTES: usize = 1024 * 1024;
+const DAY_COVERAGE_KEY_BYTES: usize = 4096;
+#[derive(Default)]
+struct DayCoverageCache {
+    entries: std::collections::HashMap<DayCoverageKey, bool>,
+    bytes: usize,
+}
+
 pub struct QueryService<'a> {
     conn: &'a Connection,
     legacy: Option<&'a LegacySnapshot>,
@@ -135,6 +153,7 @@ pub struct QueryService<'a> {
     label_key: std::cell::RefCell<Option<LabelKey>>,
     live_state: std::cell::RefCell<Option<super::read_model::State>>,
     live_facts: std::cell::RefCell<Option<Vec<super::read_model::LiveFact>>>,
+    day_coverage: std::cell::RefCell<DayCoverageCache>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Fact {
@@ -319,8 +338,23 @@ impl Aggregate {
         }
         Ok(())
     }
-    fn bundle(&self) -> Value {
+    fn add_for(&mut self, f: &Fact, detail: BundleDetail) -> QueryResult<()> {
+        match detail {
+            BundleDetail::Full => self.add(f),
+            BundleDetail::Metrics => self.add_usage(f),
+        }
+    }
+    fn usage_bundle(&self) -> Value {
         let metrics = json!({"total":self.cells[7].value(),"input_uncached":self.cells[0].value(),"cache_read":self.cells[1].value(),"cache_write":self.cells[2].value(),"output":self.cells[3].value(),"reasoning_output":self.cells[4].value(),"output_combined":self.cells[6].value(),"requests":self.cells[9].value()});
+        json!({"metrics":metrics,"coverage":{"protection":match(self.ledger,self.live){(true,true)=>"mixed",(true,false)=>"ledger",_=>"unprotected"},"grain":match(self.requests,self.days){(true,true)=>"mixed",(true,false)=>"request",(false,true)=>"day",_=>"none"},"undated_count":"0","excluded_day_count":self.excluded.to_string(),"incomplete_sources":[]}})
+    }
+    fn bundle_for(&self, detail: BundleDetail) -> Value {
+        match detail {
+            BundleDetail::Full => self.bundle(),
+            BundleDetail::Metrics => self.usage_bundle(),
+        }
+    }
+    fn bundle(&self) -> Value {
         let sessions = if self.session_unknown == 0 {
             json!({"state":"exact","known_value":(self.sessions.len() as i64+self.ledger_sessions).to_string()})
         } else if self.sessions.is_empty() && self.ledger_sessions == 0 {
@@ -330,7 +364,10 @@ impl Aggregate {
         };
         let mut costs:Vec<Value>=self.costs.iter().map(|(c,(units,scale,_))|json!({"kind":"reported_request","currency":c,"amount":decimal(*units,*scale),"state":if self.cost_unknown==0&&!self.live&&!self.reported_cost{"exact"}else{"partial"},"scope":"filtered","reason":null,"pricing_version":null})).collect();
         costs.extend(self.session_costs.iter().cloned());
-        json!({"metrics":metrics,"sessions":sessions,"costs":costs,"coverage":{"protection":match(self.ledger,self.live){(true,true)=>"mixed",(true,false)=>"ledger",_=>"unprotected"},"grain":match(self.requests,self.days){(true,true)=>"mixed",(true,false)=>"request",(false,true)=>"day",_=>"none"},"undated_count":"0","excluded_day_count":self.excluded.to_string(),"incomplete_sources":[]}})
+        let mut bundle = self.usage_bundle();
+        bundle["sessions"] = sessions;
+        bundle["costs"] = json!(costs);
+        bundle
     }
 }
 fn add(a: i64, b: i64) -> QueryResult<i64> {
@@ -554,9 +591,11 @@ impl Context {
 }
 struct SnapshotGuard<'a> {
     conn: &'a Connection,
+    day_coverage: &'a std::cell::RefCell<DayCoverageCache>,
 }
 impl Drop for SnapshotGuard<'_> {
     fn drop(&mut self) {
+        *self.day_coverage.borrow_mut() = DayCoverageCache::default();
         let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
         if !self.conn.is_autocommit() {
             let _ = self.conn.execute_batch("ROLLBACK");
@@ -577,6 +616,7 @@ impl<'a> QueryService<'a> {
             label_key: std::cell::RefCell::new(None),
             live_state: std::cell::RefCell::new(None),
             live_facts: std::cell::RefCell::new(None),
+            day_coverage: std::cell::RefCell::new(DayCoverageCache::default()),
         }
     }
     pub fn with_catalog_cache(mut self, cache: &'a ModelCatalogCache) -> Self {
@@ -611,6 +651,7 @@ impl<'a> QueryService<'a> {
         self.all_labels.set(None);
         *self.label_key.borrow_mut() = None;
         *self.live_facts.borrow_mut() = None;
+        *self.day_coverage.borrow_mut() = DayCoverageCache::default();
         *self.live_state.borrow_mut() = None;
         self.conn.create_scalar_function(
             "usagebook_local_day",
@@ -635,7 +676,10 @@ impl<'a> QueryService<'a> {
         let started = Instant::now();
         self.conn
             .progress_handler(1000, Some(move || started.elapsed().as_secs_f64() > 5.0))?;
-        let guard = SnapshotGuard { conn: self.conn };
+        let guard = SnapshotGuard {
+            conn: self.conn,
+            day_coverage: &self.day_coverage,
+        };
         if let Some((sources, models)) = selectors {
             self.load_selectors(sources, models)?;
         }
@@ -1069,7 +1113,49 @@ impl<'a> QueryService<'a> {
             .ok_or_else(|| QueryError::invalid("day overflow"))?;
         Ok(a >= midnight(ctx.tz, day)? && b <= midnight(ctx.tz, next)? && b > a)
     }
-    fn day_covered(&self, f: &Fact, _routes: &BTreeMap<String, String>) -> QueryResult<bool> {
+    fn day_covered(&self, f: &Fact, routes: &BTreeMap<String, String>) -> QueryResult<bool> {
+        // Account for keys and conservative hash-table overhead before cloning
+        // sensitive identity strings. Oversized entries take the original path.
+        let key_bytes = f
+            .family
+            .len()
+            .saturating_add(f.namespace.len())
+            .saturating_add(f.key.len())
+            .saturating_add(f.native.len())
+            .saturating_add(f.source.len());
+        let charge = key_bytes.saturating_add(
+            3 * (std::mem::size_of::<DayCoverageKey>() + std::mem::size_of::<bool>() + 8),
+        );
+        if key_bytes > DAY_COVERAGE_KEY_BYTES {
+            return self.day_covered_uncached(f, routes);
+        }
+        let key = (
+            f.family.clone(),
+            f.namespace.clone(),
+            f.key.clone(),
+            f.native.clone(),
+            f.source.clone(),
+            f.start,
+            f.end,
+            f.live,
+        );
+        if let Some(result) = self.day_coverage.borrow().entries.get(&key).copied() {
+            return Ok(result);
+        }
+        if self.day_coverage.borrow().bytes.saturating_add(charge) > DAY_COVERAGE_CACHE_BYTES {
+            return self.day_covered_uncached(f, routes);
+        }
+        let result = self.day_covered_uncached(f, routes)?;
+        let mut cache = self.day_coverage.borrow_mut();
+        cache.entries.insert(key, result);
+        cache.bytes += charge;
+        Ok(result)
+    }
+    fn day_covered_uncached(
+        &self,
+        f: &Fact,
+        _routes: &BTreeMap<String, String>,
+    ) -> QueryResult<bool> {
         let (Some(start), Some(end)) = (f.start, f.end) else {
             return Ok(false);
         };
@@ -1241,6 +1327,17 @@ impl<'a> QueryService<'a> {
             } else {
                 "unprotected"
             });
+            if id == "claude" && !durable && self.legacy.is_none() {
+                let (has_baseline, pending): (bool, i64) = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy_capture_entries WHERE report_source='claude'), (SELECT COUNT(*) FROM claude_protection_pending WHERE reason<>'original_baseline' AND reason NOT GLOB 'approved_successor/*')",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                if has_baseline {
+                    source["history_protection"] = json!("source_reported_baseline");
+                }
+                source["pending_compatibility_observations"] = json!(pending.to_string());
+            }
             source["last_scanned_at_ms"] = json!(if durable {
                 None
             } else {
@@ -1363,7 +1460,10 @@ impl<'a> QueryService<'a> {
             ctx.incomplete.insert("claude".into());
             ctx.warnings.insert("IDENTITY_PENDING".into());
         }
-        let mut st=self.conn.prepare("SELECT DISTINCT r.report_source FROM source_roots r WHERE r.route='ledger' AND r.collector_key<>'reported-history-v1' AND(r.enabled=0 OR r.error_code IS NOT NULL OR r.enumeration_done=0 OR EXISTS(SELECT 1 FROM source_objects o WHERE o.root_id=r.root_id AND(o.state<>'ready' OR o.target_done=0)))")?;
+        // A retained compatibility baseline does not make a paused, failed or
+        // incomplete native collector current. Preserve its saved numbers but
+        // report the same coverage gap as an adopted ledger source.
+        let mut st=self.conn.prepare("SELECT DISTINCT r.report_source FROM source_roots r WHERE r.collector_key<>'reported-history-v1' AND(r.enabled=0 OR r.error_code IS NOT NULL OR r.enumeration_done=0 OR EXISTS(SELECT 1 FROM source_objects o WHERE o.root_id=r.root_id AND(o.state<>'ready' OR o.target_done=0)))")?;
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
             let id: String = r.get(0)?;
@@ -1645,7 +1745,7 @@ impl QueryService<'_> {
                 self.coverage(&query.sources, &mut ctx)?;
                 let (total, groups) = self.aggregate(query, &ctx, query.group_by)?;
 
-                let mut totals = total.bundle();
+                let mut totals = total.bundle_for(query.bundle_detail);
                 self.decorate_bundle(&mut totals, &ctx);
                 if total.excluded > 0 {
                     ctx.warnings.insert("DAY_EVIDENCE_EXCLUDED".into());
@@ -1668,10 +1768,16 @@ impl QueryService<'_> {
                     global_query.metric = Metric::Total;
                     global_query.group_by = GroupBy::None;
                     let global_ctx = ctx.clone();
-                    self.aggregate_usage(&global_query, &global_ctx, GroupBy::None)?
-                        .0
-                        .bundle()["metrics"]
-                        .clone()
+                    // Only token metrics are used for the global visibility
+                    // threshold. Do not also build groups, sessions or costs.
+                    let mut global_total = Aggregate::default();
+                    self.visit(&global_query, &global_ctx, true, |fact, usable| {
+                        if usable {
+                            global_total.add_usage(&fact)?;
+                        }
+                        Ok(())
+                    })?;
+                    global_total.bundle()["metrics"].clone()
                 };
 
                 // Detail rankings always use total tokens, independently of
@@ -1877,7 +1983,7 @@ impl QueryService<'_> {
                 total.excluded = add(total.excluded, 1)?;
                 return Ok(());
             }
-            total.add(&f)?;
+            total.add_for(&f, q.bundle_detail)?;
             let id = match group {
                 GroupBy::Source => f.source.clone(),
                 GroupBy::Model => model_id(&f.model),
@@ -1886,7 +1992,10 @@ impl QueryService<'_> {
             if groups.len() >= GROUP_LIMIT && !groups.contains_key(&id) {
                 return Err(QueryError::limit("too many groups"));
             }
-            groups.entry(id).or_insert_with(Aggregate::default).add(&f)
+            groups
+                .entry(id)
+                .or_insert_with(Aggregate::default)
+                .add_for(&f, q.bundle_detail)
         })?;
 
         Ok((total, groups))
@@ -1898,6 +2007,9 @@ impl QueryService<'_> {
         group: GroupBy,
     ) -> QueryResult<(Aggregate, BTreeMap<String, Aggregate>)> {
         let (mut total, groups) = self.aggregate_usage(q, ctx, group)?;
+        if q.bundle_detail == BundleDetail::Metrics {
+            return Ok((total, groups));
+        }
         if let Some((count, missing)) = self.session_counts(q, ctx, None)?.get("__total__") {
             total.ledger_sessions = *count;
             total.session_unknown = add(total.session_unknown, *missing)?;
@@ -1972,7 +2084,7 @@ impl QueryService<'_> {
                 }
             }
             let entry = groups.entry(id).or_default();
-            entry.add(&f)?;
+            entry.add_for(&f, q.bundle_detail)?;
             Ok(())
         })?;
 
@@ -2019,7 +2131,7 @@ impl QueryService<'_> {
         }
         let ids: Vec<_> = chosen.iter().map(|(id, _)| id.clone()).collect();
         let mut groups: BTreeMap<_, _> = chosen.into_iter().collect();
-        if !groups.is_empty() {
+        if q.bundle_detail.is_full() && !groups.is_empty() {
             for (id, n) in self.session_counts(&metadata, ctx, Some(dimension))? {
                 if let Some(a) = groups.get_mut(&id) {
                     a.ledger_sessions = n.0;
@@ -2042,7 +2154,7 @@ impl QueryService<'_> {
                 .remove(&id)
                 .ok_or_else(|| QueryError::invalid("table page missing group"))?;
             let cell = &a.cells[q.metric.index()];
-            let mut bundle = a.bundle();
+            let mut bundle = a.bundle_for(q.bundle_detail);
             self.decorate_bundle(&mut bundle, ctx);
             let mut row = json!({"id":id,"label":if dimension==Dimension::Model{self.preferred_model_label(&id)?}else{if dimension==Dimension::Source{source_label(&id)}else{id.clone()}},"bundle":bundle,"selected":allows_sorted(selected, &id),"share":share(cell,&denominator)});
             if dimension == Dimension::Model {
@@ -2164,7 +2276,9 @@ impl QueryService<'_> {
         let mut cq = q.clone();
         cq.window = w.clone();
         let (a, _) = self.aggregate(&cq, ctx, GroupBy::None)?;
-        Ok(json!({"comparable":true,"reason":null,"window":w,"totals":a.bundle()}))
+        Ok(
+            json!({"comparable":true,"reason":null,"window":w,"totals":a.bundle_for(q.bundle_detail)}),
+        )
     }
     fn trend(&self, q: &Query, t: &Trend, ctx: &Context) -> QueryResult<Value> {
         if !(1..=120).contains(&t.periods) {
@@ -2195,7 +2309,27 @@ impl QueryService<'_> {
             start_date: first.to_string(),
             end_date_exclusive: end.to_string(),
         };
-        let (_, groups) = self.aggregate_usage(&tq, ctx, tq.group_by)?;
+        // Series key selection and ranking use only metric cells. Collecting
+        // an additional total and per-group session/cost metadata here would
+        // duplicate work that is never returned by the trend response.
+        let mut groups = BTreeMap::new();
+        self.visit(&tq, ctx, true, |fact, usable| {
+            if !usable {
+                return Ok(());
+            }
+            let id = match tq.group_by {
+                GroupBy::Source => fact.source.clone(),
+                GroupBy::Model => model_id(&fact.model),
+                GroupBy::None => "__total__".into(),
+            };
+            if groups.len() >= GROUP_LIMIT && !groups.contains_key(&id) {
+                return Err(QueryError::limit("too many groups"));
+            }
+            groups
+                .entry(id)
+                .or_insert_with(Aggregate::default)
+                .add_usage(&fact)
+        })?;
         self.series(&tq, ctx, unit, 2000, &groups)
     }
 }
@@ -2772,10 +2906,10 @@ impl QueryService<'_> {
             }
             if f.kind == "day" {
                 if allocated_ids.contains(&f.id) {
-                    timed_reported.add(&f)?;
+                    timed_reported.add_for(&f, q.bundle_detail)?;
                     return Ok(());
                 }
-                daily.add(&f)?;
+                daily.add_for(&f, q.bundle_detail)?;
                 let id = match q.group_by {
                     GroupBy::Source => f.source.clone(),
                     GroupBy::Model => model_id(&f.model),
@@ -2787,7 +2921,7 @@ impl QueryService<'_> {
                 daily_groups.entry(id).or_default().add_usage(&f)?;
                 return Ok(());
             }
-            requests.add(&f)?;
+            requests.add_for(&f, q.bundle_detail)?;
             let ts = f
                 .time
                 .ok_or_else(|| QueryError::invalid("request missing timestamp"))?;
@@ -2845,7 +2979,7 @@ impl QueryService<'_> {
         });
         let hours:Vec<_>=(0..24).map(|h|json!({"hour":h,"state":if intervals[h].is_empty(){"nonexistent"}else{"present"},"intervals":intervals[h].iter().map(|(s,e)|json!({"start_ms":s.to_string(),"end_ms_exclusive":e.to_string()})).collect::<Vec<_>>(),"values":recorded.iter().map(|key|cells[h][*key].value()).collect::<Vec<_>>()})).collect();
         Ok(
-            json!({"date":date,"keys":recorded.iter().map(|index|{let(id,label)=&keys[*index];json!({"id":id,"label":label})}).collect::<Vec<_>>(),"hours":hours,"total":total.bundle(),"request_total":requests.bundle(),"timed_reported_total":timed_reported.bundle(),"day_only_total":daily.bundle(),"day_only_series":day_only_series}),
+            json!({"date":date,"keys":recorded.iter().map(|index|{let(id,label)=&keys[*index];json!({"id":id,"label":label})}).collect::<Vec<_>>(),"hours":hours,"total":total.bundle_for(q.bundle_detail),"request_total":requests.bundle_for(q.bundle_detail),"timed_reported_total":timed_reported.bundle_for(q.bundle_detail),"day_only_total":daily.bundle_for(q.bundle_detail),"day_only_series":day_only_series}),
         )
     }
 }

@@ -139,7 +139,7 @@ usagebook serve
 
 数据保存在独立的 `usage-ledger.db`：macOS 为 `~/Library/Application Support/usagebook/`，Linux 为 `${XDG_DATA_HOME:-~/.local/share}/usagebook/`，Windows 为 `%LOCALAPPDATA%\usagebook\`。可用 `USAGEBOOK_LEDGER_PATH` 指定完整文件路径。请求明细长期保留；按天汇总可随时由明细重算。账本与旧扫描缓存分开，关闭或清理旧缓存不清除账本。
 
-维护前停止 `serve` 及其他连接。同一账本只允许一个采集写入者；备份、恢复、忘记历史和时区重建需独占锁：
+维护前停止 `serve` 及其他连接。同一账本只允许一个采集写入者；备份、恢复、忘记历史和时区重建需独占锁。升级后首次运行服务或其他可能写入账本的命令前，先运行下方备份命令，保留旧版本备份；其他写入入口不会自动创建升级前备份：
 
 ```bash
 usagebook ledger backup --output ./usage-backup.db
@@ -153,7 +153,26 @@ usagebook ledger audit --source claude
 
 暂停仅控制已支持的账本来源的新增采集，已有记录仍可查询。新发现目录会继承同一来源的暂停状态；已有根有开有关时，新根保守保持关闭。显式 resume 恢复已有根，之后新根继承启用。未登记过的来源不能预先暂停；暂停不改变查询路由；保存证据的来源也遵守暂停状态。
 
-恢复和忘记操作先输出影响预览；检查后用同一命令加 `--apply --preview-token <预览返回值>` 执行。忘记记录会留下防止重新导入的规则；恢复旧备份也保留当前删除规则。出现损坏时明确报错，不会自动建空库。请使用本地磁盘；挂载目录的阻塞文件操作尚未通过完整隔离验收。三平台文件格式一致，Linux/Windows 的完整运行测试仍待发布前执行，大数据量下的查询与启动性能仍待优化和验收。
+恢复和忘记操作先输出影响预览；检查后用同一命令加 `--apply --preview-token <预览返回值>` 执行。忘记记录会留下防止重新导入的规则；恢复旧备份也保留当前删除规则。出现损坏时明确报错，不会自动建空库。当前主库损坏时，即使备份完好，普通恢复也可能失败；可按下面的离线步骤在新路径恢复。成功恢复后会保留旧账本副本，其中可能包含此前删除的历史。
+
+
+#### 损坏账本的离线救援
+
+停止所有 usagebook 服务和其他数据库访问，并原样保留损坏账本及其 `-wal`、`-shm`、`-journal` 等伴随文件，也保留备份。**恢复到新路径只能使用备份中的状态：备份之后的记录和删除、屏蔽、路由等规则可能丢失，已删除的历史可能重新出现。** 请先确认可信备份及其日期，并在重新采集或展示数据前核对这些规则。预览不会读取损坏账本，无法列出其与备份之间的差异。
+
+macOS/Linux 示例（把备份路径换成实际绝对路径；目标目录必须不存在，父目录须已存在）：
+
+```bash
+usagebook ledger rescue --input /绝对路径/usage-backup.db --output-dir "$HOME/usagebook-rescue" --dry-run
+# 核对预览及风险后，将 TOKEN 替换为预览返回的 preview_token
+usagebook ledger rescue --input /绝对路径/usage-backup.db --output-dir "$HOME/usagebook-rescue" --apply --preview-token TOKEN --accept-unknown-controls
+export USAGEBOOK_LEDGER_PATH="$HOME/usagebook-rescue/usage-ledger.db"
+usagebook ledger check
+```
+
+Windows PowerShell 使用相同命令并提供本机路径；设置环境变量的语法为 `$env:USAGEBOOK_LEDGER_PATH = "完整账本路径"`。预览仅校验备份结构、外键和支持的格式，执行时还会完成应用级校验；失败时隔离目录可能保留，须检查后另选不存在的目录重试。恢复后的时区取自备份。要使用新账本，启动 usagebook 的环境中必须设置同一个 `USAGEBOOK_LEDGER_PATH`；其他终端或开机启动服务不会自动继承当前终端的设置。若任一步失败，停止操作并保留原文件与备份，勿覆盖原路径或手动删除伴随文件；寻求支持。
+
+请使用本地磁盘；挂载目录的阻塞文件操作尚未通过完整隔离验收。三平台文件格式一致，Linux/Windows 的完整运行测试仍待发布前执行，大数据量下的查询与启动性能仍待优化和验收。
 
 接口变化：`/api/data` 已退场（410），查询使用 `/api/v2/status`、`/api/v2/query`、`/api/v2/catalog`。整数在接口中为十进制字符串；`report --json` 输出 NDJSON 页。完整筛选 DTO 可通过 `report --query-file FILE` 使用。退出码 5 表示已输出可读结果但来源覆盖不完整。
 
@@ -263,4 +282,4 @@ usagebook-cli(外壳)
 - `docs/数据源档案/29-源可信度评级报告.md` — 各源可信度评级
 - `CHANGELOG.md` / `SECURITY.md` / `LICENSE`(Apache-2.0)
 
-旧格式可通过带预览的 `ledger adopt-legacy` 选择来源报告历史；CC 支持限定的 OpenCode 强身份补录及 Pi 完整日范围采用。质量、范围、暂停/恢复和安全预算见[历史用量保存](docs/历史用量保存.md)。schema v4 升级前请保存备份；不能用旧二进制直接打开新库。
+旧格式可通过带预览的 `ledger adopt-legacy` 选择来源报告历史；CC 支持限定的 OpenCode 强身份补录及 Pi 完整日范围采用。质量、范围、暂停/恢复和安全预算见[历史用量保存](docs/历史用量保存.md)。schema v8 升级前请保存备份；不能用旧二进制直接打开新库。

@@ -506,8 +506,17 @@ const localDate = ms => state.lang === 'en-US'
 /* 日期加减使用纯日历日；只有“现在是哪一天”需要账本报告时区。 */
 const addDay = (day,n) => { const dt=new Date(day+'T12:00:00Z');dt.setUTCDate(dt.getUTCDate()+n);return dt.toISOString().slice(0,10); };
 const weekday = day => t('wd.'+new Date(day+'T12:00:00Z').getUTCDay());
+let dayFormatter=null,dayFormatterZone;
+function calendarDayFormatter(timeZone) {
+  // Cache the formatter only. The date is formatted afresh across midnight/DST.
+  if(!dayFormatter||dayFormatterZone!==timeZone){
+    dayFormatter=new Intl.DateTimeFormat('en-US',{timeZone,year:'numeric',month:'2-digit',day:'2-digit'});
+    dayFormatterZone=timeZone;
+  }
+  return dayFormatter;
+}
 const localDayStr = (dt=new Date()) => {
-  const parts=new Intl.DateTimeFormat('en-US',{timeZone:reportTimezone(),year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(dt);
+  const parts=calendarDayFormatter(reportTimezone()).formatToParts(dt);
   const get=k=>parts.find(p=>p.type===k).value;return get('year')+'-'+get('month')+'-'+get('day');
 };
 const RANGE_DAYS_N = {d7:7,d14:14,d30:30,d90:90};
@@ -760,20 +769,20 @@ function restoreSelection(dim) {
   state[source?'srcSel':'mdlSel']=sel;
   state[source?'srcSolo':'mdlSolo']=solo;
 }
-/* 单项切换:勾满全部 → 回"全部";取消到空集 → 显式保持空(配合"全不选",便于再挑一两个) */
-function toggleSel(sel, ids, v, complete=false) {
+/* 单项切换保留明确选择；全局“全部”由全选操作设置。 */
+function toggleSel(sel, v) {
   if(!sel){const next=new Set([v]);next.exclude=true;return next;}
   if(sel.exclude){const next=new Set(sel);next.exclude=true;next.has(v)?next.delete(v):next.add(v);return next.size?next:null;}
   sel=new Set(sel);
   sel.has(v) ? sel.delete(v) : sel.add(v);
-  return complete&&ids.length&&sel.size===ids.length&&ids.every(id=>sel.has(id)) ? null : sel;
+  return sel;
 }
 function toggleSrc(s) {
-  setSelection('source',toggleSel(state.srcSel, allSrcIds(), s, catalogComplete('source')),null,true);
+  setSelection('source',toggleSel(state.srcSel, s),null,true);
   render();   // 打开中的面板由 render 末尾的 refreshOpenPanels 按焦点策略刷新
 }
 function toggleMdl(m) {
-  setSelection('model',toggleSel(state.mdlSel, allMdlIds(), m, catalogComplete('model')),null,true);
+  setSelection('model',toggleSel(state.mdlSel, m),null,true);
   render();
 }
 /* 表行 solo(2026-10-19 交互改版):点行=只看该模型;再点同一行(或它已是唯一选中)恢复全部。
@@ -798,7 +807,11 @@ function soloSrc(s) {
 const segSync = (sel, pred) => $(sel).querySelectorAll('button')
   .forEach(b => b.classList.toggle('on', pred(b.dataset.v)));
 /* 收起两个多选面板(点页面空白/Escape/切换语言 三处共用) */
-const closeMsPanels = () => { $('#src-ms-panel').hidden = true; $('#mdl-ms-panel').hidden = true; };
+function closeMsPanel(dim) {
+  $(dim==='source'?'#src-ms-panel':'#mdl-ms-panel').hidden=true;
+  if(typeof cancelFilterRead==='function')cancelFilterRead(dim);
+}
+const closeMsPanels = () => { closeMsPanel('source');closeMsPanel('model'); };
 function segBind(id, key, cast, after) {
   $(id).addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
@@ -850,10 +863,10 @@ function bindMsToggle(btnId, panelId, builder) {
   $(btnId).addEventListener('click', e => {
     e.stopPropagation();
     const panel = $(panelId);
-    const other = panelId === '#src-ms-panel' ? $('#mdl-ms-panel') : $('#src-ms-panel');
-    other.hidden = true;
+    const dim=panelId==='#src-ms-panel'?'source':'model';
+    closeMsPanel(dim==='source'?'model':'source');
     if (panel.hidden) { panel.dataset.q = ''; builder(); panel.hidden = false; }
-    else panel.hidden = true;
+    else closeMsPanel(dim);
   });
   $(panelId).addEventListener('click', e => e.stopPropagation());
 }
@@ -894,9 +907,9 @@ function applyArf() {
       if (gen !== arfGen) return;
       // Hidden tabs skip ordinary reads. The server's configured collection
       // interval is independent; returning to the page fetches its latest data.
-      // A manual refresh owns its database read; ordinary ticks must not cancel it
-      // when multiple individually bounded queries outlast this interval.
-      if (document.hidden || refreshBusy) { schedule(); return; }
+      // Let any ongoing dashboard read finish, including a user changing the
+      // selected range. Explicit user actions can still replace an older read.
+      if (document.hidden || refreshBusy || (typeof pendingQueryKey !== 'undefined' && pendingQueryKey !== null)) { schedule(); return; }
       await load();
       schedule();   // schedule 入口再查 gen:await 挂起期间切档,链在此断掉
     }, Math.max(1000, state.arf * 1000));   // 下限 1s 兜底,任何路径都不会 0ms 自旋
@@ -935,7 +948,7 @@ segBind('#seg-arf', 'arf', Number, () => {
   // 切“关”仍确认一次状态；只更新连接面板，不取图或启动重试链。
   if (state.arf === 0) {
     const generation=arfGen;
-    readStatusV2('status?arf=0',undefined,()=>generation===arfGen).catch(() => {});
+    readStatusV2('dashboard/status?arf=0',undefined,()=>generation===arfGen).catch(() => {});
   }
 });
 

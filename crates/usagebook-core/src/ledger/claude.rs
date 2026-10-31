@@ -333,6 +333,13 @@ pub fn parse_line(line: &[u8]) -> Result<ParsedRecord> {
                 ignored: 0,
             })
         }
+        "tools-used" if known_tools_used(&v) => Ok(ParsedRecord {
+            ignored: 1,
+            ..Default::default()
+        }),
+        "tools-used" => Err(LedgerError::InvalidInput(
+            "InvalidRecordStructure: unrecognized tools-used structure".into(),
+        )),
         kind if known_non_usage_type(kind) => Ok(ParsedRecord {
             ignored: 1,
             ..Default::default()
@@ -341,6 +348,24 @@ pub fn parse_line(line: &[u8]) -> Result<ParsedRecord> {
             "UnknownRecordType: unrecognized source record type".into(),
         )),
     }
+}
+
+// The observed tools-used record is a session's list of tool names. Accept
+// only that exact shape: future variants could contain usage or identity data.
+fn known_tools_used(v: &Value) -> bool {
+    let Some(object) = v.as_object() else {
+        return false;
+    };
+    object.len() == 3
+        && object.get("type").and_then(Value::as_str) == Some("tools-used")
+        && object
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && object
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| tools.iter().all(Value::is_string))
 }
 
 /// These official transcript records carry no usage or request-identity facts.
@@ -400,6 +425,7 @@ pub(crate) fn identity_projection(
             Ok(Some((s, m, r)))
         }
         Some("cost-state") => Ok(None),
+        Some("tools-used") if known_tools_used(v) => Ok(None),
         Some(kind) if known_non_usage_type(kind) => Ok(None),
         _ => Err(LedgerError::IncompleteEvidence),
     }

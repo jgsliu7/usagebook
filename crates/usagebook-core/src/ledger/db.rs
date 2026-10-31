@@ -4,6 +4,12 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "regression-hooks")]
+pub use super::query_indexes::{
+    regression_fail_cleanup as regression_query_index_fail_cleanup,
+    regression_next_budget as regression_query_index_next_budget, QueryIndexCleanupFailure,
+};
+
 pub struct Ledger {
     pub(crate) conn: Connection,
     pub(crate) path: PathBuf,
@@ -11,6 +17,8 @@ pub struct Ledger {
     _writer: Option<Lease>,
     optimize_next: Instant,
     optimize_first: bool,
+    query_index_retry_at: Option<Instant>,
+    writer_poisoned: bool,
     pub(crate) claude_readers: Option<super::ingest::ReaderSliceState>,
 }
 impl Drop for Ledger {
@@ -178,11 +186,18 @@ fn configured_connection(path: &Path, write: bool) -> Result<Connection> {
 /// Its caller copies this handle into a private staging file before upgrading.
 pub(crate) fn open_restore_source(path: &Path) -> Result<Connection> {
     let c = configured_connection(path, false)?;
-    validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7])?;
+    validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7, 8])?;
     validate_historical_versions(&c)?;
     Ok(c)
 }
 pub(crate) fn open_connection(path: &Path, write: bool) -> Result<Connection> {
+    open_connection_with_index_outcome(path, write).map(|(conn, _)| conn)
+}
+
+fn open_connection_with_index_outcome(
+    path: &Path,
+    write: bool,
+) -> Result<(Connection, Option<super::query_indexes::InstallOutcome>)> {
     if write {
         // Check every independently versioned contract before opening a writer
         // or running migration/journal pragmas. Unsupported databases are not
@@ -191,7 +206,7 @@ pub(crate) fn open_connection(path: &Path, write: bool) -> Result<Connection> {
     }
     let c = configured_connection(path, write)?;
     if write {
-        validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7])?;
+        validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7, 8])?;
         let schema = c
             .query_row(
                 "SELECT schema_version FROM ledger_meta WHERE singleton=1",
@@ -218,13 +233,23 @@ pub(crate) fn open_connection(path: &Path, write: bool) -> Result<Connection> {
         if schema <= 6 {
             migrate_v6_to_v7(&c)?;
         }
+        if schema <= 7 {
+            migrate_v7_to_v8(&c)?;
+        }
     }
     validate(&c)?;
-    if write {
+    let indexes = if write {
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
         ensure_read_caches(&c)?;
-    }
-    Ok(c)
+        c.execute_batch(include_str!("claude_protection_schema.sql"))?;
+        Some(super::query_indexes::install(
+            &c,
+            super::query_indexes::OPEN_BUDGET,
+        )?)
+    } else {
+        None
+    };
+    Ok((c, indexes))
 }
 /// One-time v1 -> v2 upgrade under the writer lease: rebuilds the three
 /// tables whose definitions changed — source_objects loses the never-read
@@ -381,7 +406,7 @@ fn migrate_v2_to_v3(c: &Connection) -> Result<()> {
             .optional()?;
         c.execute_batch(
             &table_ddl("ledger_meta")?
-                .replace("CHECK(schema_version=7)", "CHECK(schema_version=3)")
+                .replace("CHECK(schema_version=8)", "CHECK(schema_version=3)")
                 .replacen(
                     "CREATE TABLE ledger_meta (",
                     "CREATE TABLE ledger_meta_v3 (",
@@ -463,7 +488,7 @@ fn migrate_v3_to_v4(c: &Connection) -> Result<()> {
             .optional()?;
         c.execute_batch(
             &table("ledger_meta")?
-                .replace("CHECK(schema_version=7)", "CHECK(schema_version=4)")
+                .replace("CHECK(schema_version=8)", "CHECK(schema_version=4)")
                 .replacen(
                     "CREATE TABLE ledger_meta (",
                     "CREATE TABLE ledger_meta_v4 (",
@@ -533,7 +558,7 @@ fn migrate_v4_to_v5(c: &Connection) -> Result<()> {
     let result = (|| -> Result<()> {
         c.execute_batch(
             &canonical[start..end]
-                .replace("CHECK(schema_version=7)", "CHECK(schema_version=5)")
+                .replace("CHECK(schema_version=8)", "CHECK(schema_version=5)")
                 .replacen(
                     "CREATE TABLE ledger_meta (",
                     "CREATE TABLE ledger_meta_v5 (",
@@ -580,7 +605,7 @@ fn migrate_v5_to_v6(c: &Connection) -> Result<()> {
         validate_v5_controls(c)?;
         c.execute_batch(
             &canonical[start..end]
-                .replace("CHECK(schema_version=7)", "CHECK(schema_version=6)")
+                .replace("CHECK(schema_version=8)", "CHECK(schema_version=6)")
                 .replacen(
                     "CREATE TABLE ledger_meta (",
                     "CREATE TABLE ledger_meta_v6 (",
@@ -622,15 +647,19 @@ fn migrate_v6_to_v7(c: &Connection) -> Result<()> {
     c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
     let result = (|| -> Result<()> {
         validate_v6(c)?;
-        c.execute_batch(&canonical[start..end].replacen(
-            "CREATE TABLE ledger_meta (",
-            "CREATE TABLE ledger_meta_v7 (",
-            1,
-        ))?;
+        c.execute_batch(
+            &canonical[start..end]
+                .replace("CHECK(schema_version=8)", "CHECK(schema_version=7)")
+                .replacen(
+                    "CREATE TABLE ledger_meta (",
+                    "CREATE TABLE ledger_meta_v7 (",
+                    1,
+                ),
+        )?;
         c.execute_batch("INSERT INTO ledger_meta_v7 SELECT singleton,7,ledger_uuid,epoch,commit_seq,derived_version,identity_version,normalization_version,report_timezone,tzdb_version,created_ms FROM ledger_meta; DROP TABLE ledger_meta; ALTER TABLE ledger_meta_v7 RENAME TO ledger_meta;")?;
         c.execute_batch(include_str!("time_repair_schema.sql"))?;
         super::time_repair::preserve_upgrade_capture(c)?;
-        validate(c)?;
+        validate_v7(c)?;
         let violation: Option<String> = c
             .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
             .optional()?;
@@ -648,8 +677,56 @@ fn migrate_v6_to_v7(c: &Connection) -> Result<()> {
     result
 }
 
+/// The v8 contract makes protected Claude history unavailable to older writers.
+/// The writer lease excludes an already-running old writer during migration.
+fn migrate_v7_to_v8(c: &Connection) -> Result<()> {
+    let canonical = include_str!("schema.sql");
+    let start = canonical
+        .find("CREATE TABLE ledger_meta (")
+        .ok_or(LedgerError::CorruptLedger)?;
+    let end = start
+        + canonical[start..]
+            .find(") STRICT;")
+            .ok_or(LedgerError::CorruptLedger)?
+        + ") STRICT;".len();
+    c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        validate_v7(c)?;
+        c.execute_batch(&canonical[start..end].replacen(
+            "CREATE TABLE ledger_meta (",
+            "CREATE TABLE ledger_meta_v8 (",
+            1,
+        ))?;
+        c.execute_batch("INSERT INTO ledger_meta_v8 SELECT singleton,8,ledger_uuid,epoch,commit_seq,derived_version,identity_version,normalization_version,report_timezone,tzdb_version,created_ms FROM ledger_meta; DROP TABLE ledger_meta; ALTER TABLE ledger_meta_v8 RENAME TO ledger_meta;")?;
+        c.execute_batch(include_str!("claude_protection_schema.sql"))?;
+        validate(c)?;
+        let violation: Option<String> = c
+            .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
+            .optional()?;
+        if violation.is_some() {
+            return Err(LedgerError::CorruptLedger);
+        }
+        bump(c)?;
+        regression_stop("migration_v8_before_commit");
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = c.execute_batch("ROLLBACK;");
+    }
+    c.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result
+}
+
 pub(crate) fn validate(c: &Connection) -> Result<()> {
-    validate_versions(c, &[7])?;
+    validate_versions(c, &[8])?;
+    validate_v7(c)?;
+    c.prepare("SELECT identity,entry_json,reason FROM claude_protection_pending LIMIT 0")
+        .map_err(|_| LedgerError::CorruptLedger)?;
+    Ok(())
+}
+fn validate_v7(c: &Connection) -> Result<()> {
+    validate_versions(c, &[7, 8])?;
     validate_v6(c)?;
     c.prepare("SELECT parent_observation_id,version,provenance,member_count,parent_hash,policy_hash,evidence_json,manifest_hash,created_ms FROM durable_time_revisions LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
     c.prepare("SELECT parent_observation_id,member_key,content_hash,occurred_ms,metrics_json,cost_units,cost_scale FROM durable_time_revision_members LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
@@ -697,7 +774,7 @@ fn ensure_read_caches(c: &Connection) -> Result<()> {
 }
 
 fn validate_v6(c: &Connection) -> Result<()> {
-    validate_versions(c, &[6, 7])?;
+    validate_versions(c, &[6, 7, 8])?;
     validate_v5_controls(c)?;
     c.prepare("SELECT parent_observation_id,version,provenance,complete,member_count,manifest_hash,created_ms FROM durable_time_allocations LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
     c.prepare("SELECT parent_observation_id,member_key,occurred_ms,metrics_json,cost_units,cost_scale FROM durable_time_members LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
@@ -819,9 +896,10 @@ impl Ledger {
             c.execute_batch(include_str!("adoption_schema.sql"))?;
             c.execute_batch(include_str!("time_allocation_schema.sql"))?;
             c.execute_batch(include_str!("time_repair_schema.sql"))?;
+            c.execute_batch(include_str!("claude_protection_schema.sql"))?;
             ensure_read_caches(&c)?;
             c.execute(
-                "INSERT INTO ledger_meta VALUES(1,7,?1,?2,0,1,1,1,?3,?4,?5)",
+                "INSERT INTO ledger_meta VALUES(1,8,?1,?2,0,1,1,1,?3,?4,?5)",
                 rusqlite::params![
                     new_epoch(),
                     new_epoch(),
@@ -885,7 +963,7 @@ impl Ledger {
         if !path.exists() {
             return Err(LedgerError::NotInitialized);
         }
-        let conn = open_connection(&path, write)?;
+        let (conn, indexes) = open_connection_with_index_outcome(&path, write)?;
         Ok(Self {
             conn,
             path,
@@ -893,6 +971,9 @@ impl Ledger {
             _writer: writer,
             optimize_next: Instant::now(),
             optimize_first: true,
+            query_index_retry_at: (indexes == Some(super::query_indexes::InstallOutcome::Deferred))
+                .then(|| Instant::now() + super::query_indexes::RETRY_DELAY),
+            writer_poisoned: false,
             claude_readers: None,
         })
     }
@@ -903,6 +984,11 @@ impl Ledger {
         &self.path
     }
     pub(crate) fn require_writer(&self) -> Result<()> {
+        if self.writer_poisoned {
+            return Err(LedgerError::InvalidInput(
+                "writer requires reopening after query index maintenance failure".into(),
+            ));
+        }
         if self._writer.is_some() {
             Ok(())
         } else {
@@ -916,6 +1002,38 @@ impl Ledger {
         self.require_writer()?;
         self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
+    }
+    /// Retry only optional query indexes that could not be built at open.
+    /// A fatal error retires this writer; callers must not continue writing
+    /// through the connection and must close/reopen it before further work.
+    pub fn maintain_query_indexes_if_due(&mut self) -> Result<bool> {
+        self.require_writer()?;
+        let Some(due) = self.query_index_retry_at else {
+            return Ok(false);
+        };
+        if Instant::now() < due {
+            return Ok(false);
+        }
+        match super::query_indexes::install(&self.conn, super::query_indexes::IDLE_BUDGET) {
+            Ok(outcome) => {
+                self.query_index_retry_at = (outcome
+                    == super::query_indexes::InstallOutcome::Deferred)
+                    .then(|| Instant::now() + super::query_indexes::RETRY_DELAY);
+                Ok(true)
+            }
+            Err(error) => {
+                self.writer_poisoned = true;
+                Err(error)
+            }
+        }
+    }
+    #[cfg(feature = "regression-hooks")]
+    pub fn regression_query_index_retry_now(&mut self) {
+        self.query_index_retry_at = Some(Instant::now());
+    }
+    #[cfg(feature = "regression-hooks")]
+    pub fn regression_query_index_retry_pending(&self) -> bool {
+        self.query_index_retry_at.is_some()
     }
     /// Small best-effort statistics maintenance, called by the existing writer
     /// after import or during idle refresh. It never changes ledger revisions.
@@ -1016,9 +1134,10 @@ pub fn live_connection(timezone: &str) -> Result<Connection> {
     c.execute_batch(include_str!("adoption_schema.sql"))?;
     c.execute_batch(include_str!("time_allocation_schema.sql"))?;
     c.execute_batch(include_str!("time_repair_schema.sql"))?;
+    c.execute_batch(include_str!("claude_protection_schema.sql"))?;
     ensure_read_caches(&c)?;
     c.execute(
-        "INSERT INTO ledger_meta VALUES(1,7,?1,?2,0,1,1,1,?3,?4,?5)",
+        "INSERT INTO ledger_meta VALUES(1,8,?1,?2,0,1,1,1,?3,?4,?5)",
         rusqlite::params![
             new_epoch(),
             new_epoch(),
@@ -1027,6 +1146,7 @@ pub fn live_connection(timezone: &str) -> Result<Connection> {
             now_ms()
         ],
     )?;
+    super::query_indexes::install(&c, super::query_indexes::OPEN_BUDGET)?;
     Ok(c)
 }
 

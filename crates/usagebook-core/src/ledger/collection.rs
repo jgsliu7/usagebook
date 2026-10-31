@@ -704,6 +704,28 @@ impl Ledger {
                 results.push(result);
                 continue;
             }
+            // A previously displayed Claude compatibility baseline cannot be
+            // cut over using bucket totals alone: equal daily aggregates do not
+            // establish member identity or preserve finer time selections.
+            // Keep its protected live route until a member-level migration has
+            // been explicitly reconciled. Existing ledger routes remain intact.
+            let protected_claude: bool = *source == "claude"
+                && tx.query_row(
+                    "SELECT (EXISTS(SELECT 1 FROM legacy_capture_entries WHERE report_source='claude') OR EXISTS(SELECT 1 FROM claude_protection_pending))",
+                    [],
+                    |row| row.get(0),
+                )?;
+            if protected_claude {
+                result.state = "blocked".into();
+                result.reason = Some("CLAUDE_BASELINE_RECONCILIATION_REQUIRED".into());
+                put_runtime_value(
+                    &tx,
+                    &format!("reconciliation/{source}"),
+                    &serde_json::to_value(&result).map_err(|_| LedgerError::CorruptLedger)?,
+                )?;
+                results.push(result);
+                continue;
+            }
             result.reason = activation_blocker(&tx, source)?;
             let live_ready = snapshot.sources.get(*source).is_some_and(|status| {
                 status.last_scanned_ms.is_some()

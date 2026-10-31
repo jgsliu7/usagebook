@@ -355,23 +355,37 @@ impl Ledger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let roots: Vec<(String,String,i64,bool,bool)> = tx.prepare("SELECT root_id,parser_version,identity_version,enabled,enumeration_done FROM source_roots WHERE identity_family='claude'")?
             .query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut changed = false;
         for (root, parser, identity, enabled, enumerated) in roots {
             if !supported_parser("claude", &parser, identity) {
                 return Err(LedgerError::UnsupportedVersion);
             }
             let capability = format!("{parser}:all-project-history");
-            tx.execute("INSERT INTO durable_imports(root_id,capability_version,parser_version,identity_version,semantics_version,created_ms) VALUES(?1,?2,?3,?4,1,?5) ON CONFLICT DO NOTHING",params![root,capability,parser,identity,now_ms()])?;
+            changed |= tx.execute("INSERT INTO durable_imports(root_id,capability_version,parser_version,identity_version,semantics_version,created_ms) VALUES(?1,?2,?3,?4,1,?5) ON CONFLICT DO NOTHING",params![root,capability,parser,identity,now_ms()])? > 0;
             let id:i64=tx.query_row("SELECT import_id FROM durable_imports WHERE root_id=?1 AND capability_version=?2 AND parser_version=?3 AND identity_version=?4 AND semantics_version=1",params![root,capability,parser,identity],|r|r.get(0))?;
             if !enabled {
                 continue;
             }
-            tx.execute("INSERT INTO durable_import_targets(import_id,object_id,target_generation,target_end) SELECT ?1,object_id,content_generation,byte_length FROM source_objects WHERE root_id=?2 AND state<>'missing' AND EXISTS(SELECT 1 FROM durable_imports WHERE import_id=?1 AND enumeration_done=0) ON CONFLICT DO NOTHING",params![id,root])?;
-            tx.execute("UPDATE durable_import_targets SET state='saved',finished_ms=?2,error_code=NULL WHERE import_id=?1 AND state='pending' AND EXISTS(SELECT 1 FROM source_objects o WHERE o.object_id=durable_import_targets.object_id AND o.content_generation=durable_import_targets.target_generation AND o.saved_offset>=durable_import_targets.target_end)",params![id,now_ms()])?;
-            tx.execute("UPDATE durable_import_targets SET state='gap',finished_ms=?2,error_code='SOURCE_CHANGED_BEFORE_SAVE' WHERE import_id=?1 AND state='pending' AND EXISTS(SELECT 1 FROM source_objects o WHERE o.object_id=durable_import_targets.object_id AND (o.content_generation<>durable_import_targets.target_generation OR o.state='missing'))",params![id,now_ms()])?;
-            tx.execute("UPDATE durable_imports SET saved_observation_id=MAX(saved_observation_id,COALESCE((SELECT MAX(o.observation_id) FROM usage_observations o JOIN source_objects f USING(object_id) WHERE f.root_id=?2),0)),enumeration_done=MAX(enumeration_done,?3),sealed_ms=CASE WHEN ?3 THEN COALESCE(sealed_ms,?4) ELSE sealed_ms END WHERE import_id=?1",params![id,root,enumerated,now_ms()])?;
+            changed |= tx.execute("INSERT INTO durable_import_targets(import_id,object_id,target_generation,target_end) SELECT ?1,object_id,content_generation,byte_length FROM source_objects WHERE root_id=?2 AND state<>'missing' AND EXISTS(SELECT 1 FROM durable_imports WHERE import_id=?1 AND enumeration_done=0) ON CONFLICT DO NOTHING",params![id,root])? > 0;
+            changed |= tx.execute("UPDATE durable_import_targets SET state='saved',finished_ms=?2,error_code=NULL WHERE import_id=?1 AND state='pending' AND EXISTS(SELECT 1 FROM source_objects o WHERE o.object_id=durable_import_targets.object_id AND o.content_generation=durable_import_targets.target_generation AND o.saved_offset>=durable_import_targets.target_end)",params![id,now_ms()])? > 0;
+            changed |= tx.execute("UPDATE durable_import_targets SET state='gap',finished_ms=?2,error_code='SOURCE_CHANGED_BEFORE_SAVE' WHERE import_id=?1 AND state='pending' AND EXISTS(SELECT 1 FROM source_objects o WHERE o.object_id=durable_import_targets.object_id AND (o.content_generation<>durable_import_targets.target_generation OR o.state='missing'))",params![id,now_ms()])? > 0;
+            changed |= tx.execute("UPDATE durable_imports SET saved_observation_id=MAX(saved_observation_id,COALESCE((SELECT MAX(o.observation_id) FROM usage_observations o JOIN source_objects f USING(object_id) WHERE f.root_id=?2),0)),enumeration_done=MAX(enumeration_done,?3),sealed_ms=CASE WHEN ?3 THEN COALESCE(sealed_ms,?4) ELSE sealed_ms END WHERE import_id=?1 AND (saved_observation_id<COALESCE((SELECT MAX(o.observation_id) FROM usage_observations o JOIN source_objects f USING(object_id) WHERE f.root_id=?2),0) OR (?3 AND (enumeration_done=0 OR sealed_ms IS NULL)))",params![id,root,enumerated,now_ms()])? > 0;
+            let incomplete_before: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM durable_imports WHERE root_id=?1 AND completed_ms IS NULL",
+                [&root],
+                |r| r.get(0),
+            )?;
             finish_targets(&tx, id)?;
+            let incomplete_after: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM durable_imports WHERE root_id=?1 AND completed_ms IS NULL",
+                [&root],
+                |r| r.get(0),
+            )?;
+            changed |= incomplete_before != incomplete_after;
         }
-        db::bump(&tx)?;
+        if changed {
+            db::bump(&tx)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -807,10 +821,22 @@ impl Ledger {
         for key in seen_object_keys {
             tx.execute("INSERT OR IGNORE INTO durable_seen_keys VALUES(?1)", [key])?;
         }
-        tx.execute("UPDATE source_objects SET state='missing',error_code=CASE WHEN target_done=0 THEN 'SOURCE_DISAPPEARED_BEFORE_SAVE' ELSE NULL END WHERE root_id=?1 AND object_key NOT IN(SELECT object_key FROM durable_seen_keys)",[&root.root_id])?;
-        tx.execute("UPDATE durable_import_targets SET state='gap',error_code='SOURCE_DISAPPEARED_BEFORE_SAVE',finished_ms=?2 WHERE state='pending' AND object_id IN(SELECT object_id FROM source_objects WHERE root_id=?1 AND state='missing')",params![root.root_id,now_ms()])?;
+        let changed_objects = tx.execute("UPDATE source_objects SET state='missing',error_code=CASE WHEN target_done=0 THEN 'SOURCE_DISAPPEARED_BEFORE_SAVE' ELSE NULL END WHERE root_id=?1 AND object_key NOT IN(SELECT object_key FROM durable_seen_keys) AND (state<>'missing' OR error_code IS NOT CASE WHEN target_done=0 THEN 'SOURCE_DISAPPEARED_BEFORE_SAVE' ELSE NULL END)",[&root.root_id])?;
+        let changed_targets = tx.execute("UPDATE durable_import_targets SET state='gap',error_code='SOURCE_DISAPPEARED_BEFORE_SAVE',finished_ms=?2 WHERE state='pending' AND object_id IN(SELECT object_id FROM source_objects WHERE root_id=?1 AND state='missing')",params![root.root_id,now_ms()])?;
+        let incomplete_before: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM durable_imports WHERE root_id=?1 AND completed_ms IS NULL",
+            [&root.root_id],
+            |r| r.get(0),
+        )?;
         finish_targets(&tx, root.import_id)?;
-        db::bump(&tx)?;
+        let incomplete_after: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM durable_imports WHERE root_id=?1 AND completed_ms IS NULL",
+            [&root.root_id],
+            |r| r.get(0),
+        )?;
+        if changed_objects > 0 || changed_targets > 0 || incomplete_before != incomplete_after {
+            db::bump(&tx)?;
+        }
         tx.commit()?;
         Ok(())
     }

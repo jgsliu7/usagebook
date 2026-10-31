@@ -194,17 +194,843 @@ impl CapturePrivacy {
     }
 }
 
+// Compatibility rows predate native identity metadata. In particular, Claude's
+// fallback key starts with the session, whereas the complete key starts with
+// the message ID. Do not promote fallback identities to independent requests.
+fn claude_identity(record: &UsageRecord) -> Option<(&str, &str)> {
+    if record.session_id.is_empty()
+        || record
+            .dedup_key
+            .starts_with(&format!("{}:", record.session_id))
+    {
+        return None;
+    }
+    let (message, request) = record.dedup_key.split_once(':')?;
+    if message.is_empty() || request.is_empty() || request.contains(':') {
+        return None;
+    }
+    Some((message, request))
+}
+
+fn claude_possible_message(record: &UsageRecord) -> Option<&str> {
+    if let Some((message, _)) = claude_identity(record) {
+        return Some(message);
+    }
+    let suffix = record
+        .dedup_key
+        .strip_prefix(&format!("{}:", record.session_id))?;
+    if suffix.is_empty() || suffix.contains(':') {
+        None
+    } else {
+        Some(suffix)
+    }
+}
+
+// A fallback key is only usable after independently persisted native evidence
+// proves one conflict-free identity and exactly the same numeric projection.
+// Looking up a hash alone, matching totals, or assuming a session-local message
+// ID is unique cannot establish this relationship.
+fn proven_claude_fallback(conn: &rusqlite::Connection, entry: &LegacyEntry) -> QueryResult<bool> {
+    use rusqlite::OptionalExtension;
+    let LegacyEntry::Request {
+        record,
+        native_tool,
+        namespace,
+        known_fields,
+    } = entry
+    else {
+        return Ok(false);
+    };
+    if record.session_id.is_empty()
+        || native_tool != "claude"
+        || namespace.is_some()
+        || *known_fields != 0
+        || record.cost_usd.is_some()
+        || record.reasoning_output != 0
+        || record.request_count != 1
+    {
+        return Ok(false);
+    }
+    let Some(message) = claude_possible_message(record) else {
+        return Ok(false);
+    };
+    if claude_identity(record).is_some() {
+        return Ok(false);
+    }
+    let numbers: Option<Vec<i64>> = [
+        record.input_uncached,
+        record.cache_read,
+        record.cache_write,
+        record.output,
+        record.cache_write_1h,
+    ]
+    .into_iter()
+    .map(|v| i64::try_from(v).ok())
+    .collect();
+    let Some(numbers) = numbers else {
+        return Ok(false);
+    };
+    let identity = super::claude::identity_key("request/fallback", &[&record.session_id, message]);
+    let id: Option<i64> = conn.query_row(
+        "SELECT o.observation_id FROM usage_observations o
+         JOIN usage_events e ON e.identity_family=o.identity_family AND e.namespace_key=o.namespace_key AND e.identity_key=o.identity_key AND e.selected_observation_id=o.observation_id
+         WHERE o.identity_family='claude' AND o.namespace_key='unknown:claude' AND o.identity_key=?1
+           AND o.report_source='claude' AND o.native_tool='claude' AND o.fact_kind='request' AND o.action='upsert'
+           AND o.cost_state='unknown'
+           AND o.native_session_id=?2 AND o.native_message_id=?3 AND o.native_request_id IS NULL
+           AND e.state='active' AND e.has_conflict=0 AND o.eligibility='eligible'
+           AND o.occurred_ms=?4 AND o.model_display=?5 AND o.input_uncached=?6 AND o.cache_read=?7
+           AND o.cache_write=?8 AND o.output_total=?9 AND o.cache_write_1h=?10 AND o.request_count=1
+           AND NOT EXISTS(SELECT 1 FROM identity_alias x WHERE x.identity_family='claude' AND x.namespace_key='unknown:claude' AND x.canonical_key=o.identity_key AND x.alias_key<>o.identity_key)
+           AND NOT EXISTS(SELECT 1 FROM identity_alias x WHERE x.identity_family='claude' AND x.namespace_key='unknown:claude' AND x.alias_key=o.identity_key AND x.canonical_key<>o.identity_key)
+           AND NOT EXISTS(SELECT 1 FROM usage_observations x WHERE x.identity_family='claude' AND x.namespace_key='unknown:claude' AND x.native_message_id=?3 AND (x.native_session_id IS NOT ?2 OR x.native_request_id IS NOT NULL OR x.identity_key IS NOT ?1))
+         LIMIT 1",
+        rusqlite::params![identity, record.session_id, message, record.ts_ms, record.model, numbers[0], numbers[1], numbers[2], numbers[3], numbers[4]], |r| r.get(0)).optional()?;
+    let Some(id) = id else {
+        return Ok(false);
+    };
+    let observation = conn.query_row(
+        "SELECT * FROM usage_observations WHERE observation_id=?1",
+        [id],
+        super::resolve::load_observation,
+    )?;
+    let suppressed = super::ingest::exact_suppressed(conn, &observation)
+        .map_err(|e| QueryError::new(e.code(), "cannot apply Claude identity deletion controls"))?;
+    let linked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE identity_family='claude' AND namespace_key='unknown:claude' AND ((kind='identity_link' AND link_version=1 AND link_key=?1) OR (kind='session' AND session_key=?2)))", rusqlite::params![super::claude::suppression_link(message), observation.session_key], |r| r.get(0))?;
+    Ok(!suppressed && !linked)
+}
+
+/// Monotonic numbers alone do not prove that an already displayed request was
+/// still streaming. Require native evidence for both versions and reject an
+/// old value that has also been reported as terminal.
+fn proven_claude_progress(
+    conn: &rusqlite::Connection,
+    old: &UsageRecord,
+    new: &UsageRecord,
+) -> QueryResult<bool> {
+    let (message, request) = if let Some((message, request)) = claude_identity(new) {
+        (message, Some(request))
+    } else if let Some(message) = claude_possible_message(new) {
+        (message, None)
+    } else {
+        return Ok(false);
+    };
+    if old.dedup_key != new.dedup_key
+        || old.session_id != new.session_id
+        || new.ts_ms < old.ts_ms
+        || old.cost_usd.is_some()
+        || new.cost_usd.is_some()
+        || old.reasoning_output != 0
+        || new.reasoning_output != 0
+        || old.request_count != 1
+        || new.request_count != 1
+    {
+        return Ok(false);
+    }
+    let identity = match request {
+        Some(request) => super::claude::identity_key("request/full", &[message, request]),
+        None => super::claude::identity_key("request/fallback", &[&new.session_id, message]),
+    };
+    let conflict: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM identity_alias WHERE identity_family='claude' AND namespace_key='unknown:claude' AND ((alias_key=?1 AND canonical_key<>?1) OR (canonical_key=?1 AND alias_key<>?1))) OR EXISTS(SELECT 1 FROM usage_observations o WHERE o.identity_family='claude' AND o.namespace_key='unknown:claude' AND o.native_message_id=?2 AND (o.native_session_id IS NOT ?3 OR o.native_request_id IS NOT ?4 OR o.identity_key IS NOT ?1)) OR EXISTS(SELECT 1 FROM usage_observations o WHERE o.identity_family='claude' AND o.namespace_key='unknown:claude' AND o.native_request_id=?4 AND o.native_message_id IS NOT ?2)", rusqlite::params![identity, message, new.session_id, request], |r| r.get(0))?;
+    if conflict {
+        return Ok(false);
+    }
+    let matches_version = |record: &UsageRecord,
+                           eligibility: &str,
+                           require_time: bool|
+     -> QueryResult<bool> {
+        let values: Option<Vec<i64>> = [
+            record.input_uncached,
+            record.cache_read,
+            record.cache_write,
+            record.output,
+            record.cache_write_1h,
+        ]
+        .into_iter()
+        .map(|v| i64::try_from(v).ok())
+        .collect();
+        let Some(values) = values else {
+            return Ok(false);
+        };
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM usage_observations o WHERE o.identity_family='claude' AND o.namespace_key='unknown:claude' AND o.identity_key=?1 AND o.report_source='claude' AND o.native_tool='claude' AND o.fact_kind='request' AND o.action='upsert' AND o.cost_state='unknown' AND o.native_session_id=?2 AND o.native_message_id=?3 AND o.native_request_id IS ?4 AND o.eligibility=?5 AND (?6=0 OR o.occurred_ms=?7) AND (?6<>0 OR ?5<>'pending_finality' OR o.occurred_ms<=?14) AND o.model_display=?8 AND o.input_uncached=?9 AND o.cache_read=?10 AND o.cache_write=?11 AND o.output_total=?12 AND (o.cache_write_1h=?13 OR (o.cache_write_1h IS NULL AND o.cache_write=0 AND ?13=0)) AND o.request_count=1)", rusqlite::params![identity,new.session_id,message,request,eligibility,require_time,record.ts_ms,record.model,values[0],values[1],values[2],values[3],values[4],new.ts_ms], |r|r.get(0))?)
+    };
+    // The display retains the first adoption time even after successive stream
+    // updates. Later native versions therefore need not have that timestamp;
+    // their full identity, model and token components must still match.
+    if !matches_version(old, "pending_finality", false)? || matches_version(old, "eligible", false)?
+    {
+        return Ok(false);
+    }
+    let new_final = matches_version(new, "eligible", true)?;
+    if !matches_version(new, "pending_finality", true)? && !new_final {
+        return Ok(false);
+    }
+    // Any terminal version for this identity constrains the entire lifecycle,
+    // not just versions equal to the old displayed value. A later pending 60
+    // cannot supersede an already observed final 100.
+    let final_exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM usage_observations WHERE identity_family='claude' AND namespace_key='unknown:claude' AND identity_key=?1 AND fact_kind='request' AND eligibility='eligible' AND action='upsert')", [&identity], |r| r.get(0))?;
+    if final_exists {
+        if !new_final {
+            return Ok(false);
+        }
+        let values: Option<Vec<i64>> = [
+            new.input_uncached,
+            new.cache_read,
+            new.cache_write,
+            new.output,
+            new.cache_write_1h,
+        ]
+        .into_iter()
+        .map(|v| i64::try_from(v).ok())
+        .collect();
+        let Some(values) = values else {
+            return Ok(false);
+        };
+        let conflicting_final: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM usage_observations o WHERE o.identity_family='claude' AND o.namespace_key='unknown:claude' AND o.identity_key=?1 AND o.fact_kind='request' AND o.eligibility='eligible' AND o.action='upsert' AND (o.model_display IS NOT ?2 OR o.input_uncached IS NOT ?3 OR o.cache_read IS NOT ?4 OR o.cache_write IS NOT ?5 OR o.output_total IS NOT ?6 OR NOT COALESCE(o.cache_write_1h IS ?7 OR (o.cache_write_1h IS NULL AND o.cache_write=0 AND ?7=0),0) OR o.request_count IS NOT 1 OR o.cost_state<>'unknown'))", rusqlite::params![identity,new.model,values[0],values[1],values[2],values[3],values[4]], |r|r.get(0))?;
+        if conflicting_final {
+            return Ok(false);
+        }
+    }
+    let denied: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE identity_family='claude' AND namespace_key='unknown:claude' AND ((kind='identity' AND identity_key=?1) OR (kind='identity_link' AND link_version=1 AND link_key=?2) OR (kind='session' AND session_key=?3)))", rusqlite::params![identity,super::claude::suppression_link(message),super::claude::identity_key("session", &[&new.session_id])], |r| r.get(0))?;
+    Ok(!denied)
+}
+
+fn claude_pending(
+    conn: &rusqlite::Connection,
+    entry: &LegacyEntry,
+    reason: &str,
+) -> QueryResult<()> {
+    let encoded = serde_json::to_string(entry)
+        .map_err(|_| QueryError::invalid("invalid Claude candidate"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"usagebook/claude-pending/v1");
+    hash.update((reason.len() as u64).to_be_bytes());
+    hash.update(reason.as_bytes());
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded.as_bytes());
+    let sql = "INSERT INTO claude_protection_pending(identity,entry_json,reason) VALUES(?1,?2,?3) ON CONFLICT(identity) DO NOTHING";
+    conn.execute(
+        sql,
+        rusqlite::params![format!("{:x}", hash.finalize()), encoded, reason],
+    )?;
+    Ok(())
+}
+
+// One watermarked row per adopted request. Keep the displayed timestamp in
+// the entry for privacy filtering; the actual source timestamp is in reason.
+fn claude_approved_key(record: &UsageRecord) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"usagebook/claude-approved-successor/v1");
+    for part in [
+        record.source,
+        record.session_id.as_str(),
+        record.dedup_key.as_str(),
+    ] {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn claude_approved_time(
+    conn: &rusqlite::Connection,
+    old: &LegacyEntry,
+) -> QueryResult<Option<i64>> {
+    use rusqlite::OptionalExtension;
+    let LegacyEntry::Request { record, .. } = old else {
+        return Ok(None);
+    };
+    let saved: Option<(String, String)> = conn
+        .query_row(
+            "SELECT reason,entry_json FROM claude_protection_pending WHERE identity=?1",
+            [claude_approved_key(record)],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((reason, saved)) = saved {
+        let Some(raw_time) = reason
+            .strip_prefix("approved_successor/")
+            .and_then(|s| s.parse::<i64>().ok())
+        else {
+            return Ok(None);
+        };
+        let current = serde_json::to_string(old)
+            .map_err(|_| QueryError::invalid("invalid Claude baseline"))?;
+        if saved != current || raw_time < record.ts_ms {
+            return Ok(None);
+        }
+        return Ok(Some(raw_time));
+    }
+    // Previous versions of this protocol retained old projections but did not
+    // record the adopted source time. Do not infer their last watermark from
+    // the displayed anchor or from a different native observation.
+    let previous_progress: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM claude_protection_pending WHERE reason='original_baseline' AND json_extract(entry_json,'$.Request.record.session_id')=?1 AND json_extract(entry_json,'$.Request.record.dedup_key')=?2)", rusqlite::params![record.session_id,record.dedup_key], |r| r.get(0))?;
+    Ok((!previous_progress).then_some(record.ts_ms))
+}
+
+fn claude_set_approved(
+    conn: &rusqlite::Connection,
+    successor: &LegacyEntry,
+    raw_time: i64,
+) -> QueryResult<()> {
+    let LegacyEntry::Request { record, .. } = successor else {
+        return Err(QueryError::invalid("invalid Claude successor"));
+    };
+    let encoded = serde_json::to_string(successor)
+        .map_err(|_| QueryError::invalid("invalid Claude successor"))?;
+    let changed = conn.execute("INSERT INTO claude_protection_pending(identity,entry_json,reason) VALUES(?1,?2,?3) ON CONFLICT(identity) DO UPDATE SET entry_json=excluded.entry_json,reason=excluded.reason WHERE claude_protection_pending.reason GLOB 'approved_successor/*'", rusqlite::params![claude_approved_key(record),encoded,format!("approved_successor/{raw_time}")])?;
+    if changed != 1 {
+        return Err(QueryError::new(
+            "CLAUDE_EVIDENCE_CONFLICT",
+            "cannot save Claude successor watermark",
+        ));
+    }
+    Ok(())
+}
+
+// Deleting an intermediate observation installs identity/message controls.
+// Compatibility values are indivisible even if their anchors lie elsewhere.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaudeDeletionMatch {
+    None,
+    Exact,
+    Uncertain,
+}
+
+#[derive(Default)]
+struct ClaudeDeletionControls {
+    identities: std::collections::BTreeSet<String>,
+    links: std::collections::BTreeSet<String>,
+    sessions: std::collections::BTreeSet<String>,
+}
+impl ClaudeDeletionControls {
+    fn load(conn: &rusqlite::Connection) -> QueryResult<Self> {
+        let mut controls = Self::default();
+        let mut query = conn.prepare("SELECT kind,identity_key,link_key,session_key FROM suppression_rules WHERE identity_family='claude' AND namespace_key='unknown:claude' AND kind IN('identity','identity_link','session')")?;
+        let rows = query.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (kind, identity, link, session) = row?;
+            match kind.as_str() {
+                "identity" => {
+                    controls.identities.insert(identity.ok_or_else(|| {
+                        QueryError::new("LEDGER_UNREADABLE", "invalid Claude deletion control")
+                    })?);
+                }
+                "identity_link" => {
+                    controls.links.insert(link.ok_or_else(|| {
+                        QueryError::new("LEDGER_UNREADABLE", "invalid Claude deletion control")
+                    })?);
+                }
+                "session" => {
+                    controls.sessions.insert(session.ok_or_else(|| {
+                        QueryError::new("LEDGER_UNREADABLE", "invalid Claude deletion control")
+                    })?);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(controls)
+    }
+    fn is_empty(&self) -> bool {
+        self.identities.is_empty() && self.links.is_empty() && self.sessions.is_empty()
+    }
+    fn classify(&self, entry: &LegacyEntry) -> ClaudeDeletionMatch {
+        if self.is_empty() {
+            return ClaudeDeletionMatch::None;
+        }
+        let record = match entry {
+            LegacyEntry::Request { record, .. } => record,
+            LegacyEntry::SessionTotal { record, .. } => {
+                return if !self.links.is_empty()
+                    || !self.identities.is_empty()
+                    || record.session_id.is_empty()
+                    || self.sessions.contains(&super::claude::identity_key(
+                        "session",
+                        &[&record.session_id],
+                    )) {
+                    ClaudeDeletionMatch::Uncertain
+                } else {
+                    ClaudeDeletionMatch::None
+                };
+            }
+            LegacyEntry::Day(_) => return ClaudeDeletionMatch::Uncertain,
+        };
+        let Some(message) = claude_possible_message(record) else {
+            return if !self.links.is_empty()
+                || !self.identities.is_empty()
+                || record.session_id.is_empty()
+                || self.sessions.contains(&super::claude::identity_key(
+                    "session",
+                    &[&record.session_id],
+                )) {
+                ClaudeDeletionMatch::Uncertain
+            } else {
+                ClaudeDeletionMatch::None
+            };
+        };
+        let identity = if let Some((message, request)) = claude_identity(record) {
+            super::claude::identity_key("request/full", &[message, request])
+        } else if !record.session_id.is_empty() {
+            super::claude::identity_key("request/fallback", &[&record.session_id, message])
+        } else {
+            return ClaudeDeletionMatch::Uncertain;
+        };
+        if self.identities.contains(&identity) {
+            ClaudeDeletionMatch::Exact
+        } else if self
+            .links
+            .contains(&super::claude::suppression_link(message))
+        {
+            ClaudeDeletionMatch::Uncertain
+        } else {
+            ClaudeDeletionMatch::None
+        }
+    }
+}
+
+/// Apply the same source/time deletion rules to retained unresolved candidates.
+/// Caller must hold the maintenance transaction, after merging deletion rules.
+pub(crate) fn scrub_claude_pending(conn: &rusqlite::Connection) -> QueryResult<usize> {
+    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='claude_protection_pending')", [], |r| r.get(0))?;
+    if !exists {
+        return Ok(0);
+    }
+    let policy = CapturePrivacy::load(conn)?;
+    let controls = ClaudeDeletionControls::load(conn)?;
+    if !controls.is_empty() {
+        // Also check first-time displayed rows, which may not have any
+        // successor watermark or original-baseline evidence yet.
+        let mut query = conn.prepare(
+            "SELECT entry_json FROM legacy_capture_entries WHERE report_source='claude'",
+        )?;
+        let rows = query.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let entry: LegacyEntry = serde_json::from_str(&row?)
+                .map_err(|_| QueryError::new("LEDGER_UNREADABLE", "invalid Claude baseline"))?;
+            if controls.classify(&entry) != ClaudeDeletionMatch::None
+                && !policy.suppresses(conn, &entry)?
+            {
+                return Err(QueryError::new("PRIVACY_SCOPE_INCOMPLETE", "the selected interval includes native evidence for a displayed Claude request whose anchor is outside the interval; include the displayed anchor"));
+            }
+        }
+    }
+    let rows: Vec<(String, String, String)> = conn
+        .prepare("SELECT identity,entry_json,reason FROM claude_protection_pending")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut removed = 0;
+    for (identity, encoded, reason) in rows {
+        let entry: LegacyEntry = serde_json::from_str(&encoded)
+            .map_err(|_| QueryError::new("LEDGER_UNREADABLE", "invalid Claude candidate"))?;
+        let anchor_suppressed = policy.suppresses(conn, &entry)?;
+        let adopted = reason == "original_baseline" || reason.starts_with("approved_successor/");
+        let identity_match = controls.classify(&entry);
+        if !anchor_suppressed && identity_match != ClaudeDeletionMatch::None {
+            if adopted || identity_match == ClaudeDeletionMatch::Uncertain {
+                return Err(QueryError::new("PRIVACY_SCOPE_INCOMPLETE", "the selected native Claude identity overlaps retained compatibility evidence whose scope cannot be safely separated"));
+            }
+        }
+        if let Some(raw) = reason.strip_prefix("approved_successor/") {
+            let raw_time: i64 = raw.parse().map_err(|_| {
+                QueryError::new("LEDGER_UNREADABLE", "invalid Claude successor watermark")
+            })?;
+            let mut source_entry = entry.clone();
+            let LegacyEntry::Request { record, .. } = &mut source_entry else {
+                return Err(QueryError::new(
+                    "LEDGER_UNREADABLE",
+                    "invalid Claude successor watermark",
+                ));
+            };
+            record.ts_ms = raw_time;
+            if policy.suppresses(conn, &source_entry)? && !anchor_suppressed {
+                return Err(QueryError::new("PRIVACY_SCOPE_INCOMPLETE", "the selected interval contains an adopted Claude successor whose displayed anchor is outside the interval; include the displayed anchor"));
+            }
+        }
+        if anchor_suppressed || identity_match == ClaudeDeletionMatch::Exact {
+            let count = conn.execute(
+                "DELETE FROM claude_protection_pending WHERE identity=?1",
+                [identity],
+            )?;
+            if reason != "original_baseline" && !reason.starts_with("approved_successor/") {
+                removed += count;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Keep the last committed Claude display as the baseline, never a fresh scan.
+/// The capture, unresolved candidates and read model commit as one transaction.
+fn protect_claude_capture(
+    conn: &rusqlite::Connection,
+    snapshot: &mut LegacySnapshot,
+) -> QueryResult<()> {
+    use rusqlite::OptionalExtension;
+    use std::collections::{BTreeMap, BTreeSet};
+    // Validate new evidence before looking at the old baseline; a stale scanner
+    // must not republish anything covered by a concurrent forget operation.
+    CapturePrivacy::load(conn)?.validate(conn, snapshot)?;
+    let ledger_route: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM source_roots WHERE report_source='claude' AND route='ledger')",
+        [],
+        |r| r.get(0),
+    )?;
+    if ledger_route {
+        return Ok(());
+    }
+    let identity_controls = ClaudeDeletionControls::load(conn)?;
+    if !identity_controls.is_empty() {
+        // Pending rows restored from a backup or observed by an older scanner
+        // must obey the same identity closure before we process this capture.
+        scrub_claude_pending(conn)?;
+    }
+    let previous = LegacySnapshot::restore_capture_source(conn, Some("claude"))?;
+    // If capture metadata was removed by maintenance, never use that as proof
+    // that a source/window-controlled history has never been displayed.
+    let deletion_scope_unresolved: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM suppression_rules WHERE (kind='window' AND (report_source IS NULL OR report_source='claude') AND (native_tool IS NULL OR native_tool='claude')) OR (kind IN('identity','session','identity_link') AND identity_family='claude')) OR EXISTS(SELECT 1 FROM adoption_forget_ranges WHERE consumer_tool='claude')",
+        [], |r| r.get(0))?;
+    let mut previous = match previous {
+        Some(previous) => previous,
+        None if !deletion_scope_unresolved => return Ok(()),
+        None => LegacySnapshot::new(super::types::new_epoch(), snapshot.routing_hash.clone()),
+    };
+    previous.filter_suppressed(conn)?;
+    let previously_published = previous
+        .sources
+        .get("claude")
+        .and_then(|status| status.last_scanned_ms)
+        .is_some()
+        || !previous.entries.is_empty();
+    let first_complete = snapshot.sources.get("claude").is_some_and(|status| {
+        status.last_scanned_ms.is_some() && !status.stale && status.error.is_none()
+    });
+    if !previously_published && first_complete && !deletion_scope_unresolved {
+        return Ok(());
+    }
+    let before = snapshot.content_fingerprint();
+    // A time-scoped deletion can remove the original timestamp of a streaming
+    // request while a later observation has another timestamp. Compatibility
+    // rows lack a durable per-member tombstone, so after such controls new
+    // identities cannot be proved disjoint from deleted history automatically.
+    let mut incoming = Vec::new();
+    for entry in snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.report_source() == "claude")
+    {
+        match identity_controls.classify(entry) {
+            ClaudeDeletionMatch::None => incoming.push(entry.clone()),
+            ClaudeDeletionMatch::Exact => { /* A forgotten identity may not re-enter pending. */ }
+            ClaudeDeletionMatch::Uncertain => return Err(QueryError::new("PRIVACY_FILTER_REQUIRED", "Claude source evidence overlaps a forgotten identity and cannot be safely separated")),
+        }
+    }
+    // Unresolved observations still constrain identity decisions. In
+    // particular, an exact-key upgrade of a weak baseline must not later
+    // permit a different message carrying the same request ID to slip in.
+    let pending_rows: Vec<(String, String)> = conn
+        .prepare("SELECT identity,entry_json FROM claude_protection_pending WHERE reason<>'original_baseline' AND reason NOT GLOB 'approved_successor/*' ORDER BY identity")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut all_candidates = incoming.clone();
+    let mut pending_encoded = BTreeSet::new();
+    for (_, row) in &pending_rows {
+        pending_encoded.insert(row.clone());
+        let entry: LegacyEntry = serde_json::from_str(row)
+            .map_err(|_| QueryError::new("LEDGER_UNREADABLE", "invalid Claude candidate"))?;
+        all_candidates.push(entry);
+    }
+    let mut candidate_messages: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut candidate_requests: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for entry in &all_candidates {
+        if let LegacyEntry::Request { record, .. } = entry {
+            if let Some(message) = claude_possible_message(record) {
+                candidate_messages
+                    .entry(message.to_owned())
+                    .or_default()
+                    .insert(record.dedup_key.clone());
+            }
+            if let Some((_, request)) = claude_identity(record) {
+                candidate_requests
+                    .entry(request.to_owned())
+                    .or_default()
+                    .insert(record.dedup_key.clone());
+            }
+        }
+    }
+    // Rotate over a bounded batch, so a permanently ambiguous early candidate
+    // cannot starve later evidence. The cursor commits with the projection.
+    let cursor: Option<String> = conn
+        .query_row(
+            "SELECT value_json FROM ledger_runtime_state WHERE state_key='claude-pending-cursor'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| serde_json::from_str(&value).ok());
+    let start = cursor
+        .as_ref()
+        .map(|cursor| pending_rows.partition_point(|(id, _)| id <= cursor))
+        .unwrap_or(0);
+    let count = pending_rows.len().min(256);
+    let mut candidates = incoming;
+    let policy = CapturePrivacy::load(conn)?;
+    let mut last_cursor = None;
+    for offset in 0..count {
+        let (identity, row) = &pending_rows[(start + offset) % pending_rows.len()];
+        let entry: LegacyEntry = serde_json::from_str(row)
+            .map_err(|_| QueryError::new("LEDGER_UNREADABLE", "invalid Claude candidate"))?;
+        if !policy.suppresses(conn, &entry)? {
+            candidates.push(entry);
+        }
+        last_cursor = Some(identity);
+    }
+    if let Some(cursor) = last_cursor {
+        let encoded = serde_json::to_string(cursor)
+            .map_err(|_| QueryError::invalid("invalid Claude cursor"))?;
+        conn.execute("INSERT INTO ledger_runtime_state(state_key,value_json) VALUES('claude-pending-cursor',?1) ON CONFLICT(state_key) DO UPDATE SET value_json=excluded.value_json", [encoded])?;
+    }
+    let mut retained = previous.entries;
+    let mut by_key: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut by_message: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut by_request: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut unknown_sessions = BTreeSet::new();
+    let mut encoded_retained = BTreeSet::new();
+    for (index, entry) in retained.iter().enumerate() {
+        encoded_retained.insert(
+            serde_json::to_string(entry)
+                .map_err(|_| QueryError::invalid("invalid Claude baseline"))?,
+        );
+        if let LegacyEntry::Request { record, .. } = entry {
+            by_key
+                .entry(record.dedup_key.clone())
+                .or_default()
+                .push(index);
+            if let Some(message) = claude_possible_message(record) {
+                by_message
+                    .entry(message.to_owned())
+                    .or_default()
+                    .push(index);
+            } else {
+                unknown_sessions.insert(record.session_id.clone());
+            }
+            if let Some((_, request)) = claude_identity(record) {
+                by_request
+                    .entry(request.to_owned())
+                    .or_default()
+                    .push(index);
+            }
+        }
+    }
+    let mut processed = BTreeSet::new();
+    for entry in candidates {
+        let candidate_json = serde_json::to_string(&entry)
+            .map_err(|_| QueryError::invalid("invalid Claude candidate"))?;
+        if !processed.insert(candidate_json.clone()) {
+            continue;
+        }
+        let LegacyEntry::Request {
+            record: candidate,
+            native_tool,
+            namespace,
+            known_fields,
+        } = &entry
+        else {
+            // Session and day summaries cannot safely be interpreted as requests.
+            // Exact repeats need no extra copy; changed summaries await review.
+            let encoded = serde_json::to_string(&entry)
+                .map_err(|_| QueryError::invalid("invalid Claude candidate"))?;
+            if !encoded_retained.contains(&encoded) {
+                claude_pending(conn, &entry, "unresolved_summary")?;
+            }
+            continue;
+        };
+        let identity =
+            claude_identity(candidate).map(|(message, request)| (message, Some(request)));
+        let matching = by_key
+            .get(&candidate.dedup_key)
+            .cloned()
+            .unwrap_or_default();
+        let fallback = if identity.is_none() && !encoded_retained.contains(&candidate_json) {
+            // A previously displayed fallback member can enter the existing
+            // identity branch; a numeric change still requires independent
+            // native lifecycle proof below. A new weak identity must pass the
+            // stronger active/eligible proof before it may be appended.
+            (matching.len() == 1
+                && !candidate.session_id.is_empty()
+                && claude_possible_message(candidate).is_some())
+                || proven_claude_fallback(conn, &entry)?
+        } else {
+            false
+        };
+        let Some((message, request)) = identity
+            .or_else(|| fallback.then(|| (claude_possible_message(candidate).unwrap(), None)))
+        else {
+            if !encoded_retained.contains(&candidate_json) {
+                claude_pending(conn, &entry, "weak_identity")?;
+            }
+            continue;
+        };
+        if deletion_scope_unresolved && matching.is_empty() {
+            claude_pending(conn, &entry, "deletion_scope_unresolved")?;
+            continue;
+        }
+        let ambiguous = by_message
+            .get(message)
+            .is_some_and(|indices| indices.iter().any(|index| !matching.contains(index)))
+            || request.is_some_and(|request| {
+                by_request
+                    .get(request)
+                    .is_some_and(|indices| indices.iter().any(|index| !matching.contains(index)))
+            })
+            || candidate_messages
+                .get(message)
+                .is_some_and(|keys| keys.iter().any(|key| key != &candidate.dedup_key))
+            || request.is_some_and(|request| {
+                candidate_requests
+                    .get(request)
+                    .is_some_and(|keys| keys.iter().any(|key| key != &candidate.dedup_key))
+            })
+            || !unknown_sessions.is_empty();
+        if ambiguous || matching.len() > 1 {
+            claude_pending(conn, &entry, "identity_ambiguous")?;
+            continue;
+        }
+        if let Some(&index) = matching.first() {
+            let LegacyEntry::Request {
+                record: old,
+                native_tool: old_tool,
+                namespace: old_namespace,
+                known_fields: old_fields,
+            } = &retained[index]
+            else {
+                unreachable!()
+            };
+            let comparable = old.source == candidate.source
+                && old.session_id == candidate.session_id
+                && old.agent == candidate.agent
+                && old.model == candidate.model
+                && old.caliber == candidate.caliber
+                && old.request_count == candidate.request_count
+                && old_tool == native_tool
+                && old_namespace == namespace
+                && old_fields == known_fields
+                && old.cost_usd == candidate.cost_usd;
+            let monotonic = candidate.input_uncached >= old.input_uncached
+                && candidate.cache_read >= old.cache_read
+                && candidate.cache_write >= old.cache_write
+                && candidate.cache_write_1h >= old.cache_write_1h
+                && candidate.output >= old.output
+                && candidate.reasoning_output >= old.reasoning_output;
+            if !comparable || !monotonic {
+                claude_pending(conn, &entry, "conflicting_observation")?;
+                continue;
+            }
+            let mut successor = entry.clone();
+            if let LegacyEntry::Request { record, .. } = &mut successor {
+                record.ts_ms = old.ts_ms;
+            }
+            let successor_json = serde_json::to_string(&successor)
+                .map_err(|_| QueryError::invalid("invalid Claude successor"))?;
+            let old_json = serde_json::to_string(&retained[index])
+                .map_err(|_| QueryError::invalid("invalid Claude baseline"))?;
+            if successor_json != old_json {
+                let approved_time = claude_approved_time(conn, &retained[index])?;
+                if *known_fields != 0
+                    || approved_time.is_none_or(|time| candidate.ts_ms < time)
+                    || !proven_claude_progress(conn, old, candidate)?
+                {
+                    claude_pending(conn, &entry, "progress_unproven")?;
+                    continue;
+                }
+                claude_pending(conn, &retained[index], "original_baseline")?;
+                claude_set_approved(conn, &successor, candidate.ts_ms)?;
+            }
+            encoded_retained.insert(successor_json);
+            retained[index] = successor;
+        } else {
+            let index = retained.len();
+            by_key
+                .entry(candidate.dedup_key.clone())
+                .or_default()
+                .push(index);
+            by_message
+                .entry(message.to_owned())
+                .or_default()
+                .push(index);
+            if let Some(request) = request {
+                by_request
+                    .entry(request.to_owned())
+                    .or_default()
+                    .push(index);
+            }
+            encoded_retained.insert(
+                serde_json::to_string(&entry)
+                    .map_err(|_| QueryError::invalid("invalid Claude candidate"))?,
+            );
+            retained.push(entry);
+        }
+        if pending_encoded.contains(&candidate_json) {
+            conn.execute("DELETE FROM claude_protection_pending WHERE reason<>'original_baseline' AND reason NOT GLOB 'approved_successor/*' AND entry_json=?1", [candidate_json])?;
+        }
+    }
+    snapshot
+        .entries
+        .retain(|entry| entry.report_source() != "claude");
+    snapshot.entries.extend(retained);
+    let evidence_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM claude_protection_pending WHERE reason NOT GLOB 'approved_successor/*'", [], |r| {
+            r.get(0)
+        })?;
+    if evidence_count > 1_000_000 {
+        return Err(QueryError::new(
+            "CLAUDE_EVIDENCE_LIMIT",
+            "Claude unresolved evidence limit reached; previous published history retained",
+        ));
+    }
+    if before != snapshot.content_fingerprint() {
+        snapshot.generation = super::types::new_epoch();
+    }
+    Ok(())
+}
+
 impl super::Ledger {
     /// Compatibility publication and its query projection share one commit.
     pub fn publish_compatibility_capture(&mut self, snapshot: &LegacySnapshot) -> QueryResult<()> {
+        use rusqlite::params;
         self.require_writer()
             .map_err(|_| QueryError::invalid("writer required"))?;
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        snapshot.persist(&tx)?;
-        super::read_model::replace(&tx, snapshot)?;
-        super::db::bump(&tx).map_err(|e| QueryError::new(e.code(), "capture commit failed"))?;
+        let previous = LegacySnapshot::restore_capture(&tx)?;
+        let mut protected = snapshot.clone();
+        protect_claude_capture(&tx, &mut protected)?;
+        // Scanner generations describe raw input, not the protected result.
+        // Keep the published cursor stable when a scan, status update or
+        // pending-only retry leaves all visible facts and routing unchanged.
+        if let Some(old) = &previous {
+            if old.projection_fingerprint() == protected.projection_fingerprint() {
+                protected.generation = old.generation.clone();
+            } else {
+                protected.generation = super::types::new_epoch();
+            }
+        } else {
+            protected.generation = super::types::new_epoch();
+        }
+        let projection_unchanged: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM query_live_state s JOIN ledger_meta m ON m.singleton=s.singleton AND m.ledger_uuid=s.ledger_uuid AND m.epoch=s.epoch WHERE s.generation=?1 AND s.routing_hash=?2)",params![protected.generation,protected.routing_hash],|r|r.get(0))?;
+        protected.persist(&tx)?;
+        super::read_model::replace(&tx, &protected)?;
+        if !projection_unchanged {
+            super::db::bump(&tx).map_err(|e| QueryError::new(e.code(), "capture commit failed"))?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -460,6 +1286,12 @@ impl LegacySnapshot {
     /// Only the publisher uses this digest; cursors retain random generations so
     /// an A -> B -> A transition cannot revive an old cursor.
     pub fn content_fingerprint(&self) -> [u8; 32] {
+        self.fingerprint(true)
+    }
+    fn projection_fingerprint(&self) -> [u8; 32] {
+        self.fingerprint(false)
+    }
+    fn fingerprint(&self, include_status: bool) -> [u8; 32] {
         fn key(entry: &LegacyEntry) -> (u8, &str, &str, &str) {
             match entry {
                 LegacyEntry::Request {
@@ -512,7 +1344,9 @@ impl LegacySnapshot {
             hash.update((bytes.len() as u64).to_be_bytes());
             hash.update(bytes);
         }
-        hash.update(serde_json::to_vec(&sources).expect("typed source status is serializable"));
+        if include_status {
+            hash.update(serde_json::to_vec(&sources).expect("typed source status is serializable"));
+        }
         hash.finalize().into()
     }
     pub fn push_records(
