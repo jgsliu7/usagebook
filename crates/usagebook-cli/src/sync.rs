@@ -16,7 +16,7 @@ use usagebook_core::ledger::{
     db, sync_identity as identity,
     sync_projection::{self, Identity, ProjectedRow},
     sync_state as state,
-    types::{new_epoch, now_ms},
+    types::{new_epoch, now_ms, LedgerError},
     Ledger,
 };
 type Outcome<T> = Result<T, String>;
@@ -666,12 +666,18 @@ enum NetworkResult {
     Upload(String, Result<Value, CloudError>),
     Logout(Outcome<()>, mpsc::SyncSender<Outcome<Value>>),
 }
+// Instant 的可表示范围因平台而异；无法减去该时长时兜底为 now()。
+fn stale_instant(ago: Duration) -> Instant {
+    Instant::now().checked_sub(ago).unwrap_or_else(Instant::now)
+}
 enum ExportMessage {
     Page(Vec<ProjectedRow>),
     Done(Outcome<()>),
 }
 struct Export {
     id: String,
+    source: String,
+    projection_version: i64,
     rx: mpsc::Receiver<ExportMessage>,
 }
 pub struct Runtime {
@@ -682,6 +688,9 @@ pub struct Runtime {
     network_busy: bool,
     export: Option<Export>,
     last_version: i64,
+    // Successful source snapshots only. A pending or failed source is deliberately
+    // absent so the periodic retry still runs even when projection_clock is stable.
+    exported_versions: std::collections::BTreeMap<(String, String), i64>,
     source_queue: std::collections::VecDeque<String>,
     last_cycle: Instant,
     server_ready: bool,
@@ -715,13 +724,14 @@ impl Runtime {
                 network_busy: false,
                 export: None,
                 last_version: -1,
+                exported_versions: Default::default(),
                 source_queue: Default::default(),
-                last_cycle: Instant::now() - Duration::from_secs(60),
+                last_cycle: stale_instant(Duration::from_secs(60)),
                 server_ready: false,
                 credentials: None,
                 path: ledger.path().to_owned(),
                 next_network: Instant::now(),
-                last_cleanup: Instant::now() - Duration::from_secs(86400),
+                last_cleanup: stale_instant(Duration::from_secs(86400)),
             },
             handle,
         ))
@@ -761,13 +771,15 @@ impl Runtime {
                             self.credentials = Some(c);
                             self.server_ready = false;
                             self.last_version = -1;
+                            self.exported_versions.clear();
                             self.next_network = Instant::now();
                             ledger.sync_set_enabled(true).map_err(|e| e.to_string())
                         }
                     }
                     "wake" => {
-                        self.last_cycle = Instant::now() - Duration::from_secs(60);
+                        self.last_cycle = stale_instant(Duration::from_secs(60));
                         self.last_version = -1;
+                        self.exported_versions.clear();
                         state::status(ledger.connection()).map_err(|e| e.to_string())
                     }
                     _ => Err("INVALID_ACTION".into()),
@@ -916,9 +928,11 @@ impl Runtime {
             // One bounded page between acquisition slices; exporting never consumes the
             // dashboard query workers or holds this connection during network waiting.
             match export.rx.try_recv() {
-                Ok(ExportMessage::Page(page)) => ledger
-                    .sync_accept_page(&export.id, &page)
-                    .map_err(|e| e.to_string())?,
+                Ok(ExportMessage::Page(page)) => {
+                    if let Err(error) = ledger.sync_accept_page(&export.id, &page) {
+                        finished = Some(Err(export_error_code(&error)));
+                    }
+                }
                 Ok(ExportMessage::Done(result)) => finished = Some(result),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     finished = Some(Err("SYNC_EXPORT_FAILED".into()))
@@ -928,14 +942,30 @@ impl Runtime {
         }
         if let Some(result) = finished {
             let export = self.export.take().unwrap();
-            if result.is_ok() {
+            let result = result.and_then(|_| {
                 ledger
                     .sync_finish_export(&export.id)
-                    .map_err(|e| e.to_string())?;
-            } else {
-                ledger
-                    .sync_cancel_export(&export.id, Some("SOURCE_EXPORT_FAILED"))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| export_error_code(&e))
+            });
+            match result {
+                Ok(_)
+                    if state::source_export_ready(ledger.connection(), &export.source)
+                        .map_err(|e| e.to_string())? =>
+                {
+                    self.exported_versions.insert(
+                        (b.binding_id.clone(), export.source),
+                        export.projection_version,
+                    );
+                }
+                Ok(_) => {} // Identity/value conflicts are not a successful baseline.
+                Err(code) => {
+                    ledger
+                        .sync_cancel_export(&export.id, None)
+                        .map_err(|e| e.to_string())?;
+                    ledger
+                        .sync_record_source_error(&export.source, &code)
+                        .map_err(|e| e.to_string())?;
+                }
             }
         }
         if self.export.is_none() {
@@ -946,13 +976,32 @@ impl Runtime {
                 {
                     self.source_queue = state::sources(ledger.connection())
                         .map_err(|e| e.to_string())?
-                        .into();
+                        .into_iter()
+                        .filter(|source| {
+                            self.exported_versions
+                                .get(&(b.binding_id.clone(), source.clone()))
+                                != Some(&version)
+                        })
+                        .collect();
                     self.last_version = version;
                     self.last_cycle = Instant::now();
                 }
             }
             if let Some(source) = self.source_queue.pop_front() {
-                if let Ok(export_id) = ledger.sync_begin_export(&source) {
+                let projection_version =
+                    state::version(ledger.connection()).map_err(|e| e.to_string())?;
+                let export_id = match ledger.sync_begin_export(&source) {
+                    Ok(id) => Some(id),
+                    Err(LedgerError::InvalidInput(code)) if code == "SYNC_SOURCE_PENDING" => None,
+                    Err(error) => {
+                        ledger
+                            .sync_record_source_error(&source, &export_error_code(&error))
+                            .map_err(|e| e.to_string())?;
+                        None
+                    }
+                };
+                if let Some(export_id) = export_id {
+                    let export_source = source.clone();
                     let (tx, rx) = mpsc::sync_channel(2);
                     let path = ledger.path().to_owned();
                     let secret = secret(&creds)?;
@@ -998,7 +1047,7 @@ impl Runtime {
                                     Ok(())
                                 },
                             )
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| export_error_code(&e))?;
                             if started.elapsed() > Duration::from_secs(5) {
                                 tracing::warn!(
                                     duration_ms = started.elapsed().as_millis() as u64,
@@ -1013,7 +1062,12 @@ impl Runtime {
                         })();
                         let _ = tx.send(ExportMessage::Done(result));
                     });
-                    self.export = Some(Export { id: export_id, rx });
+                    self.export = Some(Export {
+                        id: export_id,
+                        source: export_source,
+                        projection_version,
+                        rx,
+                    });
                 }
             }
         }
@@ -1044,6 +1098,12 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+fn export_error_code(error: &LedgerError) -> String {
+    match error {
+        LedgerError::InvalidInput(code) => code.clone(),
+        _ => error.code().to_owned(),
     }
 }
 fn uuid_bytes() -> Box<[u8; 16]> {

@@ -31,12 +31,13 @@ pub(crate) fn input_identity(
         occurrence,
     ))
 }
+type AdoptedBinding = (
+    sync_state::Binding,
+    sync_projection::Identity,
+    BTreeMap<(String, String), NativeBucket>,
+);
 pub(crate) struct Prepared {
-    bindings: Vec<(
-        sync_state::Binding,
-        sync_projection::Identity,
-        BTreeMap<(String, String), NativeBucket>,
-    )>,
+    bindings: Vec<AdoptedBinding>,
     version: i64,
 }
 #[derive(Default)]
@@ -374,7 +375,7 @@ pub(crate) fn publish(
                 &binding,
                 source,
                 version,
-                &[parent_id.clone()],
+                std::slice::from_ref(&parent_id),
                 &retired,
                 "adoption",
             )?;

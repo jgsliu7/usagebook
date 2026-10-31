@@ -32,12 +32,33 @@ pub fn status(c: &Connection) -> Result<Value> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let queue:i64=c.query_row("SELECT COUNT(*) FROM sync_transactions WHERE binding_id=?1 AND state NOT IN('acked','aborted')",[&b.binding_id],|r|r.get(0))?;
+    // Match next_upload's ordering: a permanently blocked head reserves the
+    // device even after off/on clears the binding's transient error fields.
+    let head: Option<(String, Option<String>)> = c.query_row(
+        "SELECT state,last_error_code FROM sync_transactions WHERE binding_id=?1 AND state NOT IN('acked','aborted') ORDER BY rowid LIMIT 1",
+        [&b.binding_id], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let blocked_error = head.as_ref().and_then(|(state, code)| {
+        (state == "blocked").then(|| code.as_deref().unwrap_or("SYNC_TRANSACTION_BLOCKED"))
+    });
     let seq: i64 = c.query_row("SELECT control_seq FROM sync_meta", [], |r| r.get(0))?;
     let mut sources = Vec::new();
     let mut q=c.prepare("SELECT source,state,reason,(SELECT COUNT(*) FROM sync_contributions c WHERE c.binding_id=s.binding_id AND c.source=s.source AND c.presence='absent'),(SELECT COUNT(*) FROM sync_coverage_gaps g WHERE g.binding_id=s.binding_id AND g.source=s.source) FROM sync_scopes s WHERE binding_id=?1 ORDER BY source")?;
     for row in q.query_map([&b.binding_id],|r|Ok(json!({"source":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"error_code":r.get::<_,Option<String>>(2)?,"absent_count":r.get::<_,i64>(3)?,"gap_count":r.get::<_,i64>(4)?})))?{sources.push(row?);}
+    // A receipt from another source must not hide a retained export failure.
+    // Binding-wide authentication/restore/storage/backoff states retain priority.
+    let source_error = sources.iter().find_map(|s| s["error_code"].as_str());
+    let state = if !b.enabled {
+        "off"
+    } else if (blocked_error.is_some() || source_error.is_some())
+        && matches!(b.status.as_str(), "ready" | "sending")
+    {
+        "conflict"
+    } else {
+        &b.status
+    };
     Ok(
-        json!({"enabled":b.enabled,"state":if !b.enabled{"off"}else{&b.status},"account_id":b.account_id,"device_id":b.device_id,"sources":sources,"queue_count":queue,"last_ack_ms":ack.map(|n|n.to_string()),"error_code":err,"control_seq":seq.to_string()}),
+        json!({"enabled":b.enabled,"state":state,"account_id":b.account_id,"device_id":b.device_id,"sources":sources,"queue_count":queue,"last_ack_ms":ack.map(|n|n.to_string()),"error_code":err.as_deref().or(blocked_error).or(source_error),"control_seq":seq.to_string()}),
     )
 }
 pub fn version(c: &Connection) -> Result<i64> {
@@ -53,6 +74,9 @@ pub fn sources(c: &Connection) -> Result<Vec<String>> {
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+pub fn source_export_ready(c: &Connection, source: &str) -> Result<bool> {
+    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM sync_scopes s JOIN sync_bindings b USING(binding_id) WHERE b.is_current=1 AND s.source=?1 AND s.state='ready' AND s.reason IS NULL)",[source],|r|r.get(0))?)
 }
 pub fn error(code: &str) -> LedgerError {
     LedgerError::InvalidInput(code.to_string())
@@ -131,6 +155,14 @@ impl Ledger {
         self.conn.execute("DELETE FROM sync_source_exports", [])?;
         self.conn
             .execute("DELETE FROM sync_transactions WHERE state='staging'", [])?;
+        Ok(())
+    }
+    /// Export failures belong to their source and remain retryable. Do not stop
+    /// independent sources or overwrite the binding's authentication/restore guard.
+    pub fn sync_record_source_error(&mut self, source: &str, code: &str) -> Result<()> {
+        self.require_writer()?;
+        let b = binding(&self.conn)?.ok_or_else(|| error("SYNC_NOT_BOUND"))?;
+        self.conn.execute("INSERT INTO sync_scopes(binding_id,source,route,state,reason) VALUES(?1,?2,CASE WHEN EXISTS(SELECT 1 FROM source_roots WHERE report_source=?2 AND route='ledger') THEN 'ledger' ELSE 'live' END,'conflict',?3) ON CONFLICT(binding_id,source) DO UPDATE SET state='conflict',reason=excluded.reason",params![b.binding_id,source,code])?;
         Ok(())
     }
     pub fn sync_begin_export(&mut self, source: &str) -> Result<String> {
@@ -213,7 +245,7 @@ impl Ledger {
     pub fn sync_cancel_export(&mut self, export: &str, code: Option<&str>) -> Result<()> {
         self.require_writer()?;
         if let Some(code) = code {
-            self.conn.execute("UPDATE sync_scopes SET reason=?1 WHERE (binding_id,source) IN(SELECT binding_id,source FROM sync_source_exports WHERE export_id=?2)",params![code,export])?;
+            self.conn.execute("UPDATE sync_scopes SET state='conflict',reason=?1 WHERE (binding_id,source) IN(SELECT binding_id,source FROM sync_source_exports WHERE export_id=?2)",params![code,export])?;
         }
         self.conn.execute(
             "DELETE FROM sync_source_exports WHERE export_id=?1",

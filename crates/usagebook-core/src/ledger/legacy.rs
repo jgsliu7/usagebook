@@ -632,10 +632,11 @@ pub(crate) fn scrub_claude_pending(conn: &rusqlite::Connection) -> QueryResult<u
         let anchor_suppressed = policy.suppresses(conn, &entry)?;
         let adopted = reason == "original_baseline" || reason.starts_with("approved_successor/");
         let identity_match = controls.classify(&entry);
-        if !anchor_suppressed && identity_match != ClaudeDeletionMatch::None {
-            if adopted || identity_match == ClaudeDeletionMatch::Uncertain {
-                return Err(QueryError::new("PRIVACY_SCOPE_INCOMPLETE", "the selected native Claude identity overlaps retained compatibility evidence whose scope cannot be safely separated"));
-            }
+        if !anchor_suppressed
+            && identity_match != ClaudeDeletionMatch::None
+            && (adopted || identity_match == ClaudeDeletionMatch::Uncertain)
+        {
+            return Err(QueryError::new("PRIVACY_SCOPE_INCOMPLETE", "the selected native Claude identity overlaps retained compatibility evidence whose scope cannot be safely separated"));
         }
         if let Some(raw) = reason.strip_prefix("approved_successor/") {
             let raw_time: i64 = raw.parse().map_err(|_| {

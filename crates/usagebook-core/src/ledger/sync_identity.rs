@@ -22,6 +22,7 @@ pub fn new_secret() -> Vec<u8> {
 pub fn identity_key_tag(secret: &[u8]) -> String {
     hmac(secret, b"identity-key-tag-v1")
 }
+#[allow(clippy::too_many_arguments)]
 pub fn local_key(
     secret: &[u8],
     ledger: &str,
@@ -74,6 +75,7 @@ pub(crate) fn inherited_id(c: &Connection, binding: &str, local: &str) -> Result
     )
     .optional()?)
 }
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_lineage(
     c: &Connection,
     binding: &str,
@@ -204,6 +206,8 @@ pub fn available_bytes(path: &std::path::Path) -> Result<u64> {
             return Err(std::io::Error::last_os_error().into());
         }
         let stat = unsafe { stat.assume_init() };
+        // f_bavail/f_frsize 在 macOS 为 u32/u64、Linux 为 u64/u64,as 是跨平台统一写法
+        #[allow(clippy::unnecessary_cast)]
         Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
     }
     #[cfg(windows)]
