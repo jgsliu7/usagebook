@@ -330,13 +330,27 @@ impl Cloud {
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(CloudError {
                 code: "RESPONSE_TOO_LARGE".into(),
-                retry: None,
+                retry: (status.as_u16() == 429 || status.is_server_error())
+                    .then_some(retry.unwrap_or(2000)),
             });
         }
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| CloudError {
-            code: "INVALID_SERVER_RESPONSE".into(),
-            retry: None,
-        })?;
+        // Reverse proxies commonly return HTML or an empty body for temporary
+        // 502/503 failures. HTTP retry semantics must survive an unreadable error
+        // body; successful protocol responses still require valid JSON.
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) if !status.is_success() => json!({"error":{"code":
+                if status.as_u16() == 429 { "RATE_LIMITED" }
+                else if status.is_server_error() { "SERVER_ERROR" }
+                else { "INVALID_SERVER_RESPONSE" }
+            }}),
+            Err(_) => {
+                return Err(CloudError {
+                    code: "INVALID_SERVER_RESPONSE".into(),
+                    retry: None,
+                })
+            }
+        };
         if status.is_success() {
             return Ok(value);
         }
@@ -1278,6 +1292,48 @@ fn settle_pending(
     }
     Ok(())
 }
+/// Explicit reconciliation may finish ordinary immutable work, but must not
+/// silently turn it into a permanent cancellation. Failures retain the queue so
+/// the normal host or a repeated repair can resume the same transaction ID.
+fn resume_pending(ledger: &mut Ledger, cloud: &Cloud) -> Outcome<()> {
+    let pending = {
+        let mut q = ledger.connection().prepare(
+            "SELECT transaction_id,manifest_json,retry_count FROM sync_transactions t JOIN sync_bindings b USING(binding_id) WHERE b.is_current=1 AND t.state NOT IN('acked','aborted') ORDER BY t.rowid",
+        ).map_err(|_| "STORAGE_ERROR")?;
+        let rows = q
+            .query_map([], |r| {
+                Ok(state::Upload {
+                    transaction_id: r.get(0)?,
+                    manifest: r.get(1)?,
+                    retry_count: r.get(2)?,
+                })
+            })
+            .map_err(|_| "STORAGE_ERROR")?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "STORAGE_ERROR")?;
+        rows
+    };
+    for upload in pending {
+        let mut result = upload_transaction(cloud, ledger.path(), &upload).map_err(|e| e.code)?;
+        let until = Instant::now() + Duration::from_secs(30);
+        while result["state"] == "committing" {
+            if Instant::now() >= until {
+                return Err("SYNC_COMMIT_PENDING：队列已保留，稍后重试原修复命令".into());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            result = cloud
+                .get(&format!("/sync/transactions/{}", upload.transaction_id))
+                .map_err(|e| e.code)?;
+        }
+        if result["state"] != "committed" {
+            return Err("SYNC_UNRESOLVED_TRANSACTION：队列已保留".into());
+        }
+        ledger
+            .sync_apply_receipt(&upload.transaction_id, &result["receipt"])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
 fn repair(
     source: Option<String>,
     continue_from_now: bool,
@@ -1297,10 +1353,11 @@ fn repair(
         Arc::new(AtomicBool::new(false)),
     )?;
     let mut server = cloud.get("/sync/state").map_err(|e| e.code)?;
-    if b.restore_epoch
+    let epoch_changed = b
+        .restore_epoch
         .as_deref()
-        .is_some_and(|epoch| Some(epoch) != server["restore_epoch"].as_str())
-    {
+        .is_some_and(|epoch| Some(epoch) != server["restore_epoch"].as_str());
+    if epoch_changed {
         ledger
             .sync_record_error("restore_required", "RESTORE_EPOCH_CHANGED")
             .map_err(|e| e.to_string())?;
@@ -1338,7 +1395,16 @@ fn repair(
             yes,
             "应用同 ID 同内容的安全确认、补交云端缺失的已确认数据？冲突历史保留原值。",
         )?;
-        settle_pending(&mut ledger, &cloud, None, true)?;
+        if epoch_changed {
+            // A restored server can have lost pending commits. Only settle
+            // receipts it still proves; retain every unresolved original body
+            // rather than canceling it or replaying across an unverified epoch.
+            settle_pending(&mut ledger, &cloud, None, false).map_err(|e| {
+                format!("{e}：服务端已恢复，未确认队列保留，未应用对账；需要核对原事务后再继续")
+            })?;
+        } else {
+            resume_pending(&mut ledger, &cloud)?;
+        }
     }
     ledger.connection().execute_batch("CREATE TEMP TABLE sync_inventory(id TEXT PRIMARY KEY,revision TEXT NOT NULL,payload_hash TEXT NOT NULL,active INTEGER NOT NULL) WITHOUT ROWID;").map_err(|_|"STORAGE_ERROR")?;
     let mut stable = false;

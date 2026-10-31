@@ -303,6 +303,10 @@ impl Ledger {
         let mut batch = Vec::new();
         let mut parts = 0usize;
         let mut count = 0;
+        // The first independently committed batch must carry the complete,
+        // already validated source baseline. Otherwise a crash between batches
+        // leaves uploadable history without the missing+new identity guard.
+        let mut baseline_sealed = route != "live";
         while let Some(row) = cursor.next()? {
             let id: String = row.get(0)?;
             let n: i64 = self.conn.query_row(
@@ -311,7 +315,9 @@ impl Ledger {
                 |r| r.get(0),
             )?;
             if !batch.is_empty() && (parts + n as usize > 100000 || batch.len() >= 512) {
-                count += seal_batch(&self.conn, &b, &source, version, &batch)?;
+                count +=
+                    seal_export_batch(&self.conn, &b, &source, version, &batch, !baseline_sealed)?;
+                baseline_sealed = true;
                 batch.clear();
                 parts = 0;
             }
@@ -319,7 +325,7 @@ impl Ledger {
             parts += n as usize;
         }
         if !batch.is_empty() {
-            count += seal_batch(&self.conn, &b, &source, version, &batch)?;
+            count += seal_export_batch(&self.conn, &b, &source, version, &batch, !baseline_sealed)?;
         }
         drop(cursor);
         drop(ids);
@@ -430,6 +436,38 @@ impl Ledger {
         tx.execute("INSERT INTO sync_coverage_gaps VALUES(?1,?2,?3,NULL,?4,'explicit_continue_from_now',?5)",params![new_epoch(),b.binding_id,source,cutoff,now_ms()])?;
         tx.commit()?;
         Ok(())
+    }
+}
+/// Commit the full live identity guard together with the first sendable batch.
+/// Later batches remain independent so a large export need not retain all of
+/// its transport bytes in one write transaction. The final export transaction
+/// still accepts baselines for snapshots that do not produce any upload.
+fn seal_export_batch(
+    c: &Connection,
+    b: &Binding,
+    source: &str,
+    version: i64,
+    ids: &[String],
+    preserve_live_baseline: bool,
+) -> Result<usize> {
+    if !preserve_live_baseline {
+        return seal_batch(c, b, source, version, ids);
+    }
+    c.execute_batch("SAVEPOINT sync_export_baseline;")?;
+    let result = (|| {
+        c.execute("INSERT OR IGNORE INTO sync_live_baseline SELECT ?1,?2,local_key,payload_hash,id FROM sync_export_facts WHERE payload_hash IS NOT NULL",params![b.binding_id,source])?;
+        seal_batch(c, b, source, version, ids)
+    })();
+    match result {
+        Ok(count) => {
+            c.execute_batch("RELEASE sync_export_baseline;")?;
+            Ok(count)
+        }
+        Err(error) => {
+            let _ =
+                c.execute_batch("ROLLBACK TO sync_export_baseline; RELEASE sync_export_baseline;");
+            Err(error)
+        }
     }
 }
 struct ChunkSink<'a> {
