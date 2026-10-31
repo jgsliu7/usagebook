@@ -1090,3 +1090,20 @@ setDailyViewUi();
 applyArf();
 setInterval(()=>{if(!DATA?.ready||document.hidden)return;if(renderedDay!==localDayStr())render();else renderStatus();},1000);
 load();
+
+// Local sync controls never fetch cloud totals into the single-device dashboard.
+(() => {
+  const button=document.getElementById('cloud-sync-control');if(!button)return;
+  let current=null,busy=false;
+  const render=()=>{const labels={unbound:['未绑定','Unbound'],off:['已关闭','Off'],ready:['已开启','On'],sending:['同步中','Syncing'],backoff:['重试中','Retrying'],reauth:['需登录','Sign in'],conflict:['待处理','Needs attention'],restore_required:['需核对','Reconcile'],storage_error:['保存失败','Storage error']};const label=labels[current?.state]||['不可用','Unavailable'];button.textContent=words('云同步 · ','Cloud sync · ')+words(...label);button.disabled=busy;button.title=current?.state==='unbound'?words('先在终端运行 usagebook sync login，或在云端设备页生成绑定码后运行 usagebook sync login --pair-code。','Run usagebook sync login in the terminal, or generate a pairing code in the cloud device page and use usagebook sync login --pair-code.'):current?.error_code||words('仅同步来源、模型、时间和用量；云端历史长期保留，成本和对话内容不上传。','Only sources, models, times and usage are synchronized. Cloud history is retained; costs and conversation content are excluded.');};
+  const refresh=async()=>{try{const r=await fetch('/api/local/sync/status',{cache:'no-store'});if(!r.ok)throw Error();current=await r.json();}catch{current=null;}render();};
+  button.addEventListener('click',async()=>{
+    if(busy)return;
+    if(!current||current.state==='unbound'){window.open('https://app.usagebook.com/devices','_blank','noopener,noreferrer');return;}
+    const action=current.enabled?'off':'on';
+    if(action==='on'&&!window.confirm(words('开启后上传来源、模型、时间和用量，云端长期保存。确认开启？','Enable synchronization of sources, models, times and usage for long-term cloud storage?')))return;
+    busy=true;render();
+    try{const r=await fetch('/api/local/sync/control',{method:'POST',headers:{'Content-Type':'application/json','X-Usagebook-Local':'1'},body:JSON.stringify({action,instance_id:current.instance_id})});const v=await r.json();if(!r.ok)throw Error(v.error?.code||'SYNC_CONTROL_FAILED');current=v;}catch(e){button.title=String(e.message);}
+    finally{busy=false;await refresh();}
+  });window.renderCloudSync=render;refresh();setInterval(refresh,10000);
+})();

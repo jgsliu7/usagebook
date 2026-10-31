@@ -984,3 +984,76 @@ pub(crate) fn status(c: &Connection) -> Result<Value> {
         json!({"version":1,"state":if remaining==0{"complete"}else if remaining==skipped{"waiting_evidence"}else{"pending"},"repaired":repaired,"remaining":remaining,"skipped":skipped,"reasons":reasons,"has_more":remaining>skipped}),
     )
 }
+
+/// Validate repaired time evidence without allocating all members for upload.
+pub(crate) fn validate_stream(c: &Connection, parent_id: i64) -> Result<Option<&'static str>> {
+    use sha2::{Digest, Sha256};
+    let header:Option<(i64,String,i64,String,String,String,String)>=c.query_row("SELECT version,provenance,member_count,parent_hash,policy_hash,evidence_json,manifest_hash FROM durable_time_revisions WHERE parent_observation_id=?1",[parent_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+    let Some((version, provenance, count, parent_hash, policy_hash, evidence, expected)) = header
+    else {
+        return Ok(None);
+    };
+    if version != 1
+        || provenance != PROVENANCE
+        || !(1..=time_allocation::MAX_MEMBERS as i64).contains(&count)
+        || evidence.len() > 262144
+    {
+        return Err(LedgerError::CorruptLedger);
+    }
+    let p = time_allocation::parent(c, parent_id)?;
+    if parent_hash != hash_bytes(&p.normalized_hash)
+        || policy_hash != time_allocation::digest(&policy(c, parent_id)?)?
+    {
+        return Err(LedgerError::CorruptLedger);
+    }
+    let evidence: Value =
+        serde_json::from_str(&evidence).map_err(|_| LedgerError::CorruptLedger)?;
+    let mut validator = time_allocation::MemberValidator::new(&p)?;
+    let mut digest = Sha256::new();
+    let mut prefix = serde_json::to_vec(&(
+        "time-revision-v1",
+        PROVENANCE,
+        &parent_hash,
+        &policy_hash,
+        &evidence,
+    ))
+    .map_err(|_| LedgerError::CorruptLedger)?;
+    prefix.pop();
+    digest.update(prefix);
+    digest.update(b",[");
+    let mut q=c.prepare("SELECT member_key,content_hash,occurred_ms,metrics_json,cost_units,cost_scale FROM durable_time_revision_members WHERE parent_observation_id=?1 ORDER BY member_key")?;
+    let mut rows = q.query([parent_id])?;
+    let mut first = true;
+    while let Some(r) = rows.next()? {
+        let encoded: String = r.get(3)?;
+        let content_hash: String = r.get(1)?;
+        if encoded.len() > 512
+            || content_hash.len() != 64
+            || !content_hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(LedgerError::CorruptLedger);
+        }
+        let member = RevisionMember {
+            member: TimeMember {
+                member_key: r.get(0)?,
+                occurred_ms: r.get(2)?,
+                metrics: serde_json::from_str(&encoded).map_err(|_| LedgerError::CorruptLedger)?,
+                cost_units: r.get(4)?,
+                cost_scale: r.get(5)?,
+            },
+            content_hash,
+        };
+        validator.add(&member.member)?;
+        if !first {
+            digest.update(b",");
+        }
+        first = false;
+        digest.update(serde_json::to_vec(&member).map_err(|_| LedgerError::CorruptLedger)?);
+    }
+    digest.update(b"]]");
+    validator.finish(&p, count)?;
+    if format!("{:x}", digest.finalize()) != expected {
+        return Err(LedgerError::CorruptLedger);
+    }
+    Ok(Some("durable_time_revision_members"))
+}

@@ -225,3 +225,116 @@ pub(crate) fn validate_restore(current: &Connection, staging: &Connection) -> Re
     }
     Ok(())
 }
+
+/// Constant-memory validation for cloud export. The dashboard loader remains
+/// unchanged; both paths validate the same immutable manifest and raw totals.
+pub(crate) struct MemberValidator {
+    start: i64,
+    end: i64,
+    previous: Option<String>,
+    sum: Metrics,
+    cost: Option<(i64, i64)>,
+    count: usize,
+}
+impl MemberValidator {
+    pub(crate) fn new(p: &Observation) -> Result<Self> {
+        Ok(Self {
+            start: p.day_start_ms.ok_or(LedgerError::CorruptLedger)?,
+            end: p.day_end_ms.ok_or(LedgerError::CorruptLedger)?,
+            previous: None,
+            sum: [Some(0); 10],
+            cost: None,
+            count: 0,
+        })
+    }
+    pub(crate) fn add(&mut self, m: &TimeMember) -> Result<()> {
+        if m.member_key.len() != 64
+            || !m.member_key.bytes().all(|b| b.is_ascii_hexdigit())
+            || self.previous.as_ref().is_some_and(|k| k >= &m.member_key)
+            || m.occurred_ms < self.start
+            || m.occurred_ms >= self.end
+            || m.cost_units.is_some() != m.cost_scale.is_some()
+        {
+            return Err(LedgerError::CorruptLedger);
+        }
+        metrics::evaluate(&m.metrics)?;
+        for (a, b) in self.sum.iter_mut().zip(m.metrics) {
+            *a = match (*a, b) {
+                (Some(a), Some(b)) => Some(a.checked_add(b).ok_or(LedgerError::NumericOverflow)?),
+                _ => None,
+            };
+        }
+        self.cost = add_cost(self.cost, m.cost_units.zip(m.cost_scale))?;
+        self.previous = Some(m.member_key.clone());
+        self.count += 1;
+        Ok(())
+    }
+    pub(crate) fn finish(&self, p: &Observation, count: i64) -> Result<()> {
+        let cost = if p.cost_state == "known" && p.cost_currency.as_deref() == Some("USD") {
+            add_cost(None, p.cost_units.zip(p.cost_scale))?
+        } else if p.cost_state == "unknown" {
+            None
+        } else {
+            return Err(LedgerError::CorruptLedger);
+        };
+        if self.count == 0
+            || self.count > MAX_MEMBERS
+            || self.count as i64 != count
+            || self.sum != p.metrics
+            || self.cost != cost
+        {
+            return Err(LedgerError::CorruptLedger);
+        }
+        Ok(())
+    }
+}
+pub(crate) fn validate_stream(c: &Connection, parent_id: i64) -> Result<Option<&'static str>> {
+    let header:Option<(i64,String,i64,i64,String)>=c.query_row("SELECT version,provenance,complete,member_count,manifest_hash FROM durable_time_allocations WHERE parent_observation_id=?1",[parent_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+    let Some((version, provenance, complete, count, expected)) = header else {
+        return super::time_repair::validate_stream(c, parent_id);
+    };
+    if version != 1
+        || provenance != PROVENANCE
+        || complete != 1
+        || !(1..=MAX_MEMBERS as i64).contains(&count)
+    {
+        return Err(LedgerError::CorruptLedger);
+    }
+    let p = parent(c, parent_id)?;
+    let mut validator = MemberValidator::new(&p)?;
+    let mut digest = Sha256::new();
+    let mut prefix =
+        serde_json::to_vec(&("adopted-time-allocation-v1", PROVENANCE, &p.normalized_hash))
+            .map_err(|_| LedgerError::CorruptLedger)?;
+    prefix.pop();
+    digest.update(prefix);
+    digest.update(b",[");
+    let mut q=c.prepare("SELECT member_key,occurred_ms,metrics_json,cost_units,cost_scale FROM durable_time_members WHERE parent_observation_id=?1 ORDER BY member_key")?;
+    let mut rows = q.query([parent_id])?;
+    let mut first = true;
+    while let Some(r) = rows.next()? {
+        let encoded: String = r.get(2)?;
+        if encoded.len() > 512 {
+            return Err(LedgerError::CorruptLedger);
+        }
+        let member = TimeMember {
+            member_key: r.get(0)?,
+            occurred_ms: r.get(1)?,
+            metrics: serde_json::from_str(&encoded).map_err(|_| LedgerError::CorruptLedger)?,
+            cost_units: r.get(3)?,
+            cost_scale: r.get(4)?,
+        };
+        validator.add(&member)?;
+        if !first {
+            digest.update(b",");
+        }
+        first = false;
+        digest.update(serde_json::to_vec(&member).map_err(|_| LedgerError::CorruptLedger)?);
+    }
+    digest.update(b"]]");
+    validator.finish(&p, count)?;
+    if format!("{:x}", digest.finalize()) != expected {
+        return Err(LedgerError::CorruptLedger);
+    }
+    Ok(Some("durable_time_members"))
+}

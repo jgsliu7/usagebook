@@ -234,6 +234,8 @@
         <button data-v="0" data-i18n="arf.off">关</button>
       </span>
     </span>
+    <button id="cloud-sync-control" class="hbtn" data-i18n="cloud.sync">云同步</button>
+    <a class="hbtn" href="https://app.usagebook.com/personal" target="_blank" rel="noopener noreferrer" data-i18n="cloud.dashboard" data-i18n-title="cloud.dashboardTitle">云端看板 ↗</a>
     <button id="btn-refresh" data-i18n="btn.refresh">↻ 立即刷新</button>
     <button id="clear-model-filter" class="hbtn" hidden></button>
     </div>
@@ -443,6 +445,7 @@ function setLang(lang) {
   lsSet(LANG_LS_KEY, lang);
   if (lsGet(UNIT_LS_KEY) === null) { state.unit = langDefaultUnit(lang); setUnitUi(); }
   applyStaticI18n();
+  window.renderCloudSync?.();
   /* 未就绪期切语言:静态替换会把 #scanning-txt 覆写回加载文案,按当前态重设
      (失败/重试文案的语义不能丢) */
   if (!DATA || !DATA.ready) setScanningText(

@@ -1234,6 +1234,15 @@ pub(crate) fn rebuild_unit(
     if !event_diff && !alias_diff {
         return Ok(false);
     }
+    if alias_diff {
+        // A read snapshot may stream ordinary new publications concurrently.
+        // Changing an established alias while its source export is reserved
+        // must wait until that export has sealed its identity mapping.
+        let pinned_alias:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sync_source_exports x JOIN source_roots r ON r.report_source=x.source WHERE r.identity_family=?1 AND r.namespace_key=?2) AND EXISTS(SELECT 1 FROM identity_alias old JOIN ledger_unit_alias next ON next.alias_key=old.alias_key WHERE old.identity_family=?1 AND old.namespace_key=?2 AND old.canonical_key<>next.canonical_key)",params![family,namespace],|r|r.get(0))?;
+        if pinned_alias {
+            return Err(LedgerError::Busy);
+        }
+    }
     let seq: i64 = c.query_row(
         "SELECT commit_seq FROM ledger_meta WHERE singleton=1",
         [],

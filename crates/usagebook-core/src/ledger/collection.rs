@@ -726,6 +726,17 @@ impl Ledger {
                 results.push(result);
                 continue;
             }
+            if super::sync_identity::guard_change(&tx, source)? {
+                result.state = "blocked".into();
+                result.reason = Some("SYNC_ROUTE_BRIDGE_REQUIRED".into());
+                put_runtime_value(
+                    &tx,
+                    &format!("reconciliation/{source}"),
+                    &serde_json::to_value(&result).map_err(|_| LedgerError::CorruptLedger)?,
+                )?;
+                results.push(result);
+                continue;
+            }
             result.reason = activation_blocker(&tx, source)?;
             let live_ready = snapshot.sources.get(*source).is_some_and(|status| {
                 status.last_scanned_ms.is_some()

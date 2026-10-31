@@ -70,6 +70,16 @@ pub fn replace(conn: &Connection, snapshot: &LegacySnapshot) -> QueryResult<()> 
     )?;
     let unchanged:bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM query_live_state WHERE singleton=1 AND ledger_uuid=?1 AND epoch=?2 AND generation=?3)", params![uuid,epoch,snapshot.generation], |r|r.get(0))?;
     if !unchanged {
+        if conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='sync_projection_clock')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            conn.execute(
+                "UPDATE sync_projection_clock SET version=version+1 WHERE singleton=1",
+                [],
+            )?;
+        }
         conn.execute("DELETE FROM query_live_facts", [])?;
         let routes = {
             let mut query = conn

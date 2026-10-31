@@ -171,6 +171,8 @@ struct ServerContext<'a> {
     port: u16,
     durable_at_start: bool,
     ledger_path: &'a std::path::Path,
+    sync: Option<&'a crate::sync::HostHandle>,
+    sync_only: bool,
 }
 fn response(req: Request, body: String, ctype: &str, code: u16) {
     let resp=Response::from_string(body).with_status_code(code).with_header(Header::from_bytes("Content-Type",ctype).unwrap()).with_header(Header::from_bytes("Cache-Control","no-store").unwrap()).with_header(Header::from_bytes("X-Content-Type-Options","nosniff").unwrap()).with_header(Header::from_bytes("Content-Security-Policy","default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'").unwrap());
@@ -194,7 +196,20 @@ pub fn run(
     open: bool,
     temporary: bool,
 ) {
-    if port == 0 || !(5..=86400).contains(&refresh_secs) {
+    run_inner(port, refresh_secs, collection_mode, open, temporary, false)
+}
+pub fn run_sync_host() {
+    run_inner(0, 60, CollectionMode::Continuous, false, false, true)
+}
+fn run_inner(
+    port: u16,
+    refresh_secs: u64,
+    collection_mode: CollectionMode,
+    open: bool,
+    temporary: bool,
+    sync_only: bool,
+) {
+    if (port == 0 && !sync_only) || !(5..=86400).contains(&refresh_secs) {
         crate::ledger_cli::fail(
             "port must be positive; refresh interval must be 5..=86400 seconds",
             2,
@@ -202,10 +217,11 @@ pub fn run(
     }
     let server =
         TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| crate::ledger_cli::fail(e, 3));
+    let port = server.local_addr().unwrap().port();
     usagebook_core::store::prune_bad_backups();
     let _ = usagebook_core::logging::global().activate("serve");
     let path = db::default_path();
-    let writer = if temporary {
+    let mut writer = if temporary {
         None
     } else if db::exists_or_recoverable(&path) {
         Some(
@@ -223,6 +239,17 @@ pub fn run(
             Ledger::init(&path, &timezone)
                 .unwrap_or_else(|e| crate::ledger_cli::fail(&e, e.exit_code())),
         )
+    };
+    let (sync_runtime, sync_handle) = if let Some(writer) = writer.as_mut() {
+        match crate::sync::Runtime::new(writer, port) {
+            Ok((runtime, handle)) => (Some(runtime), Some(handle)),
+            Err(code) => {
+                tracing::warn!(code=%code,"cloud sync host unavailable");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
     };
     // Freeze this once for both the writer and query workers. An init during
     // startup must not connect readers to a different database from the writer.
@@ -291,6 +318,7 @@ pub fn run(
         let shared = shared.clone();
         std::thread::spawn(move || {
             let mut writer = writer;
+            let mut sync_runtime = sync_runtime;
             let mut history = usagebook_core::ledger::collection::Collector::default();
             let mut history_backlog = writer.is_some();
             let mut first = true;
@@ -304,6 +332,9 @@ pub fn run(
             let mut last_time_repair = None::<Instant>;
             let mut time_repair_interval = Duration::from_secs(1);
             loop {
+                if let (Some(runtime), Some(ledger)) = (sync_runtime.as_mut(), writer.as_mut()) {
+                    runtime.tick(ledger);
+                }
                 // Install/retry optional indexes only between writer batches.
                 // Fatal cleanup errors stop and drop this connection entirely;
                 // independent readers can still serve committed history.
@@ -682,6 +713,7 @@ pub fn run(
         let path = path.clone();
         let stamp = stamp.clone();
         let catalog_cache = catalog_cache.clone();
+        let sync_handle = sync_handle.clone();
         std::thread::spawn(move || {
             let ledger = if durable_at_start {
                 Some(
@@ -718,6 +750,8 @@ pub fn run(
                         port,
                         durable_at_start,
                         ledger_path: &path,
+                        sync: sync_handle.as_ref(),
+                        sync_only,
                     };
                     handle(req, conn, &context);
                 }
@@ -738,7 +772,11 @@ pub fn run(
                 Err(_) => break,
             };
             if let Some(request) = Request::receive(connection) {
-                if let Some(request) = static_request(request, &assets, port) {
+                if let Some(request) = if sync_only {
+                    Some(request)
+                } else {
+                    static_request(request, &assets, port)
+                } {
                     match queries.try_send(request) {
                         Ok(()) => {}
                         Err(mpsc::TrySendError::Full(request)) => error(request, 429, "BUSY"),
@@ -842,11 +880,67 @@ fn handle(mut req: Request, conn: &rusqlite::Connection, ctx: &ServerContext) {
         port,
         durable_at_start,
         ledger_path,
+        sync,
+        sync_only,
     } = *ctx;
     if !crate::serve::local_request(req.headers(), port) {
         return error(req, 403, "FORBIDDEN");
     }
     let path = req.url().split('?').next().unwrap_or("/").to_owned();
+    if path == "/api/local/sync/status" && req.method() == &Method::Get {
+        let Some(host) = sync else {
+            return error(req, 409, "SYNC_REQUIRES_PERSISTENT_LEDGER");
+        };
+        return match usagebook_core::ledger::sync_state::status(conn) {
+            Ok(status) => response(
+                req,
+                host.annotate(status).to_string(),
+                "application/json",
+                200,
+            ),
+            Err(_) => error(req, 503, "STORAGE_ERROR"),
+        };
+    }
+    if path == "/api/local/sync/control" && req.method() == &Method::Post {
+        let Some(host) = sync else {
+            return error(req, 409, "SYNC_REQUIRES_PERSISTENT_LEDGER");
+        };
+        if !req
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("X-Usagebook-Local") && h.value.as_str() == "1")
+            || !req.headers().iter().any(|h| {
+                h.field.equiv("Content-Type")
+                    && h.value.as_str().split(';').next() == Some("application/json")
+            })
+        {
+            return error(req, 403, "FORBIDDEN");
+        }
+        if req.body_length().is_some_and(|n| n > 1024) {
+            return error(req, 413, "BODY_TOO_LARGE");
+        }
+        let bytes = match req.read_body() {
+            Ok(b) if b.len() <= 1024 => b,
+            _ => return error(req, 400, "INVALID_CONTROL"),
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return error(req, 400, "INVALID_CONTROL"),
+        };
+        if value.as_object().is_none_or(|o| o.len() != 2) {
+            return error(req, 400, "INVALID_CONTROL");
+        }
+        return match host.control(
+            value["action"].as_str().unwrap_or(""),
+            value["instance_id"].as_str().unwrap_or(""),
+        ) {
+            Ok(v) => response(req, v.to_string(), "application/json", 200),
+            Err(e) => error(req, 503, &e),
+        };
+    }
+    if sync_only {
+        return error(req, 404, "NOT_FOUND");
+    }
     if path == "/api/v2/refresh" && req.method() == &Method::Post {
         let mut state = shared.lock().unwrap();
         if state.writer_stopped {

@@ -354,7 +354,7 @@ fn check_backup_snapshot(c: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if schema == 8 {
+    if schema == 9 {
         check_conn(c)
     } else {
         check_integrity(c)
@@ -1139,6 +1139,7 @@ impl Maintenance {
             c.execute_batch(
                 "BEGIN IMMEDIATE; CREATE TEMP TABLE delete_ids(id INTEGER PRIMARY KEY);",
             )?;
+            c.execute("UPDATE sync_bindings SET enabled=0,status='restore_required',last_error_code='LEDGER_RESTORED'", [])?;
             remember_restore_controls(&current, &c)?;
             let saved_capture = super::legacy::LegacySnapshot::restore_capture(&c)
                 .map_err(|_| LedgerError::CorruptLedger)?;

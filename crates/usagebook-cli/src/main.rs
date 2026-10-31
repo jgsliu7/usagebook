@@ -12,9 +12,15 @@ mod ledger_cli;
 mod ledger_http;
 mod logging_setup;
 mod serve;
+mod sync;
 
 #[derive(Subcommand)]
 enum Command {
+    /// 多机云端统计同步（默认关闭）
+    Sync {
+        #[command(subcommand)]
+        command: sync::SyncCommand,
+    },
     #[command(name = "__ledger-reader", hide = true)]
     LedgerReader,
     /// 持久账本管理（初始化、刷新、备份、删除和恢复）
@@ -157,6 +163,7 @@ fn main() {
     }
     logging_setup::init(args.verbose);
     match args.command {
+        Some(Command::Sync { command }) => sync::run(command, args.json),
         Some(Command::LedgerReader) => {
             if let Err(e) = usagebook_core::ledger::ingest::reader_helper_main() {
                 ledger_cli::fail(&e, e.exit_code())
