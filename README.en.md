@@ -159,7 +159,7 @@ Troubleshooting: attach that directory when reporting issues (redact first — p
 
 The local dashboard always shows this machine only; an optional cloud service aggregates multiple devices on a separate page. Sync is **off by default**; automatic usage uploads require login and enabling sync. Explicit `sync login`, `sync logout`, and `sync repair` commands may make authentication or management requests even while sync is off; confirming `sync repair --reconcile --apply` may also retransmit data. A working cloud deployment is required. The cloud keeps received history for statistics and does not restore your local ledger.
 
-Synced fields: sources, model categories, actual timestamps with timezone/local date, usage metrics (with quality flags), and device-local contribution ids/versions. Costs, file paths, native request/session ids, and conversation content are never uploaded.
+Synced fields: sources, model names (unsafe names fall back to unknown), actual timestamps with timezone/local date, usage metrics (with quality flags), and device-local contribution ids/versions. Costs, file paths, native request/session ids, and conversation content are never uploaded.
 
 ```bash
 usagebook sync login             # GitHub Device Flow (default)

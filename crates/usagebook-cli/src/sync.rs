@@ -1595,7 +1595,11 @@ fn repair(
             };
             let mut result =
                 upload_transaction(&cloud, ledger.path(), &upload).map_err(|e| e.code)?;
+            let until = Instant::now() + Duration::from_secs(30);
             while result["state"] == "committing" {
+                if Instant::now() >= until {
+                    return Err("SYNC_COMMIT_PENDING：队列已保留，稍后重试原修复命令".into());
+                }
                 std::thread::sleep(Duration::from_secs(1));
                 result = cloud
                     .get(&format!("/sync/transactions/{txid}"))
@@ -1643,7 +1647,11 @@ fn repair(
             };
             let mut result =
                 upload_transaction(&cloud, ledger.path(), &upload).map_err(|e| e.code)?;
+            let until = Instant::now() + Duration::from_secs(30);
             while result["state"] == "committing" {
+                if Instant::now() >= until {
+                    return Err("SYNC_COMMIT_PENDING：队列已保留，稍后重试原修复命令".into());
+                }
                 std::thread::sleep(Duration::from_secs(1));
                 result = cloud
                     .get(&format!("/sync/transactions/{txid}"))
