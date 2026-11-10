@@ -4,7 +4,7 @@
 use super::{
     claude, collection, db, ingest,
     legacy::{LegacyEntry, LegacySnapshot},
-    metrics, resolve,
+    metrics, resolve, sync_transition,
     time_allocation::{self, TimeMember},
     types::*,
     Ledger,
@@ -35,6 +35,8 @@ struct Bucket {
     cost_scale: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     members: Vec<TimeMember>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sync_proofs: BTreeMap<String, sync_transition::InputProof>,
 }
 #[derive(Serialize)]
 struct NativeEvidenceBucket {
@@ -57,6 +59,7 @@ impl Bucket {
             cost_units: self.cost_units,
             cost_scale: self.cost_scale,
             members: Vec::new(),
+            sync_proofs: BTreeMap::new(),
         }
     }
     fn new(date: String, model: String, start_ms: i64, end_ms: i64) -> Self {
@@ -71,6 +74,7 @@ impl Bucket {
             cost_units: None,
             cost_scale: None,
             members: Vec::new(),
+            sync_proofs: BTreeMap::new(),
         }
     }
     fn add(&mut self, fields: &Metrics, cost: Option<(i64, i64)>) -> Result<()> {
@@ -183,11 +187,15 @@ struct FrozenPreview {
 struct PreviewMember {
     bucket: usize,
     member: TimeMember,
+    #[serde(default)]
+    sync_proof: Option<sync_transition::InputProof>,
 }
 #[derive(Serialize)]
 struct PreviewMemberRef<'a> {
     bucket: usize,
     member: &'a TimeMember,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_proof: Option<&'a sync_transition::InputProof>,
 }
 fn preview_key(source: &str, token: &str) -> Result<String> {
     if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -214,12 +222,11 @@ fn save_preview(c: &Connection, preview: &FrozenPreview) -> Result<()> {
     let buckets: Vec<_> = preview.buckets.iter().map(Bucket::summary).collect();
     let mut members = Vec::new();
     for (bucket, value) in preview.buckets.iter().enumerate() {
-        members.extend(
-            value
-                .members
-                .iter()
-                .map(|member| PreviewMemberRef { bucket, member }),
-        );
+        members.extend(value.members.iter().map(|member| PreviewMemberRef {
+            bucket,
+            member,
+            sync_proof: value.sync_proofs.get(&member.member_key),
+        }));
     }
     if members.is_empty() || members.len() > MAX_ROWS {
         return Err(LedgerError::RecordTooLarge);
@@ -283,11 +290,15 @@ fn load_preview(c: &Connection, source: &str, token: &str) -> Result<FrozenPrevi
             return Err(LedgerError::CorruptLedger);
         }
         for value in chunk {
-            buckets
+            let bucket = buckets
                 .get_mut(value.bucket)
-                .ok_or(LedgerError::CorruptLedger)?
-                .members
-                .push(value.member);
+                .ok_or(LedgerError::CorruptLedger)?;
+            if let Some(proof) = value.sync_proof {
+                bucket
+                    .sync_proofs
+                    .insert(value.member.member_key.clone(), proof);
+            }
+            bucket.members.push(value.member);
             loaded += 1;
             if loaded > count {
                 return Err(LedgerError::CorruptLedger);
@@ -608,6 +619,8 @@ fn adopt(
     let mut buckets = BTreeMap::<(String, String), Bucket>::new();
     let mut live_rows = 0usize;
     let mut member_occurrences = BTreeMap::<String, usize>::new();
+    let mut identity_payloads = BTreeMap::<String, String>::new();
+    let mut ambiguous_identities = BTreeSet::<String>::new();
     if let Some(preview) = frozen {
         for bucket in &preview.buckets {
             buckets.insert((bucket.date.clone(), bucket.model.clone()), bucket.clone());
@@ -620,7 +633,13 @@ fn adopt(
             .filter(|e| e.report_source() == source)
         {
             within_budget(started)?;
-            let LegacyEntry::Request { record, .. } = entry else {
+            let LegacyEntry::Request {
+                record,
+                namespace: live_namespace,
+                known_fields,
+                ..
+            } = entry
+            else {
                 return Err(invalid(
                 "legacy interval adoption requires request-delta history with trustworthy times",
             ));
@@ -667,7 +686,7 @@ fn adopt(
             let member = TimeMember {
                 member_key: time_allocation::digest(&(
                     "legacy-time-member-v1",
-                    source_record,
+                    &source_record,
                     *occurrence,
                 ))?,
                 occurred_ms: record.ts_ms,
@@ -686,12 +705,53 @@ fn adopt(
                         end.min(cutoff),
                     )
                 });
+            // Keep explicit member identity evidence with the frozen preview.
+            // Raw keys never enter this record or the network. Equal amounts
+            // alone cannot establish that a live contribution became a member.
+            if !record.dedup_key.is_empty() {
+                let semantic_hash = digest(&(
+                    record.ts_ms,
+                    &bucket.model,
+                    &fields,
+                    known_fields,
+                    live_namespace,
+                ))?;
+                if identity_payloads
+                    .get(&source_record)
+                    .is_some_and(|old| old != &semantic_hash)
+                {
+                    ambiguous_identities.insert(source_record.clone());
+                }
+                identity_payloads
+                    .entry(source_record.clone())
+                    .or_insert_with(|| semantic_hash.clone());
+                bucket.sync_proofs.insert(
+                    member.member_key.clone(),
+                    sync_transition::InputProof {
+                        identity_hash: sync_transition::input_identity(
+                            record.source,
+                            live_namespace.as_deref().unwrap_or(""),
+                            &record.dedup_key,
+                            *occurrence - 1,
+                        )?,
+                        source_record_hash: source_record,
+                        semantic_hash,
+                    },
+                );
+            }
             bucket.add(&fields, cost)?;
             bucket.members.push(member);
             live_rows += 1;
             if live_rows > MAX_ROWS || buckets.len() > MAX_BUCKETS {
                 return Err(LedgerError::RecordTooLarge);
             }
+        }
+    }
+    if frozen.is_none() {
+        for bucket in buckets.values_mut() {
+            bucket
+                .sync_proofs
+                .retain(|_, proof| !ambiguous_identities.contains(&proof.source_record_hash));
         }
     }
     if buckets.is_empty() && lower.is_some() && raw.is_empty() {
@@ -910,6 +970,7 @@ fn adopt(
         }
     }
     within_budget(started)?;
+    let sync_prepared = sync_transition::prepare(c, source, &active, &timezone)?;
     let policy = digest(&("legacy-policy-v1", &preview_token))?;
     c.execute("INSERT INTO adoption_policies(policy_id,consumer_tool,kind,start_ms,end_ms,native_timezone,manifest_hash,created_ms,status) VALUES(?1,?2,'legacy_snapshot',?3,?4,?5,?6,?7,'active')",params![policy,tool,start,cutoff,timezone,preview_token,now_ms()])?;
     // The frozen values have their own internal acquisition object; a native
@@ -920,6 +981,7 @@ fn adopt(
     let internal_root:String=c.query_row("SELECT root_id FROM source_roots WHERE identity_family=?1 AND namespace_key=?2 AND collector_key='reported-history-v1' AND locator=?3",params![family,namespace,locator],|r|r.get(0))?;
     c.execute("INSERT INTO source_objects(root_id,object_key,locator,content_generation,byte_length,object_revision,state,parser_version,target_generation,target_end,target_done,last_observed_ms,audit_due_ms) VALUES(?1,?2,?3,?2,0,0,'ready',?4,?2,0,1,?5,?6)",params![internal_root,policy,format!("usagebook:legacy:{policy}"),first.5,cutoff,i64::MAX])?;
     let object_id = c.last_insert_rowid();
+    let mut parent_observations = Vec::new();
     for (o, bucket) in derived.iter_mut().zip(&values) {
         o.object_id = object_id;
         o.normalized_hash = claude::normalized_hash(o)?;
@@ -927,6 +989,7 @@ fn adopt(
         let id:i64=c.query_row("SELECT observation_id FROM usage_observations WHERE identity_family=?1 AND namespace_key=?2 AND candidate_key=?3 AND normalized_hash=?4",params![o.identity_family,o.namespace_key,o.candidate_key,o.normalized_hash],|r|r.get(0))?;
         c.execute("INSERT INTO adoption_items(selected_observation_id,source_observation_id,policy_id) VALUES(?1,?1,?2)",params![id,policy])?;
         time_allocation::save(c, id, &bucket.members)?;
+        parent_observations.push(id);
         units.insert(resolve::publish_key(o).ok_or(LedgerError::IncompleteEvidence)?);
     }
     retire_selected_interval(
@@ -962,6 +1025,30 @@ fn adopt(
         [source],
     )?;
     db::bump(c)?;
+    let sync_buckets: Vec<_> = derived
+        .iter()
+        .zip(&values)
+        .zip(parent_observations)
+        .map(|((o, bucket), id)| sync_transition::Bucket {
+            observation_id: id,
+            parent_key: &o.candidate_key,
+            native_date: &bucket.date,
+            model: &bucket.model,
+            start_ms: bucket.start_ms,
+            end_ms: bucket.end_ms,
+            members: &bucket.members,
+            proofs: &bucket.sync_proofs,
+        })
+        .collect();
+    sync_transition::publish(
+        c,
+        sync_prepared,
+        source,
+        family,
+        namespace,
+        &policy,
+        &sync_buckets,
+    )?;
     collection::put_runtime_value(
         c,
         &format!("reconciliation/{source}"),

@@ -1,10 +1,10 @@
-//! Original schema v2 migration gate, followed through the current v8 schema:
+//! Original schema v2 migration gate, followed through the current schema:
 //! a v1 database upgrades in place
 //! on the first write open with every fact, derived row, and suppression rule
 //! preserved. The frozen v1 DDL lives beside this file; the rebuilt tables
 //! must end up byte-identical (modulo whitespace) to a fresh init.
 use rusqlite::Connection;
-use usagebook_core::ledger::{Ledger, LedgerError};
+use usagebook_core::ledger::{db::SCHEMA_VERSION, Ledger, LedgerError};
 
 const SCHEMA_V1: &str = include_str!("ledger_schema_v1.sql");
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 32 bytes hex
@@ -92,7 +92,7 @@ fn v1_migrates_in_place_and_preserves_data() {
     let schema: i64 = c
         .query_row("SELECT schema_version FROM ledger_meta", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(schema, 8);
+    assert_eq!(schema, SCHEMA_VERSION);
 
     let object_cols = columns(c, "source_objects");
     for dead in ["audit_generation", "audit_offset", "audit_digest"] {
@@ -139,8 +139,8 @@ fn v1_migrates_in_place_and_preserves_data() {
         .query_row("SELECT commit_seq FROM ledger_meta", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        seq, 7,
-        "each migration from v1 through v8 must bump commit_seq so stale cursors die"
+        seq, SCHEMA_VERSION - 1,
+        "each migration from v1 through the current schema must bump commit_seq so stale cursors die"
     );
 
     {
@@ -162,6 +162,18 @@ fn v1_migrates_in_place_and_preserves_data() {
     let fresh = Ledger::init(&fresh_path, "UTC").unwrap();
     assert_eq!(normalized_ddl(c), normalized_ddl(fresh.connection()));
     drop(db);
+    // A second writer open must not replay already completed migrations.
+    let reopened = Ledger::open(&path, true).unwrap();
+    let reopened_seq: i64 = reopened
+        .connection()
+        .query_row("SELECT commit_seq FROM ledger_meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reopened_seq, seq);
+    assert_eq!(
+        normalized_ddl(reopened.connection()),
+        normalized_ddl(fresh.connection())
+    );
+    drop(reopened);
     drop(fresh);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&fresh_path);

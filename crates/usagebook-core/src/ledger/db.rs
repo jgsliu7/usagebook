@@ -10,6 +10,9 @@ pub use super::query_indexes::{
     regression_next_budget as regression_query_index_next_budget, QueryIndexCleanupFailure,
 };
 
+/// Current durable ledger format; every migration advances commit_seq once.
+pub const SCHEMA_VERSION: i64 = 9;
+
 pub struct Ledger {
     pub(crate) conn: Connection,
     pub(crate) path: PathBuf,
@@ -214,7 +217,7 @@ fn configured_connection(path: &Path, write: bool) -> Result<Connection> {
 /// Its caller copies this handle into a private staging file before upgrading.
 pub(crate) fn open_restore_source(path: &Path) -> Result<Connection> {
     let c = configured_connection(path, false)?;
-    validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7, 8])?;
+    validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
     validate_historical_versions(&c)?;
     Ok(c)
 }
@@ -234,7 +237,7 @@ fn open_connection_with_index_outcome(
     }
     let c = configured_connection(path, write)?;
     if write {
-        validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7, 8])?;
+        validate_versions(&c, &[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
         let schema = c
             .query_row(
                 "SELECT schema_version FROM ledger_meta WHERE singleton=1",
@@ -263,6 +266,9 @@ fn open_connection_with_index_outcome(
         }
         if schema <= 7 {
             migrate_v7_to_v8(&c)?;
+        }
+        if schema <= 8 {
+            migrate_v8_to_v9(&c)?;
         }
     }
     validate(&c)?;
@@ -434,7 +440,7 @@ fn migrate_v2_to_v3(c: &Connection) -> Result<()> {
             .optional()?;
         c.execute_batch(
             &table_ddl("ledger_meta")?
-                .replace("CHECK(schema_version=8)", "CHECK(schema_version=3)")
+                .replace("CHECK(schema_version=9)", "CHECK(schema_version=3)")
                 .replacen(
                     "CREATE TABLE ledger_meta (",
                     "CREATE TABLE ledger_meta_v3 (",
@@ -516,7 +522,7 @@ fn migrate_v3_to_v4(c: &Connection) -> Result<()> {
             .optional()?;
         c.execute_batch(
             &table("ledger_meta")?
-                .replace("CHECK(schema_version=8)", "CHECK(schema_version=4)")
+                .replace("CHECK(schema_version=9)", "CHECK(schema_version=4)")
                 .replacen(
                     "CREATE TABLE ledger_meta (",
                     "CREATE TABLE ledger_meta_v4 (",
@@ -586,7 +592,7 @@ fn migrate_v4_to_v5(c: &Connection) -> Result<()> {
     let result = (|| -> Result<()> {
         c.execute_batch(
             &canonical[start..end]
-                .replace("CHECK(schema_version=8)", "CHECK(schema_version=5)")
+                .replace("CHECK(schema_version=9)", "CHECK(schema_version=5)")
                 .replacen(
                     "CREATE TABLE ledger_meta (",
                     "CREATE TABLE ledger_meta_v5 (",
@@ -633,7 +639,7 @@ fn migrate_v5_to_v6(c: &Connection) -> Result<()> {
         validate_v5_controls(c)?;
         c.execute_batch(
             &canonical[start..end]
-                .replace("CHECK(schema_version=8)", "CHECK(schema_version=6)")
+                .replace("CHECK(schema_version=9)", "CHECK(schema_version=6)")
                 .replacen(
                     "CREATE TABLE ledger_meta (",
                     "CREATE TABLE ledger_meta_v6 (",
@@ -677,7 +683,7 @@ fn migrate_v6_to_v7(c: &Connection) -> Result<()> {
         validate_v6(c)?;
         c.execute_batch(
             &canonical[start..end]
-                .replace("CHECK(schema_version=8)", "CHECK(schema_version=7)")
+                .replace("CHECK(schema_version=9)", "CHECK(schema_version=7)")
                 .replacen(
                     "CREATE TABLE ledger_meta (",
                     "CREATE TABLE ledger_meta_v7 (",
@@ -720,14 +726,18 @@ fn migrate_v7_to_v8(c: &Connection) -> Result<()> {
     c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
     let result = (|| -> Result<()> {
         validate_v7(c)?;
-        c.execute_batch(&canonical[start..end].replacen(
-            "CREATE TABLE ledger_meta (",
-            "CREATE TABLE ledger_meta_v8 (",
-            1,
-        ))?;
+        c.execute_batch(
+            &canonical[start..end]
+                .replacen(
+                    "CREATE TABLE ledger_meta (",
+                    "CREATE TABLE ledger_meta_v8 (",
+                    1,
+                )
+                .replace("CHECK(schema_version=9)", "CHECK(schema_version=8)"),
+        )?;
         c.execute_batch("INSERT INTO ledger_meta_v8 SELECT singleton,8,ledger_uuid,epoch,commit_seq,derived_version,identity_version,normalization_version,report_timezone,tzdb_version,created_ms FROM ledger_meta; DROP TABLE ledger_meta; ALTER TABLE ledger_meta_v8 RENAME TO ledger_meta;")?;
         c.execute_batch(include_str!("claude_protection_schema.sql"))?;
-        validate(c)?;
+        validate_v8(c)?;
         let violation: Option<String> = c
             .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
             .optional()?;
@@ -746,15 +756,56 @@ fn migrate_v7_to_v8(c: &Connection) -> Result<()> {
     result
 }
 
+pub(crate) fn migrate_v8_to_v9(c: &Connection) -> Result<()> {
+    c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        validate_v8(c)?;
+        let canonical = include_str!("schema.sql");
+        let start = canonical
+            .find("CREATE TABLE ledger_meta (")
+            .ok_or(LedgerError::CorruptLedger)?;
+        let end = start
+            + canonical[start..]
+                .find(") STRICT;")
+                .ok_or(LedgerError::CorruptLedger)?
+            + ") STRICT;".len();
+        c.execute_batch(&canonical[start..end].replacen(
+            "CREATE TABLE ledger_meta (",
+            "CREATE TABLE ledger_meta_v9 (",
+            1,
+        ))?;
+        c.execute_batch("INSERT INTO ledger_meta_v9 SELECT singleton,9,ledger_uuid,epoch,commit_seq,derived_version,identity_version,normalization_version,report_timezone,tzdb_version,created_ms FROM ledger_meta; DROP TABLE ledger_meta; ALTER TABLE ledger_meta_v9 RENAME TO ledger_meta;")?;
+        c.execute_batch(include_str!("sync_schema.sql"))?;
+        validate(c)?;
+        bump(c)?;
+        regression_stop("migration_v9_before_commit");
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = c.execute_batch("ROLLBACK;");
+    }
+    c.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result
+}
 pub(crate) fn validate(c: &Connection) -> Result<()> {
-    validate_versions(c, &[8])?;
+    validate_versions(c, &[SCHEMA_VERSION])?;
+    validate_v8(c)?;
+    c.prepare("SELECT version FROM sync_projection_clock WHERE singleton=1")
+        .map_err(|_| LedgerError::CorruptLedger)?;
+    c.prepare("SELECT binding_id,secret_check_hash,enabled FROM sync_bindings LIMIT 0")
+        .map_err(|_| LedgerError::CorruptLedger)?;
+    Ok(())
+}
+fn validate_v8(c: &Connection) -> Result<()> {
+    validate_versions(c, &[8, 9])?;
     validate_v7(c)?;
     c.prepare("SELECT identity,entry_json,reason FROM claude_protection_pending LIMIT 0")
         .map_err(|_| LedgerError::CorruptLedger)?;
     Ok(())
 }
 fn validate_v7(c: &Connection) -> Result<()> {
-    validate_versions(c, &[7, 8])?;
+    validate_versions(c, &[7, 8, 9])?;
     validate_v6(c)?;
     c.prepare("SELECT parent_observation_id,version,provenance,member_count,parent_hash,policy_hash,evidence_json,manifest_hash,created_ms FROM durable_time_revisions LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
     c.prepare("SELECT parent_observation_id,member_key,content_hash,occurred_ms,metrics_json,cost_units,cost_scale FROM durable_time_revision_members LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
@@ -802,7 +853,7 @@ fn ensure_read_caches(c: &Connection) -> Result<()> {
 }
 
 fn validate_v6(c: &Connection) -> Result<()> {
-    validate_versions(c, &[6, 7, 8])?;
+    validate_versions(c, &[6, 7, 8, 9])?;
     validate_v5_controls(c)?;
     c.prepare("SELECT parent_observation_id,version,provenance,complete,member_count,manifest_hash,created_ms FROM durable_time_allocations LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
     c.prepare("SELECT parent_observation_id,member_key,occurred_ms,metrics_json,cost_units,cost_scale FROM durable_time_members LIMIT 0").map_err(|_|LedgerError::CorruptLedger)?;
@@ -926,9 +977,10 @@ impl Ledger {
             c.execute_batch(include_str!("time_allocation_schema.sql"))?;
             c.execute_batch(include_str!("time_repair_schema.sql"))?;
             c.execute_batch(include_str!("claude_protection_schema.sql"))?;
+            c.execute_batch(include_str!("sync_schema.sql"))?;
             ensure_read_caches(&c)?;
             c.execute(
-                "INSERT INTO ledger_meta VALUES(1,8,?1,?2,0,1,1,1,?3,?4,?5)",
+                "INSERT INTO ledger_meta VALUES(1,9,?1,?2,0,1,1,1,?3,?4,?5)",
                 rusqlite::params![
                     new_epoch(),
                     new_epoch(),
@@ -1129,6 +1181,17 @@ pub(crate) fn bump(c: &Connection) -> Result<i64> {
     let old: i64 = c.query_row("SELECT commit_seq FROM ledger_meta", [], |r| r.get(0))?;
     let next = old.checked_add(1).ok_or(LedgerError::NumericOverflow)?;
     c.execute("UPDATE ledger_meta SET commit_seq=?1", [next])?;
+    // Earlier migration steps run before v9 creates this table.
+    if c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='sync_projection_clock')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        c.execute(
+            "UPDATE sync_projection_clock SET version=version+1 WHERE singleton=1",
+            [],
+        )?;
+    }
     Ok(next)
 }
 pub(crate) fn change_epoch(c: &Connection) -> Result<String> {
@@ -1164,9 +1227,10 @@ pub fn live_connection(timezone: &str) -> Result<Connection> {
     c.execute_batch(include_str!("time_allocation_schema.sql"))?;
     c.execute_batch(include_str!("time_repair_schema.sql"))?;
     c.execute_batch(include_str!("claude_protection_schema.sql"))?;
+    c.execute_batch(include_str!("sync_schema.sql"))?;
     ensure_read_caches(&c)?;
     c.execute(
-        "INSERT INTO ledger_meta VALUES(1,8,?1,?2,0,1,1,1,?3,?4,?5)",
+        "INSERT INTO ledger_meta VALUES(1,9,?1,?2,0,1,1,1,?3,?4,?5)",
         rusqlite::params![
             new_epoch(),
             new_epoch(),

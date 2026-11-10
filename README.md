@@ -180,6 +180,50 @@ Windows PowerShell 使用相同命令并提供本机路径；设置环境变量�
 
 状态接口另提供 `collection`（模式、间隔、调度状态）、`storage`（当前服务的存储模式、是否需重启验证、支持长期保存的来源）及每来源 `history_protection`/`durable_supported`/`last_scanned_at_ms`。`initial_import` 显示固定首导范围、缺口及已保存/已发布水位；`evidence_supported` 表示具备用量证据保存能力，`durable_supported` 表示具备经审计的正式准入范围。CC 的 `accounting.unaccounted_rows` 是未计入的证据数量，不是调用次数。`saved_pending_candidates` 是尚未对应正式事实的观察数量，`confirmed_events` / `verified_events` 是按适配规则核实的事件数量；`source_reported_events` 是明确采用的来源报告事实数量，`adopted_events` 是二者之和（汇总事实不等于逐请求数），二者不是可相加的请求数。live 来源已有持久证据时，`last_saved_at_ms` 表示实际证据提交时间；没有持久证据时保留旧扫描时间别名，因此采集时间应读取 `last_scanned_at_ms`，持久保护应同时检查保存计数和保护状态。
 
+### 多机云端统计（可选）
+
+本地看板始终显示本机；云端看板在独立页面按设备相加。同步默认关闭，云端保存已收到的历史，不因本地文件缺失、清理或退出登录而删除。本期云端提供统计，不提供恢复本地账本。同步字段包括来源、模型名(不安全名称归为未知)、实际发生时间与时区/本地日期、各用量指标(含质量标记)、设备内贡献标识与版本；成本、路径、原生请求/会话 ID、对话内容不上传。无法安全分类的模型归入“未知”。
+
+普通本地采集、看板和报表默认不访问外网。用量自动上传需要已登录并开启同步；即使同步关闭，显式执行 `sync login`、`sync logout`、`sync repair` 也可能发送认证或管理请求，确认执行 `sync repair --reconcile --apply` 还可能补传数据。
+
+需要可用且已配置 GitHub 登录的云端服务。首次 GitHub 登录自动建立账号，不设置邮箱密码。以下命令在持久账本模式下使用：
+
+```bash
+# 默认使用 GitHub Device Flow；终端显示授权地址与代码
+usagebook sync login
+# 或先在云端设备页生成一次绑定码，在隐藏提示中粘贴
+usagebook sync login --pair-code
+# PAT 仅通过标准输入读取一行，不接受命令参数、不落盘
+usagebook sync login --pat-stdin
+
+# 绑定后仍为关闭；首次开启会确认上传范围
+usagebook sync on
+# 已有 serve 时自动由其同步；没有 serve 时前台运行
+usagebook sync run
+usagebook sync status --json
+usagebook sync wake
+usagebook sync off
+usagebook sync logout
+```
+
+`sync on` 不安装后台服务；用量自动上传仅在 `serve` 或 `sync run` 运行期间进行。`sync run` 只开放回环控制接口，不显示看板。两者使用同一账本写锁，不能同时运行。另一个终端的 `on/off/wake/logout` 通过本机控制接口操作正在运行的宿主；登录和修复必须先停止宿主，避免消费绑定码后无法保存凭证。临时看板 `serve --temporary` 不支持同步。
+
+退出会关闭同步并撤销设备令牌，保留云端历史和本地身份密钥。重新授权原设备，在网页选择“继续绑定”；丢失身份文件时选择“替换原设备”，旧历史保留，新设备仅从服务端确认的当前时刻继续。选择独立新设备导入完整历史会按两台设备相加。切换其他账号需先退出，再运行 `usagebook sync login --new-account`，原账号的映射仍保留。
+
+来源文件被重排、搬移、重写，可能让本机无法证明记录是否已经上传。这时保留云端旧值，并显示“待处理”，不会把缺失记录当删除指令。先停止宿主，再使用以下明确的修复入口：
+
+```bash
+# 仅查看云端身份/版本/摘要，不下载云端用量恢复本地
+usagebook sync repair --reconcile
+# 应用可证明的同内容确认、补交本地保留的已确认投影
+usagebook sync repair --reconcile --apply
+# 接受某来源的历史缺口，保留云端旧历史，从现在继续
+usagebook sync repair --source codex --continue-from-now
+# 自动化脚本可对 on/repair 显式传 --yes 跳过交互确认
+```
+
+同步状态和待发队列位于原账本 SQLite 中。凭证保存在账本同目录的 `cloud-credentials/` 私有文件中；数据库备份不包含凭证，恢复账本后同步保持关闭。请独立保管身份文件；不要把令牌、PAT、一次绑定码或该目录提交到代码仓库。macOS/Linux 使用私有目录与文件权限；Windows 使用仅当前用户和 SYSTEM 可访问的受保护 DACL。Windows 实机验证由专项 CI 执行，不应仅凭其他平台的测试认定通过。
+
 ### 环境变量
 
 | 变量 | 作用 | 默认 |
@@ -194,7 +238,7 @@ Windows PowerShell 使用相同命令并提供本机路径；设置环境变量�
 
 各数据源自己的目录覆盖变量，以 `usagebook doctor` 的展示与各源档案为准。
 
-usagebook 在自己的本地缓存目录保存扫描加速状态，默认位于 `~/.usagebook/` 下按兼容代次命名的子目录（如 `state.db.cache-p6-s2-l1/state.db`）。它仅包含**文件路径**、缓存修订号与白名单用量元数据（模型名、会话标识、token 计数、消息标识、时间戳），**不含任何提示词、工具调用或代码内容**；纯本地，零网络。设置 `USAGEBOOK_INCREMENTAL=off` 可完全停用并退回全量扫描；`usagebook doctor` 显示实际状态库路径及健康信息。
+usagebook 在自己的本地缓存目录保存扫描加速状态，默认位于 `~/.usagebook/` 下按兼容代次命名的子目录（如 `state.db.cache-p6-s2-l1/state.db`）。它仅包含**文件路径**、缓存修订号与白名单用量元数据（模型名、会话标识、token 计数、消息标识、时间戳），**不含任何提示词、工具调用或代码内容**；该扫描缓存仅在本地读写。可选云端功能的网络边界见上文“多机云端统计”。设置 `USAGEBOOK_INCREMENTAL=off` 可完全停用并退回全量扫描；`usagebook doctor` 显示实际状态库路径及健康信息。
 
 状态库按解析语义与锁协议的兼容代次隔离：兼容的应用版本共享同一目录，代次变更后首轮重新扫描。`USAGEBOOK_STATE_DB` 是逻辑基址，设为 `/x/custom.db` 时实际文件为 `/x/custom.db.cache-p6-s2-l1/state.db`。旧目录不会被读取、迁移或清理；目录旁的同名 `.lock` 文件是生命周期锁，正常使用期间不要删除。
 
@@ -216,7 +260,7 @@ Apache-2.0,见 [LICENSE](LICENSE)。内嵌图表库与 Rust 依赖的来源、�
 
 ## 更新
 
-本工具**自身不联网检查更新**(隐私承诺:零外呼,见 SECURITY.md)。获取新版本:
+本工具**自身不联网检查更新**；本地运行与可选云端命令的网络边界见 [SECURITY.md](SECURITY.md)。获取新版本:
 
 ```bash
 # 先在看板终端按 Ctrl-C，然后在源码目录更新并重新安装
@@ -231,7 +275,7 @@ sh install.sh
 
 ## 免责声明
 
-- 本工具只**读取**本地已有文件做统计，不修改任何工具的数据；运行时不向外网发送请求
+- 本工具只**读取**本地已有文件做统计，不修改任何工具的数据；普通本地运行默认不访问外网。已登录并开启同步后可自动上传用量；显式云端认证、退出及修复命令也会按需联网，即使自动同步处于关闭状态
 - **保护范围以成功提交和逐来源准入状态为准**。已确认历史与已保存待核对证据不随源日志删除；尚未准入的 live 合计仍可能变化。扫描缓存不能替代长期账本，也不能恢复从未采集到的记录
 - 与所列各 AI 编程工具无隶属关系;各工具名称与商标归其各自所有者
 
@@ -282,4 +326,4 @@ usagebook-cli(外壳)
 - `docs/数据源档案/29-源可信度评级报告.md` — 各源可信度评级
 - `CHANGELOG.md` / `SECURITY.md` / `LICENSE`(Apache-2.0)
 
-旧格式可通过带预览的 `ledger adopt-legacy` 选择来源报告历史；CC 支持限定的 OpenCode 强身份补录及 Pi 完整日范围采用。质量、范围、暂停/恢复和安全预算见[历史用量保存](docs/历史用量保存.md)。schema v8 升级前请保存备份；不能用旧二进制直接打开新库。
+旧格式可通过带预览的 `ledger adopt-legacy` 选择来源报告历史；CC 支持限定的 OpenCode 强身份补录及 Pi 完整日范围采用。质量、范围、暂停/恢复和安全预算见[历史用量保存](docs/历史用量保存.md)。schema v9 升级前请保存备份；不能用旧二进制直接打开新库。

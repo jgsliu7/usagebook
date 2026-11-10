@@ -123,11 +123,11 @@ This version has been tested on macOS. Linux/Windows application-level validatio
 
 ## Updating
 
-The tool never checks for updates online (zero network at runtime — see `SECURITY.md`). From source: `git pull` && `sh install.sh`. Release-archive users re-run `sh install.sh` from the newly extracted archive. Homebrew/crates.io channels are not provided yet; do not assume same-named packages belong to this project. The 0.x series follows semver, but minor versions may contain breaking changes; the local state database is handled automatically by a schema guard (details in `INSTALL.md`, Chinese).
+The tool never checks for updates online. Ordinary local use is offline by default; optional cloud authentication and management commands can use the network even when automatic sync is off (see `SECURITY.md`). From source: `git pull` && `sh install.sh`. Release-archive users re-run `sh install.sh` from the newly extracted archive. Homebrew/crates.io channels are not provided yet; do not assume same-named packages belong to this project. The 0.x series follows semver, but minor versions may contain breaking changes; the local state database is handled automatically by a schema guard (details in `INSTALL.md`, Chinese).
 
 ## Privacy & local state
 
-usagebook keeps legacy scan-acceleration state at `~/.usagebook/` (logical base path; derived cache files live alongside): file paths and a whitelist of usage metadata (model names, session ids, token counts, message ids, timestamps) only — **never prompts, tool calls, or code content**. Purely local, zero network. Set `USAGEBOOK_INCREMENTAL=off` to disable this legacy cache, or point `USAGEBOOK_DATA_DIR` elsewhere. Durable ledger storage is separate.
+usagebook keeps legacy scan-acceleration state at `~/.usagebook/` (logical base path; derived cache files live alongside): file paths and a whitelist of usage metadata (model names, session ids, token counts, message ids, timestamps) only — **never prompts, tool calls, or code content**. Ordinary local use is offline by default. Optional automatic cloud sync (see below) is off by default; usage uploads contain only whitelisted aggregate fields. Explicit cloud authentication and management commands may still use the network. Set `USAGEBOOK_INCREMENTAL=off` to disable this legacy cache, or point `USAGEBOOK_DATA_DIR` elsewhere. Durable ledger storage is separate.
 
 ### Runtime logs
 
@@ -155,9 +155,28 @@ Per-source directory override variables: see `usagebook doctor` and the source d
 
 Troubleshooting: attach that directory when reporting issues (redact first — paths may expose your username and project names). `RUST_LOG=usagebook_core=debug` temporarily raises diagnostic verbosity (once set, the variable takes full control — a human-facing message and the file layer may both carry the same line; use `RUST_LOG=usagebook_core=debug,usagebook_cli=info` to also keep the per-round dashboard summary); `-v/-vv` only raises terminal output. Known limits: ① the log directory does not support network filesystems (NFS/SMB) or shared directories; ② when two `serve` instances run on different ports, the second instance's file logging degrades automatically (dashboard unaffected); lines may interleave within a tiny race window (runtime logs are diagnostic and do not affect the ledger or statistics); ③ after a system clock jump backwards, the day's log may land in a "future-dated" filename; ④ if today's shards are wiped externally across restarts, shard numbering restarts at 001; ⑤ under extreme faults (disk full, rotation failing persistently) the bound on usage is enforced by auto-disabling the file layer after consecutive write failures, not by the 200MiB cap.
 
+## Multi-device cloud statistics (optional)
+
+The local dashboard always shows this machine only; an optional cloud service aggregates multiple devices on a separate page. Sync is **off by default**; automatic usage uploads require login and enabling sync. Explicit `sync login`, `sync logout`, and `sync repair` commands may make authentication or management requests even while sync is off; confirming `sync repair --reconcile --apply` may also retransmit data. A working cloud deployment is required. The cloud keeps received history for statistics and does not restore your local ledger.
+
+Synced fields: sources, model names (unsafe names fall back to unknown), actual timestamps with timezone/local date, usage metrics (with quality flags), and device-local contribution ids/versions. Costs, file paths, native request/session ids, and conversation content are never uploaded.
+
+```bash
+usagebook sync login             # GitHub Device Flow (default)
+usagebook sync login --pair-code # paste a one-time code from the cloud device page
+usagebook sync login --pat-stdin # PAT read from stdin only, never stored
+usagebook sync on                # stays off after login; enabling confirms the upload scope
+usagebook sync run               # foreground sync when no serve is running
+usagebook sync status --json
+usagebook sync off
+usagebook sync logout
+```
+
+`sync on` installs no background service — automatic uploads run only while `serve` or `sync run` is running. Credentials live in `cloud-credentials/` next to the ledger with restrictive permissions and are excluded from ledger backups; after restoring a ledger, sync stays off. Release builds are configured with the cloud address `app.usagebook.com`; using it requires an available deployment. Debug builds can point `USAGEBOOK_CLOUD_ORIGIN` at a self-hosted instance. See `README.md` (Chinese) for the full guide, including `sync repair` for local-file reordering and history-gap handling.
+
 ## Disclaimer
 
-- usagebook only **reads** existing local files for statistics; it never modifies any tool's data and makes no network requests at runtime.
+- usagebook only **reads** existing local files for statistics and never modifies any tool's data. Ordinary local use is offline by default. Automatic usage uploads require login and enabling sync; explicit cloud authentication and management commands may use the network while automatic sync is off.
 - Confirmed ledger facts and saved pending evidence survive source cleanup. Live totals for unadmitted formats still depend on their remaining logs. Records removed before their first successful import cannot be recovered.
 - usagebook is not affiliated with any of the listed AI coding tools; all names and trademarks belong to their respective owners.
 
@@ -165,4 +184,4 @@ Troubleshooting: attach that directory when reporting issues (redact first — p
 
 Apache-2.0. See [LICENSE](LICENSE) and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
-Explicit `ledger adopt-legacy` previews can freeze a supported legacy reporting basis. Limited CC history selection supports strongly identified OpenCode records and complete Pi daily ranges. These contributions remain source-reported; they are not promoted to verified requests. See [History preservation](docs/历史用量保存.md) for admission, query, and maintenance boundaries. Back up before upgrading to schema v8; older binaries cannot open the new schema.
+Explicit `ledger adopt-legacy` previews can freeze a supported legacy reporting basis. Limited CC history selection supports strongly identified OpenCode records and complete Pi daily ranges. These contributions remain source-reported; they are not promoted to verified requests. See [History preservation](docs/历史用量保存.md) for admission, query, and maintenance boundaries. Back up before upgrading to schema v9; older binaries cannot open the new schema.

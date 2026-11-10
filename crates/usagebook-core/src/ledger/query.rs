@@ -1327,20 +1327,91 @@ impl<'a> QueryService<'a> {
                 Ok(false)
             }
         } else {
-            // 读模型路径(legacy 为 None):live_facts() 物化缓存
-            for row in self.live_facts()?.iter() {
-                let request = &row.fact;
-                if !owned
-                    && request.kind == "request"
-                    && request.native == f.native
-                    && request.namespace == f.namespace
-                    && request.time.is_some_and(|time| time >= start && time < end)
+            // 读模型路径(legacy 为 None):SQL 直查物化表快径(语义与 live_facts
+            // 循环一致:非 ledger 路由的 request 命中即覆盖,与 legacy 双轨的
+            // route 语义对齐;取代逐行物化循环)
+            let covered:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM query_live_facts f WHERE fact_kind='request' AND occurred_ms>=?1 AND occurred_ms<?2 AND json_extract(payload_json,'$.fact.native')=?3 AND json_extract(payload_json,'$.fact.namespace')=?4 AND NOT EXISTS(SELECT 1 FROM source_roots r WHERE r.report_source=f.report_source AND r.route='ledger'))",params![start,end,f.native,f.namespace],|r|r.get(0))?;
+            Ok(!owned && covered)
+        }
+    }
+    /// Streams exactly the selected request/day facts used by V2, without the
+    /// rollup shortcut. The caller already holds a WAL snapshot transaction.
+    pub(crate) fn visit_selected_facts(
+        &self,
+        source: &str,
+        mut visitor: impl FnMut(super::sync_projection::SelectedFact) -> super::Result<()>,
+    ) -> QueryResult<()> {
+        use super::sync_projection::{metrics_value, SelectedFact};
+        let routes = self.source_routes()?;
+        let mut emit = |f: Fact| -> QueryResult<()> {
+            let time = if f.kind == "request" {
+                let Some(at) = f.time else { return Ok(()) };
+                json!({"kind":"instant","at_ms":at.to_string()})
+            } else {
+                if self.day_covered(&f, &routes)? {
+                    return Ok(());
+                }
+                let (Some(start), Some(end), Some(ref tz), Some(ref date)) =
+                    (f.start, f.end, f.timezone.as_ref(), f.date.as_ref())
+                else {
+                    return Ok(());
+                };
+                if start >= end || f.live && f.namespace.is_empty() {
+                    return Ok(());
+                }
+                json!({"kind":"interval","start_ms":start.to_string(),"end_ms":end.to_string(),"native_timezone":tz,"native_date":date})
+            };
+            let metrics = metrics_value(
+                &f.metrics,
+                f.reported,
+                if f.live { f.known_fields } else { 1023 },
+            )
+            .map_err(|e| QueryError::new(e.code(), e.to_string()))?;
+            visitor(SelectedFact {
+                observation_id: f.id,
+                family: f.family,
+                namespace: f.namespace,
+                key: f.key,
+                source: f.source,
+                kind: f.kind,
+                model: f.model,
+                live: f.live,
+                reported: f.reported,
+                time,
+                metrics,
+            })
+            .map_err(|e| QueryError::new(e.code(), e.to_string()))
+        };
+        if routes.get(source).is_some_and(|route| route == "ledger") {
+            let sql=format!("SELECT {FACT_COLUMNS} FROM usage_events e JOIN usage_observations o ON o.observation_id=e.selected_observation_id WHERE e.state='active' AND e.fact_kind IN('request','day') AND e.report_source=?1 ORDER BY e.identity_key");
+            let mut q = self.conn.prepare(&sql)?;
+            let mut rows = q.query([source])?;
+            while let Some(row) = rows.next()? {
+                emit(Fact::from_row(row)?)?;
+            }
+        } else {
+            if let Some(state) = super::read_model::state(self.conn)? {
+                if state
+                    .sources
+                    .get(source)
+                    .is_some_and(|s| s.stale || s.error.is_some() || s.last_scanned_ms.is_none())
                 {
-                    return Ok(true);
+                    return Err(QueryError::new(
+                        "SOURCE_READ_FAILED",
+                        "source publication incomplete",
+                    ));
                 }
             }
-            Ok(false)
+            let mut q=self.conn.prepare("SELECT payload_json FROM query_live_facts WHERE report_source=?1 AND fact_kind IN('request','day') ORDER BY json_extract(payload_json,'$.fact.key'),json_extract(payload_json,'$.fact.model'),json_extract(payload_json,'$.fact.time'),json_extract(payload_json,'$.fact.metrics'),json_extract(payload_json,'$.fact.start'),json_extract(payload_json,'$.fact.end'),json_extract(payload_json,'$.fact.known_fields')")?;
+            let mut rows = q.query([source])?;
+            while let Some(row) = rows.next()? {
+                let row: super::read_model::LiveFact =
+                    serde_json::from_str(&row.get::<_, String>(0)?)
+                        .map_err(|_| QueryError::invalid("invalid live projection"))?;
+                emit(row.fact)?;
+            }
         }
+        Ok(())
     }
     pub fn status(&self) -> QueryResult<Status> {
         let (_guard, ctx) = self.snapshot(None)?;
