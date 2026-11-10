@@ -104,6 +104,13 @@ fn spawn_serve(port: u16, data_dir: &Path, extra_env: &[(&str, &str)]) -> Child 
         .env("USAGEBOOK_STATE_DB", data_dir.join("state.db"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Windows:env_clear 后缺 SystemRoot 时 winsock 目录不可加载,serve 绑定即
+    // "过程调用表无效 (os error 10104)" 秒退(2026-10-28 Windows 合流实证);
+    // Linux 下无此变量,按 cfg 仅 Windows 透传。
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", root);
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -612,12 +619,19 @@ fn unwritable_log_dir_degrades_console_warns() {
 #[test]
 fn home_path_never_appears_unabbreviated() {
     let data = tmpdir("serve-home");
+    // logs 仅 Unix 断言消费(见下),Windows 下避免 unused
+    #[cfg(unix)]
     let logs = data.join("logs");
     let (mut child, port) = spawn_serve_alive(&data, &[]);
     assert!(wait_port(port, Duration::from_secs(15)));
     std::thread::sleep(Duration::from_millis(400));
     kill(&mut child);
+    // 仅 Unix 可断言:Linux 的 /tmp 不在 HOME 之下,日志路径含 HOME 前缀即未缩略;
+    // Windows 的 TEMP 位于用户目录之下(含 HOME 前缀是常态),断言在该平台无意义
+    // 必然误报(2026-10-28 Windows 合流实证,同 v01_tail_batch F1.3 的 unix 门控先例)。
+    #[cfg(unix)]
     let content = std::fs::read_to_string(today_log(&logs)).unwrap();
+    #[cfg(unix)]
     if let Ok(home) = std::env::var("HOME") {
         assert!(
             !content.contains(&home),

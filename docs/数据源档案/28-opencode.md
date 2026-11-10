@@ -1,7 +1,11 @@
 # 28. OpenCode
 
 > 状态:**本机实证 ✅**(~/.local/share/opencode/opencode.db 24.6GB,544 会话 / 13,026 message 行)。
-> 证据链:ccusage `rust/adapters/opencode/` + 本机 db 只读对拍(2026-10)。
+> **Windows 增补实证(2026-10-19)**:新版 schema 的 `session_message`(v2)已实际启用,
+> 且 **type 判别字段是 SQL 列、data blob 不再内嵌 role/type**——旧适配器 blob 子串预过滤 +
+> blob role 判别双双落空致 0 条(缺陷记录 docs/bugs/20261019-opencode-v2新schema解析0条/,
+> 修复后 2831 条非零行五桶逐位对账通过)。
+> 证据链:ccusage `rust/adapters/opencode/` + 本机 db 只读对拍(2026-10)+ Windows 实库对拍(2026-10-19)。
 
 ## 1. 发现规则
 
@@ -30,6 +34,12 @@
 | `message`(v1) | id/session_id/time_created/data(JSON:role/tokens/modelID/time/cost) | 13,026(11,982 assistant) |
 | `session_message`(v2) | 同 v1 + type/seq 列 | 0(建表未用) |
 | `part` | 消息正文 blob(**24GB 体积大头,永不触碰**) | — |
+
+**v2 双形态(2026-10-19 Windows 实库)**:旧版(Mac 实证)v2 建表未用、blob 内嵌 role/type;
+新版 v2 已启用(本机 Windows 3409 行),**type 只在 SQL 列、blob 无 role/type**
+(blob 键集:agent/model/content/cost/tokens/error/time)。v1 与 v2 交集行五桶一致
+(差异仅 v1 多 `total` 键),v2 为迁移超集 → 通道互斥取 v2 仍正确。
+适配器探测 type 列:在 → `WHERE type='assistant'` SQL 判别;不在 → 原 blob 路径(旧版)。
 
 **通道互斥规则(防双计)**:session 聚合 = message 明细之和(本机对拍一 会话五列全吻合:
 input 516+1775+2019=4310 ✓ output/reasoning/cache_read 同)。同取两通道必双计。

@@ -1,8 +1,11 @@
 //! v0.1 尾批验收 fixture(F 编号=验收条款编号;单入口串行,避免进程级 env/store 竞态)。
 
 use std::path::PathBuf;
-use usagebook_core::common::{__reset_caches_for_tests, with_incremental_cache};
+use usagebook_core::common::__reset_caches_for_tests;
+#[cfg(unix)]
+use usagebook_core::common::with_incremental_cache;
 use usagebook_core::store;
+#[cfg(unix)]
 use usagebook_core::UsageSource;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -85,6 +88,8 @@ fn f1_1_gate_ignores_note_keywords() {
 }
 
 // —— F1.3 unreadable_db_marks_failed(kilo + zcode)——
+// 依赖 chmod 0o000 制造不可读库,仅 Unix 有效;调用点已同步 #[cfg(unix)]
+#[cfg(unix)]
 fn f1_3_unreadable_db_marks_failed() {
     for (src_id, layout) in [("kilo", "kilo"), ("zcode", "zcode")] {
         let dir = tmp(&format!("f13-{src_id}"));
@@ -133,6 +138,7 @@ fn f1_3_unreadable_db_marks_failed() {
 }
 
 /// 造一个表结构存在但无数据的库(只为让"打开失败"分支有真实目标)。
+#[cfg(unix)]
 fn kilo_db(path: &std::path::Path) -> PathBuf {
     let conn = rusqlite::Connection::open(path).unwrap();
     conn.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1);")
@@ -290,6 +296,8 @@ fn f6_2_parser_v4_upgrade_rebuilds() {
 #[test]
 fn tail_batch_all() {
     f1_1_gate_ignores_note_keywords();
+    // chmod 0o000 仅 Unix 能制造不可读库(Windows ACL 不映射),该子项 unix 门控
+    #[cfg(unix)]
     f1_3_unreadable_db_marks_failed();
     f1_4_zcode_freeze_restored();
     f2_1_newer_schema_disables_without_touching();

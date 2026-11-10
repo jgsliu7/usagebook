@@ -567,6 +567,7 @@ fn scan_session_store(
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut ids = HashMap::<String, Vec<SqlValue>>::new();
+        let mut unreadable_created_at: u32 = 0;
         while let Some(row) = rows.next()? {
             stats.lines_total += 1;
             let vals: Vec<SqlValue> = (0..11).map(|i| row.get(i)).collect::<Result<_, _>>()?;
@@ -598,12 +599,23 @@ fn scan_session_store(
                     SqlValue::Null => 0,
                     v => sql_token(v)?,
                 };
-                let ts_ms = sql_text(&vals[10])
-                    .and_then(|s| {
-                        chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S").ok()
-                    })
-                    .map(|t| t.and_utc().timestamp_millis())
-                    .unwrap_or(0);
+                // created_at(§7):1.0.92 naive UTC "YYYY-MM-DD HH:MM:SS";1.0.101+ 为 RFC3339
+                // 带毫秒 Z(Windows 实库实证 2026-10-21)——双格式取序无歧义交集,旧格式行为不变;
+                // 不可辨值跳过该行并计数(不静默置 0 落 1970,也不整源失败)
+                let ts_ms = sql_text(&vals[10]).and_then(|s| {
+                    let t = s.trim();
+                    chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S")
+                        .map(|x| x.and_utc().timestamp_millis())
+                        .ok()
+                        .or_else(|| crate::common::iso_to_ms(t))
+                });
+                let ts_ms = match ts_ms {
+                    Some(ms) => ms,
+                    None => {
+                        unreadable_created_at += 1;
+                        return Ok(None);
+                    }
+                };
                 coverage
                     .sessions
                     .entry(session.to_owned())
@@ -625,6 +637,13 @@ fn scan_session_store(
                 Ok(None) => {}
                 Err(code) => fail(stats, code),
             }
+        }
+        if unreadable_created_at > 0 {
+            // 行级披露而非 lines_bad_json:装配层把后者当整源失败信号(会冻结全部新鲜数据)
+            stats.notes.push(format!(
+                "{} created_at 不可解析,跳过 {unreadable_created_at} 行(已知格式:1.0.92 naive/1.0.101+ RFC3339)",
+                db.display()
+            ));
         }
         Ok(())
     })();

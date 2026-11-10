@@ -2,7 +2,8 @@
 //!
 //! 根:~/.claude/projects(CLAUDE_CONFIG_DIR 逗号多根 + XDG 回退)
 //! 行:assistant.message.usage 四字段(exclusive,input 不含 cache)
-//! 去重:精确键 message.id+requestId → 退化键 session+message.id(msg_id 缺失才用 session+ts);token 大者胜
+//! 去重:精确键 message.id+requestId → 退化键 session+message.id(msg_id 缺失才用 session+ts);token 大者胜;
+//!     跨会话重放(msg_id+ts+五桶+model 全同)合并为一条
 //! 特殊:subagents/**/journal.jsonl 丢弃;<synthetic> 模型跳过;cost-state 作会话级基线
 
 use crate::common::*;
@@ -185,6 +186,14 @@ impl UsageSource for ClaudeSource {
         // cost-state 会话级基线:session → record(保留最后)
         let mut cost_state: HashMap<String, UsageRecord> = HashMap::new();
 
+        // 跨会话重放已见集:resume/fork 会把父消息原样重放进新会话文件
+        // (msg_id、ts、五桶、model 全同,仅 sessionId 不同),按会话作用域的
+        // 退化键会双计;cc-switch 的裸 msg_id 主键天然收敛为一条(2026-10-19
+        // 修,本机实测 49 条重放双计 +0.30%)。不同五桶视为真实请求,不合并。
+        let mut replay_seen: std::collections::HashSet<(String, i64, [u64; 4], String)> =
+            std::collections::HashSet::new();
+        let mut replays_merged: usize = 0;
+
         for path in &files {
             let in_subagents = path.components().any(|c| c.as_os_str() == "subagents");
             let agent_name = if in_subagents {
@@ -280,6 +289,20 @@ impl UsageSource for ClaudeSource {
                         } else {
                             format!("{}:{}:", session_id, ts_ms)
                         };
+                        // 重放合并仅作用于退化键路径;同 msg_id+ts+五桶+model 全同
+                        // 即同一响应的重放副本,保留首条(值全同,任取等价)。
+                        if !exact_key
+                            && !replay_seen.insert((
+                                msg_id.to_string(),
+                                ts_ms,
+                                [input, cache_read, cache_write, output],
+                                rec.model.clone(),
+                            ))
+                        {
+                            replays_merged += 1;
+                            parsed_any = true;
+                            return;
+                        }
                         let rec = UsageRecord {
                             dedup_key: key.clone(),
                             ..rec
@@ -387,6 +410,11 @@ impl UsageSource for ClaudeSource {
             "cost-state 会话级基线 {} 条(口径 session_total,不并入增量求和)",
             cost_state.len()
         ));
+        if replays_merged > 0 {
+            stats.notes.push(format!(
+                "跨会话重放合并 {replays_merged} 条(resume 复制父消息:msg_id+ts+五桶全同,保留一条防双计)"
+            ));
+        }
         let conflicts = ttl_evidence.values().filter(|e| e.conflict).count();
         let mut unknown_ttl = 0usize;
         let mut records: Vec<UsageRecord> = dedup

@@ -18,6 +18,10 @@
 
 - 首导分类完成不再直接切换查询：固定分桶对账通过才自动启用账本；提供明确的旧口径基线与 CC 历史采用预览。补齐保存/发布失败、跨根公平调度、日期与跨渠道删除闭包、恢复依赖及迁移前版本校验。
 
+- 适配 **Qoder** Windows 发现:IDE 通道 local.db 增 `%APPDATA%` 双基(macOS 行为不变),本机 Qoder/QoderCN 两库 53 条入账并逐位对账;CLI 通道目录清单补齐 `~/.qoder-cn` 与 `~/.qoderwake-cn/qodercli`(qoderclicn/qodercli 转录为 Claude Code 兼容格式,当前 qfmodel 网关不下发计数故 0 条,未来下发即生效;新增全 0 跳过与非零直通双场景 fixture)。档案 27 升级为 Windows 实证。
+- 修复 **Claude 跨会话重放双计**(残差 0.30%):resume/fork 把父消息原样重放进新会话文件(msg_id+ts+五桶全同,仅 sessionId 异),退化键按会话作用域会计两条;同 msg_id+ts+五桶+model 全同的重放副本合并为一条并在 notes 上报,五桶不同不合并。本机实测与 cc-switch 数据库明细及按其口径重算转录三方吻合(档案 01 §5.2 同步修订,新增重放 fixture;退化键去 ts 修复已随 0.2.0 发布,此处补记)。
+- 修复 **copilot 新版 created_at 时间戳漂移落 1970**:GitHub Copilot CLI 1.0.101 起 created_at 由 naive 秒值改为 RFC3339 带时区格式,旧解析固定按秒折算致新行全部漂移到 1970;现 `assistant_usage_events` 通道双格式解析+不可辨值跳过计数,Windows 实库复验 by_day 归位且五桶逐位不变。PARSER_VERSION 升至 18(并入 Windows 适配线各解析语义变更),升级后首轮扫描自动全量重建增量库。
+
 - 前序 v2 迁移删除从未被读取的三列（`source_objects.audit_generation/audit_offset/audit_digest`）与从未启用的小时粒度汇总规格（`usage_rollups.hour_cache_revision`、`grain='hour'`）；旧 v1 库在下一次写打开（serve/refresh）时自动原地迁移，全部事实与忘记规则保留。定期审计对已封印且未变化的文件改为纯前缀哈希校验（不再整文件重解析），指纹不匹配或无封印时仍走完整重读；README 移除"小时缓存可以淘汰"的失实承诺（review R-16）。
 - `ledger init --timezone` 缺省改取系统时区（iana-time-zone 推断，经 chrono-tz 校验；推断失败时要求显式指定）；未初始化时 report 及显式 temporary serve 的临时库同样按系统时区折算日界，推断失败才回退 UTC 并提示。此前三处硬编码 `Asia/Shanghai`，非东八区用户日界切分错误且静默固化（review R-11）。
 

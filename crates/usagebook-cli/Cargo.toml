@@ -25,3 +25,5 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 regex = "1"
+# R-11 测试在 Windows 上与同进程系统时区推断对账(TZ 伪造仅 Unix 生效)
+iana-time-zone = "0.1"

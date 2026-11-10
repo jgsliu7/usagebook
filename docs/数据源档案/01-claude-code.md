@@ -81,7 +81,7 @@
 
 1. **每轮 cache_read 回放是真实计费**(上下文重放),不是重复——但累加会让"输入总量"巨大,展示必须分列。
 2. **去重键三层设计**(照抄 ccusage `rust/adapters/claude/src/lib.rs`,自有命名):
-   - **精确键**(:348-362):`hash(message_id, request_id)`;**仅当 request_id 缺失**时退化为追加 `hash(session_id, timestamp)`(:357-360)——网关会复用 message_id,无 request id 必须按会话+时间收窄。
+   - **精确键**(:348-362):`hash(message_id, request_id)`;**仅当 request_id 缺失**时退化为 `hash(session_id, message_id)`(**2026-10-19 修订**,原 v1 为追加 `hash(session_id, timestamp)` 收窄):同一请求的流式快照行共享 message.id 但 timestamp 毫秒级互异,掺 ts 会把快照裂成多键双计——本机 GLM/k3 兼容网关转录 99.7% 无 requestId,实测总量虚高 2.04 倍(10 月 1,296.7M → 修正 642.0M,与参考实现按 message.id 聚块口径吻合)。快照行五桶相同或 output 递增,同键大者胜即选出终值。真实撞键(网关复用 message_id)由碰撞观察上报:ts 差>60s 且五桶不同才计 `key_clash`,快照补全(ts 差小或五桶相同)不误报。**跨会话重放合并**(同日修订):resume/fork 会把父消息原样重放进新会话文件(msg_id、ts、五桶、model 全同,仅 sessionId 异),退化键按会话作用域会双计;同 msg_id+ts+五桶+model 全同的退化键候选视为同一响应重放,保留一条(本机实测 49 条,占 0.30%),合并数在 ScanStats.notes 上报;五桶不同的同 msg_id 不合并(真实请求)。
    - **sidechain-replay 路由键**(:364-370):固定串 + message_id + session_id——sidechain 日志会以**新 request id 重放父消息**,精确键打不中,该键跨 request id 匹配。
    - **sidechain-replay-entry 索引键**(:373-379):只索引 sidechain 条目,父候选查它避免全量扫描。
    - 替换规则 `should_replace_deduped_entry`(:198-212):sidechain vs 父——**父胜**;token 总量大者胜;平手时带 `usage.speed` 者胜。跨会话副本幸存时为两个 session_id 各补 alias 桶(:273-286)。

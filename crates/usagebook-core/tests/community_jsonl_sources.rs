@@ -1,7 +1,7 @@
 //! Community 源 JSONL 通道 fixture 测试(qwen 月度通道 升级 §7.2)。
 //! 路径注入,不依赖本机安装。
 
-use usagebook_core::sources::qwen;
+use usagebook_core::sources::{qoder, qwen};
 use usagebook_core::UsageSource;
 
 fn temp_root(tag: &str) -> std::path::PathBuf {
@@ -101,5 +101,48 @@ fn qwen_chats_fallback() {
         ),
         (70, 30, 30, 20)
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// qoder CLI 通道:全 0 usage 行跳过(本机实证现状:qfmodel 不下发计数),
+/// 非零 usage 五桶直通 + chatcmpl 去重键(§3;未来网关下发 token 即生效)。
+#[test]
+fn qoder_cli_jsonl() {
+    let root = temp_root("qoder-cli");
+    let proj = root.join("projects/d--dev-demo");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("6f1a2b3c-0000-4000-8000-000000000001.jsonl"),
+        concat!(
+            r#"{"type":"runtime-config","sessionId":"s1","model":"qfmodel","reasoningEffort":"low","timestamp":1792461189309}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-10-20T02:09:31.000Z","message":{"id":"chatcmpl-zero","role":"assistant","model":"qfmodel","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-10-20T02:09:35.000Z","message":{"id":"chatcmpl-demo2","role":"assistant","model":"qfmodel","usage":{"input_tokens":120,"cache_creation_input_tokens":30,"cache_read_input_tokens":80,"output_tokens":45}}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-10-20T02:09:36.000Z","message":{"role":"user","content":[]}}"#,
+        ),
+    )
+    .unwrap();
+
+    // discover_roots 推入的是 projects 目录,测试按同口径注入
+    let (records, stats) =
+        qoder::QoderSource.scan_roots(std::slice::from_ref(&root.join("projects")), None);
+    assert_eq!(
+        records.len(),
+        1,
+        "全 0 usage 行与非 assistant 行跳过;notes: {:?}",
+        stats.notes
+    );
+    let r = &records[0];
+    // 五桶直通,无减除(§3)
+    assert_eq!(
+        (r.input_uncached, r.cache_read, r.cache_write, r.output),
+        (120, 80, 30, 45)
+    );
+    assert_eq!(r.dedup_key, "qoder:chatcmpl-demo2");
+    assert_eq!(r.model, "qfmodel");
+    // session_id 取转录文件名 stem(§3)
+    assert_eq!(r.session_id, "6f1a2b3c-0000-4000-8000-000000000001");
     let _ = std::fs::remove_dir_all(root);
 }
