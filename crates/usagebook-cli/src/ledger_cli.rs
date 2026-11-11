@@ -116,6 +116,13 @@ pub enum LedgerCommand {
         #[command(flatten)]
         confirm: Confirm,
     },
+    /// 重置某 live 源的历史只增不减守卫基线:该源下一次成功发布将成为新
+    /// 基线(不做保留),warning 留 GUARD_REBASED 痕。用于人工纠错等合法下修。
+    /// (缺陷档案 20261110-live路由源历史用量可缩水,方案 v2 白名单③)
+    GuardReset {
+        #[arg(long)]
+        source: String,
+    },
     Check,
 }
 #[derive(Args)]
@@ -483,6 +490,17 @@ fn execute(command: LedgerCommand) -> usagebook_core::ledger::Result<()> {
         }
         LedgerCommand::Unsuppress { rule_id, confirm } => {
             json!(Maintenance::open(&path)?.unsuppress(rule_id, confirm.token())?)
+        }
+        LedgerCommand::GuardReset { source } => {
+            use usagebook_core::ledger::db::Ledger;
+            let ledger = Ledger::open(&path, true)?;
+            ledger.connection().execute(
+                "INSERT INTO ledger_runtime_state(state_key,value_json) VALUES(?1,'{\"pending\":true}')
+                 ON CONFLICT(state_key) DO UPDATE SET value_json=excluded.value_json",
+                [format!("guard/rebase/{source}")],
+            )?;
+            json!({"source":source,"guard_reset":true,
+                   "note":"该源下一次成功发布将成为守卫新基线(留 GUARD_REBASED 痕)"})
         }
         LedgerCommand::Check => {
             Maintenance::open(&path)?.check()?;

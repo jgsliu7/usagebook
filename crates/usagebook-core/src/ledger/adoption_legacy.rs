@@ -410,6 +410,10 @@ impl Ledger {
                         status["state"] = json!("ready");
                         status["error"] = Value::Null;
                         status["last_success_ms"] = json!(now_ms());
+                    } else if result["reason"] == "NATIVE_ONLY_CONFIRM_REQUIRED" {
+                        // P1b:native-only 非零被拦,预览已存;等显式确认。
+                        status["state"] = json!("confirm_required");
+                        status["error"] = json!("NATIVE_ONLY_CONFIRM_REQUIRED");
                     } else {
                         status["state"] = previous["state"].clone();
                         status["error"] = previous["error"].clone();
@@ -453,7 +457,17 @@ impl Ledger {
         let frozen = token
             .map(|token| load_preview(&tx, source, token))
             .transpose()?;
-        let result = adopt(&tx, snapshot, source, token, frozen.as_ref(), None)?;
+        // P1b(缺陷档案 20261110):被 NATIVE_ONLY_CONFIRM_REQUIRED 拦下的自动续接
+        // 预览携带 lower=续接 cutoff;显式 apply 必须沿用该 lower 走续接闸门
+        // (prior 检查放行、区间重叠与身份一致性照常),否则确认出口断裂。
+        let result = adopt(
+            &tx,
+            snapshot,
+            source,
+            token,
+            frozen.as_ref(),
+            frozen.as_ref().and_then(|frozen| frozen.lower),
+        )?;
         tx.commit()?;
         Ok(result)
     }
@@ -962,6 +976,33 @@ fn adopt(
                 token: preview_token.clone(),
             },
         )?;
+        return Ok(result);
+    }
+    // P1b(缺陷档案 20261110-live路由源历史用量可缩水,方案 v2):自动续接冻结前
+    // 校验。已保存的 native 日/模型桶在本轮 live 重扫中消失(疑似源侧清理/收敛)
+    // 且含非零指标时,不再后台静默整段替换(那会把已入库事件 retire 成
+    // unresolved 并以 live 重扫值冻结——历史缩水且无守卫),改为保存预览、
+    // 待显式 token 确认后走同一 apply 流程。零差额桶不受影响,自动续接维持。
+    if token.is_none()
+        && lower.is_some()
+        && native_only.iter().any(|bucket| bucket.selected_events > 0)
+    {
+        save_preview(
+            c,
+            &FrozenPreview {
+                source: source.into(),
+                cutoff,
+                lower,
+                buckets: values,
+                token: preview_token.clone(),
+            },
+        )?;
+        result["reason"] = json!("NATIVE_ONLY_CONFIRM_REQUIRED");
+        if let Some(warnings) = result["warnings"].as_array_mut() {
+            warnings.push(json!(
+                "native-only 桶含非零指标:已保存历史在本轮 live 重扫中消失,自动续接已暂停;请核对预览后以 preview_token 显式确认应用"
+            ));
+        }
         return Ok(result);
     }
     if let Some(token) = token {
