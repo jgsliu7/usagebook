@@ -12,7 +12,7 @@ use tiny_http::{Header, Method, Response};
 use transport::{Connection, Request};
 use usagebook_core::ledger::{
     db,
-    legacy::{LegacySnapshot, LegacySourceStatus},
+    legacy::{LegacyEntry, LegacySnapshot, LegacySourceStatus},
     query::{ModelCatalogCache, QueryService},
     query_types::{CatalogRequest, QueryRequest, MAX_BODY},
     types::{new_epoch, now_ms},
@@ -145,6 +145,257 @@ fn begins_history_cycle(scan: Option<bool>, backlog: bool) -> bool {
 /// serve 失败源合并(2026-10-28 合流:判据与回滚为远端演进版,自扫描闭包提取保持可测)。
 /// 输入容器缺失先标失败;stale/error 源回滚为上一轮完整读,上一轮无完整时间戳则
 /// 不回滚(失败不得伪装成成功空读);诊断计数与 warning 随上一轮保留。
+/// P1(缺陷档案 20261110-live路由源历史用量可缩水,方案 v2):live 路由源的
+/// 历史只增不减守卫入口。纳入条件:route=live 且非 claude(已有更强的
+/// protect_claude_capture 条目级保护,双守卫会互相干扰)且非 ccswitch-rollup
+/// (诊断日行不进总量,load_ccswitch_at 独立入口)。重基触发:PARSER_VERSION
+/// 变更(解析修正可合法下修,留 GUARD_REBASED 痕)、账本时区变更(日界口径
+/// 变了,旧按日基线不可比)、显式豁免(ledger guard-reset,一次性核销)。
+/// 守卫状态存 ledger_runtime_state('guard/state' 与 'guard/rebase/<source>')。
+fn guard_history(
+    snapshot: &mut LegacySnapshot,
+    previous: &LegacySnapshot,
+    conn: &rusqlite::Connection,
+) -> usagebook_core::ledger::query_types::QueryResult<std::collections::BTreeMap<String, usize>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use usagebook_core::ledger::query_types::{QueryError, QueryResult};
+    fn state_row(conn: &rusqlite::Connection, key: &str) -> QueryResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT value_json FROM ledger_runtime_state WHERE state_key=?1",
+            [key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| QueryError::new("LEDGER_UNREADABLE", format!("guard state read failed: {e}")))
+    }
+    let mut eligible = BTreeSet::new();
+    {
+        let mut st = conn.prepare(
+            "SELECT report_source, MIN(route), MAX(route) FROM source_roots GROUP BY report_source",
+        )?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let source: String = r.get(0)?;
+            let lo: String = r.get(1)?;
+            let hi: String = r.get(2)?;
+            if lo == hi && lo == "live" && source != "claude" && source != "ccswitch-rollup" {
+                eligible.insert(source);
+            }
+        }
+    }
+    if eligible.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let stored = state_row(conn, "guard/state")?;
+    let stored_json: Option<serde_json::Value> =
+        stored.and_then(|value| serde_json::from_str(&value).ok());
+    let generation = usagebook_core::store::PARSER_VERSION.to_string();
+    let timezone: Option<String> = conn
+        .query_row("SELECT report_timezone FROM ledger_meta", [], |r| r.get(0))
+        .ok();
+    let generation_changed = stored_json
+        .as_ref()
+        .and_then(|value| value.get("generation"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|stored| stored != generation);
+    let timezone_changed = stored_json
+        .as_ref()
+        .and_then(|value| value.get("timezone"))
+        .and_then(|value| value.as_str())
+        .zip(timezone.as_deref())
+        .is_some_and(|(stored, current)| stored != current);
+    let mut rebase = BTreeSet::new();
+    if generation_changed || timezone_changed {
+        rebase = eligible.clone();
+    }
+    for source in &eligible {
+        let key = format!("guard/rebase/{source}");
+        if state_row(conn, &key)?.is_some() {
+            // 评审E-B P1①:豁免标记只在"本轮有新鲜成功读"的源上核销——失败/
+            // 回滚轮不消耗标记,保证重基绑定的是首次成功发布。
+            let fresh_ok = snapshot.sources.get(source.as_str()).is_some_and(|status| {
+                status.last_scanned_ms.is_some() && !status.stale && status.error.is_none()
+            });
+            if fresh_ok {
+                conn.execute("DELETE FROM ledger_runtime_state WHERE state_key=?1", [key])?;
+                rebase.insert(source.clone());
+            }
+        }
+    }
+    let mut guarded = match snapshot.monotonic_history_guard(previous, conn, &eligible, &rebase) {
+        Ok(guarded) => guarded,
+        Err(error) => {
+            // 评审D-A P1②:守卫执行失败按失败闭锁——eligible 源本轮回滚为
+            // 上一轮已发布条目(与 merge_failed_sources 同款保留),绝不把
+            // 未经守卫的变少读发布出去;增长下轮照常生效。回滚纯内存,不再失败。
+            tracing::warn!("历史只增不减守卫执行失败,本轮 eligible 源按旧值保留:{error}");
+            for source in &eligible {
+                snapshot
+                    .entries
+                    .retain(|entry| entry.report_source() != source.as_str());
+                snapshot.entries.extend(
+                    previous
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.report_source() == source.as_str())
+                        .cloned(),
+                );
+                if let Some(status) = snapshot.sources.get_mut(source.as_str()) {
+                    status.warning = Some("GUARD_UNAVAILABLE_RETAINED".into());
+                }
+            }
+            BTreeMap::new()
+        }
+    };
+    // 告警转移过滤:变小的读每轮都会被检测与保留(数据防线是硬性的),但只在
+    // warning 文本相对上一轮发布发生变化时才计入返回值——持续的已守卫状态
+    // 不重复告警(评审C:防每轮重报的告警疲劳)。
+    guarded.retain(|source, _| {
+        let before = previous
+            .sources
+            .get(source)
+            .and_then(|status| status.warning.clone());
+        let after = snapshot
+            .sources
+            .get(source)
+            .and_then(|status| status.warning.clone());
+        before != after
+    });
+    // P3:按日摘要巡检跟随守卫,对守卫后的最终快照生效;claude 不入守卫
+    // (有自己的条目级保护层)但入巡检(缺日级告警)。
+    let mut digest_sources = eligible.clone();
+    digest_sources.insert("claude".into());
+    if let Some(tz) = timezone.as_deref() {
+        day_digest_patrol(snapshot, conn, tz, &digest_sources);
+    }
+    let state = serde_json::json!({"generation": generation, "timezone": timezone});
+    conn.execute(
+        "INSERT INTO ledger_runtime_state(state_key,value_json) VALUES('guard/state',?1)
+         ON CONFLICT(state_key) DO UPDATE SET value_json=excluded.value_json",
+        [state.to_string()],
+    )?;
+    Ok(guarded)
+}
+
+/// P3(缺陷档案 20261110,方案 v2):按日单调巡检——只读告警,不做任何数据决策。
+/// 对 live 路由源(含 claude:它有条目级保护层但缺日级告警)按(源×本地日)
+/// 记录请求条数与六桶合计摘要于 ledger_runtime_state('guard/digest/<source>'),
+/// 每轮与上轮比对,发现下降即 tracing::warn 并记入 'guard/day-alerts'(留最近
+/// 100 条)。这是 P1 条目级守卫之外的纵深防御,也覆盖 P1 落地前的历史。
+fn day_digest_patrol(
+    snapshot: &LegacySnapshot,
+    conn: &rusqlite::Connection,
+    timezone: &str,
+    sources: &std::collections::BTreeSet<String>,
+) {
+    let patrol = || -> usagebook_core::ledger::query_types::QueryResult<()> {
+        use usagebook_core::ledger::query_types::QueryError;
+        let zone = usagebook_core::ledger::metrics::timezone(timezone)
+            .map_err(|e| QueryError::new("LEDGER_UNREADABLE", format!("patrol tz: {e}")))?;
+        let mut digests: BTreeMap<String, BTreeMap<String, (i64, i64)>> = BTreeMap::new();
+        for entry in &snapshot.entries {
+            let source = entry.report_source();
+            if !sources.contains(source) {
+                continue;
+            }
+            if let LegacyEntry::Request { record, .. } = entry {
+                let day = chrono::DateTime::from_timestamp_millis(record.ts_ms)
+                    .map(|at| at.with_timezone(&zone).date_naive().to_string())
+                    .unwrap_or_else(|| "undated".into());
+                let tokens = (record.input_uncached
+                    + record.cache_read
+                    + record.cache_write
+                    + record.output
+                    + record.reasoning_output) as i64;
+                let day_map = digests.entry(source.to_owned()).or_default();
+                let cell = day_map.entry(day).or_insert((0i64, 0i64));
+                cell.0 += tokens;
+                cell.1 += 1;
+            }
+        }
+        let mut alerts: Vec<serde_json::Value> = conn
+            .query_row(
+                "SELECT value_json FROM ledger_runtime_state WHERE state_key='guard/day-alerts'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+            .and_then(|value| value.get("alerts").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        // 评审E-B P1②:保留最近 100 条(此前 truncate(len-100) 在 ≤100 时会清空)。
+        if alerts.len() > 100 {
+            alerts.drain(..alerts.len() - 100);
+        }
+        for (source, days) in &digests {
+            let key = format!("guard/digest/{source}");
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT value_json FROM ledger_runtime_state WHERE state_key=?1",
+                    [&key],
+                    |r| r.get(0),
+                )
+                .ok();
+            let previous_days: serde_json::Map<String, serde_json::Value> = stored
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            for (day, (tokens, requests)) in days {
+                if let Some(previous) = previous_days.get(day) {
+                    let old_tokens = previous.get("tokens").and_then(|v| v.as_i64());
+                    let old_requests = previous.get("requests").and_then(|v| v.as_i64());
+                    if old_tokens.is_some_and(|old| *tokens < old)
+                        || old_requests.is_some_and(|old| *requests < old)
+                    {
+                        tracing::warn!(
+                            "按日单调巡检:{source} {day} 摘要下降 tokens {old_tokens:?}->{tokens} requests {old_requests:?}->{requests}"
+                        );
+                        alerts.push(serde_json::json!({
+                            "source":source,"day":day,"tokens":{"from":old_tokens,"to":tokens},
+                            "requests":{"from":old_requests,"to":requests},
+                            "at_ms":usagebook_core::ledger::types::now_ms(),
+                        }));
+                    }
+                }
+            }
+            conn.execute(
+                "INSERT INTO ledger_runtime_state(state_key,value_json) VALUES(?1,?2)
+                 ON CONFLICT(state_key) DO UPDATE SET value_json=excluded.value_json",
+                rusqlite::params![
+                    key,
+                    serde_json::to_string(
+                        &days
+                            .iter()
+                            .map(|(day, (tokens, requests))| {
+                                (
+                                    day.clone(),
+                                    serde_json::json!({"tokens":tokens,"requests":requests}),
+                                )
+                            })
+                            .collect::<serde_json::Map<String, serde_json::Value>>()
+                    )
+                    .map_err(|e| QueryError::new(
+                        "LEDGER_UNREADABLE",
+                        format!("patrol encode: {e}")
+                    ))?
+                ],
+            )?;
+        }
+        let payload = serde_json::json!({"alerts":alerts});
+        conn.execute(
+            "INSERT INTO ledger_runtime_state(state_key,value_json) VALUES('guard/day-alerts',?1)
+             ON CONFLICT(state_key) DO UPDATE SET value_json=excluded.value_json",
+            rusqlite::params![payload.to_string()],
+        )?;
+        Ok(())
+    };
+    if let Err(error) = patrol() {
+        tracing::warn!("按日单调巡检本轮跳过:{error}");
+    }
+}
+
 /// `warning`(按源降级:该源有单条坏行被跳过)不在失败判据中:坏行降级的源保留
 /// 本轮新鲜好数据,不回滚(见 docs/features/20261023-live快照管线加固与查询提速)。
 fn merge_failed_sources(snapshot: &mut LegacySnapshot, previous_for_merge: &LegacySnapshot) {
@@ -595,6 +846,26 @@ fn run_inner(
                             // still containing old live rows. Merge only against the snapshot
                             // captured before that transition, and only for sources still live.
                             merge_failed_sources(&mut snapshot, &previous_for_merge);
+                            // P1(缺陷档案 20261110):live 源历史只增不减守卫——
+                            // 失败回滚之后、索引重建之前。仅 durable serve 生效
+                            // (transient/CLI 冷启无发布语义,守卫静默);守卫自身
+                            // 失败不阻断本轮发布(fail-open,只告警)。
+                            if writer.is_some() {
+                                match guard_history(&mut snapshot, &previous_for_merge, conn) {
+                                    Ok(counts) => {
+                                        for (source, count) in counts {
+                                            tracing::warn!(
+                                                "历史只增不减守卫:{source} 本轮 {count} 条变小的读已保留旧值"
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            "历史只增不减守卫本轮跳过(状态读取失败):{error}"
+                                        );
+                                    }
+                                }
+                            }
                             // 合并可能改动 entries(retain+extend),索引必须在其后、
                             // 指纹/publish 之前重建(方案 M2 双构建点之二)。后续
                             // ledger 续跑对 snapshot 条目只读,不再变动 entries。

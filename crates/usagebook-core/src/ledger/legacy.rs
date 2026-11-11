@@ -1169,6 +1169,268 @@ impl LegacySnapshot {
         Ok(())
     }
 
+    /// P1(缺陷档案 20261110-live路由源历史用量可缩水,方案 v2):live 路由源
+    /// "已发布历史只增不减"的条目级单调守卫。推广 claude 保护层先例
+    /// (protect_claude_capture 的 comparable+monotonic 语义)。previous 先过
+    /// 隐私删除谓词(白名单①:显式删除必须能缩小)。非重基源的 previous
+    /// Request/Day 条目默认保留(append-only);新条目按键匹配后身份相等且
+    /// 六桶全 >= 才替换(替换沿用旧 ts/日区间防日漂移),更小则保留旧值并经
+    /// sources.warning 留痕(warning 已编入指纹且有突变测试,不新增指纹字段;
+    /// SessionTotal 不入守卫,visit 空臂)。重基源(白名单②缓存代次变更/
+    /// 时区变更/③显式豁免)本轮新发布即为新基线,不保留旧条目,warning 留
+    /// GUARD_REBASED 痕。源整体从扫描消失(非失败回滚路径)时保留其历史并
+    /// 留痕,暂停≠删除。
+    ///
+    /// 只应在 serve 装配路径(merge_failed_sources 之后、build_index 之前)
+    /// 调用;失败源已由 merge_failed_sources 回滚,本守卫只管"成功但变少"。
+    /// 返回按源守卫计数(因变小而被保留旧值的条目数)。
+    pub fn monotonic_history_guard(
+        &mut self,
+        previous: &LegacySnapshot,
+        conn: &rusqlite::Connection,
+        eligible: &std::collections::BTreeSet<String>,
+        rebase: &std::collections::BTreeSet<String>,
+    ) -> QueryResult<BTreeMap<String, usize>> {
+        if eligible.is_empty()
+            && previous
+                .entries
+                .iter()
+                .all(|entry| self.sources.contains_key(entry.report_source()))
+        {
+            return Ok(BTreeMap::new());
+        }
+        let policy = CapturePrivacy::load(conn)?;
+        let mut guarded: BTreeMap<String, usize> = BTreeMap::new();
+        let mut changed = false;
+        // 源整体消失:保留历史(暂停/未发现≠删除),重基源除外。
+        for entry in &previous.entries {
+            let source = entry.report_source();
+            if self.sources.contains_key(source) || rebase.contains(source) {
+                continue;
+            }
+            if !policy.suppresses(conn, entry)? {
+                self.entries.push(entry.clone());
+                changed = true;
+                let status = self.sources.entry(source.to_owned()).or_default();
+                status.stale = true;
+                status.warning = Some("SOURCE_VANISHED_RETAINED".into());
+            }
+        }
+        for source in eligible {
+            let mut prev_entries: Vec<&LegacyEntry> = Vec::new();
+            for entry in previous
+                .entries
+                .iter()
+                .filter(|entry| entry.report_source() == source.as_str())
+            {
+                if !policy.suppresses(conn, entry)? {
+                    prev_entries.push(entry);
+                }
+            }
+            if prev_entries.is_empty() {
+                continue;
+            }
+            if rebase.contains(source) {
+                // 重基:新发布即基线,不保留旧条目;留痕可审计。
+                if let Some(status) = self.sources.get_mut(source.as_str()) {
+                    status.warning = Some("GUARD_REBASED".into());
+                }
+                changed = true;
+                continue;
+            }
+            let mut prev_requests: BTreeMap<&str, Vec<&LegacyEntry>> = BTreeMap::new();
+            let mut prev_days: BTreeMap<&str, Vec<&LegacyEntry>> = BTreeMap::new();
+            for entry in &prev_entries {
+                match entry {
+                    LegacyEntry::Request { record, .. } => prev_requests
+                        .entry(record.dedup_key.as_str())
+                        .or_default()
+                        .push(entry),
+                    LegacyEntry::Day(day) => prev_days
+                        .entry(day.row_key.as_str())
+                        .or_default()
+                        .push(entry),
+                    // SessionTotal 不入守卫:visit 空臂,不参与日/总量聚合。
+                    LegacyEntry::SessionTotal { .. } => {}
+                }
+            }
+            // 索引+决策两段式(同键多条见下):先收集 fresh 下标,再统一定夺,
+            // 避免边迭代 self.entries 边按 previous 引用改写。
+            let mut fresh_requests: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+            let mut fresh_days: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+            for (index, entry) in self.entries.iter().enumerate() {
+                if entry.report_source() != source.as_str() {
+                    continue;
+                }
+                match entry {
+                    LegacyEntry::Request { record, .. } => fresh_requests
+                        .entry(record.dedup_key.as_str())
+                        .or_default()
+                        .push(index),
+                    LegacyEntry::Day(day) => fresh_days
+                        .entry(day.row_key.as_str())
+                        .or_default()
+                        .push(index),
+                    LegacyEntry::SessionTotal { .. } => {}
+                }
+            }
+            let mut replacements: BTreeMap<usize, LegacyEntry> = BTreeMap::new();
+            let mut drops: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            let mut appends: Vec<LegacyEntry> = Vec::new();
+            let mut count = 0usize;
+            // 单键单条:可比且六桶全 >= 才替换(沿用旧 ts 防跨日漂移),更小保留旧值。
+            // 同键多条(任一侧):歧义键——参照 claude 先例"多条不自动裁决",保留
+            // previous 全组、丢弃 fresh 组,计数=被丢弃条数(不丢 previous 条目,
+            // 也不克隆同一旧条目造成双计)。
+            for (key, prev_vec) in &prev_requests {
+                let fresh = fresh_requests.get(key);
+                if fresh.is_none() {
+                    // previous 独有键(本轮扫描未再出现):append-only 保留全组。
+                    appends.extend(prev_vec.iter().map(|entry| (**entry).clone()));
+                    changed = true;
+                    continue;
+                }
+                let fresh_slice = fresh.unwrap();
+                if prev_vec.len() != 1 || fresh_slice.len() != 1 {
+                    // 歧义键:同键多条(任一侧)。
+                    drops.extend(fresh_slice.iter().copied());
+                    appends.extend(prev_vec.iter().map(|entry| (**entry).clone()));
+                    count += fresh_slice.len();
+                    changed = true;
+                    continue;
+                }
+                let old = prev_vec[0];
+                let index = fresh_slice[0];
+                let LegacyEntry::Request {
+                    record: old_record,
+                    native_tool: old_tool,
+                    namespace: old_namespace,
+                    known_fields: old_fields,
+                } = old
+                else {
+                    unreachable!("prev_requests 只收 Request");
+                };
+                let LegacyEntry::Request {
+                    record,
+                    native_tool,
+                    namespace,
+                    known_fields,
+                } = &self.entries[index]
+                else {
+                    unreachable!("fresh_requests 只收 Request");
+                };
+                // 与 claude 保护层同款可比性:身份字段相等才可比较。
+                let comparable = old_record.source == record.source
+                    && old_record.session_id == record.session_id
+                    && old_record.agent == record.agent
+                    && old_record.model == record.model
+                    && old_record.caliber == record.caliber
+                    && old_record.request_count == record.request_count
+                    && old_record.cost_usd == record.cost_usd
+                    && old_tool == native_tool
+                    && old_namespace == namespace
+                    && old_fields == known_fields;
+                let monotonic = record.input_uncached >= old_record.input_uncached
+                    && record.cache_read >= old_record.cache_read
+                    && record.cache_write >= old_record.cache_write
+                    && record.cache_write_1h >= old_record.cache_write_1h
+                    && record.output >= old_record.output
+                    && record.reasoning_output >= old_record.reasoning_output;
+                if comparable && monotonic {
+                    // 替换沿用旧 ts:dedup 键内容相同时时间不得漂移跨日。
+                    let mut grown = self.entries[index].clone();
+                    if let LegacyEntry::Request { record, .. } = &mut grown {
+                        record.ts_ms = old_record.ts_ms;
+                    }
+                    replacements.insert(index, grown);
+                } else {
+                    replacements.insert(index, (*old).clone());
+                    count += 1;
+                    changed = true;
+                }
+            }
+            for (key, prev_vec) in &prev_days {
+                let fresh = fresh_days.get(key);
+                if fresh.is_none() {
+                    appends.extend(prev_vec.iter().map(|entry| (**entry).clone()));
+                    changed = true;
+                    continue;
+                }
+                let fresh_slice = fresh.unwrap();
+                if prev_vec.len() != 1 || fresh_slice.len() != 1 {
+                    drops.extend(fresh_slice.iter().copied());
+                    appends.extend(prev_vec.iter().map(|entry| (**entry).clone()));
+                    count += fresh_slice.len();
+                    changed = true;
+                    continue;
+                }
+                let old = prev_vec[0];
+                let index = fresh_slice[0];
+                let LegacyEntry::Day(old_day) = old else {
+                    unreachable!("prev_days 只收 Day");
+                };
+                let LegacyEntry::Day(day) = &self.entries[index] else {
+                    unreachable!("fresh_days 只收 Day");
+                };
+                let comparable = old_day.native_tool == day.native_tool
+                    && old_day.namespace == day.namespace
+                    && old_day.model_key == day.model_key
+                    && old_day.native_date == day.native_date;
+                let monotonic =
+                    day.projection
+                        .iter()
+                        .zip(old_day.projection.iter())
+                        .all(|(new, old)| match (new, old) {
+                            (Some(new), Some(old)) => new >= old,
+                            (None, Some(_)) => false,
+                            _ => true,
+                        });
+                if comparable && monotonic {
+                    // 沿用旧日区间:日事实按本地日入账,区间漂移会跨日。
+                    let mut grown = self.entries[index].clone();
+                    if let LegacyEntry::Day(day) = &mut grown {
+                        day.start_ms = old_day.start_ms;
+                        day.end_ms = old_day.end_ms;
+                    }
+                    replacements.insert(index, grown);
+                } else {
+                    replacements.insert(index, (*old).clone());
+                    count += 1;
+                    changed = true;
+                }
+            }
+            // 应用次序:先就地替换(下标仍有效),再按位置丢弃歧义 fresh,最后追加。
+            for (index, entry) in replacements {
+                self.entries[index] = entry;
+            }
+            if !drops.is_empty() {
+                let mut position = 0usize;
+                let drops_ref = &drops;
+                self.entries.retain(|_| {
+                    let keep = !drops_ref.contains(&position);
+                    position += 1;
+                    keep
+                });
+            }
+            self.entries.append(&mut appends);
+            if count > 0 {
+                guarded.insert(source.clone(), count);
+                if let Some(status) = self.sources.get_mut(source.as_str()) {
+                    let note = format!("DAY_SHRINK_GUARDED:{count}");
+                    status.warning = match status.warning.take() {
+                        Some(existing) => Some(format!("{existing};{note}")),
+                        None => Some(note),
+                    };
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation = super::types::new_epoch();
+        }
+        Ok(guarded)
+    }
+
     /// Apply only explicit source/time/native-day scopes. Preserve every field
     /// of retained records; unknown time is not guessed into a dated deletion.
     pub fn filter_suppressed(&mut self, conn: &rusqlite::Connection) -> QueryResult<usize> {
@@ -1898,6 +2160,306 @@ mod push_records_tests {
             .unwrap();
         assert_eq!(s.entries.len(), 1);
         assert!(s.sources["claude"].warning.is_none());
+    }
+}
+
+/// P1(缺陷档案 20261110-live路由源历史用量可缩水,方案 v2):
+/// live 源条目级单调守卫的语义锁定测试(评审C §6 清单关键项)。
+#[cfg(test)]
+mod monotonic_guard_tests {
+    use super::*;
+    use crate::model::{Caliber, UsageRecord};
+    use std::collections::BTreeSet;
+
+    fn qwen_rec(key: &str, input: u64, output: u64, ts: i64) -> UsageRecord {
+        UsageRecord {
+            source: "qwen",
+            session_id: "s".into(),
+            agent: None,
+            model: "m".into(),
+            ts_ms: ts,
+            caliber: Caliber::RequestDelta,
+            input_uncached: input,
+            cache_read: 0,
+            cache_write: 0,
+            cache_write_1h: 0,
+            output,
+            reasoning_output: 0,
+            cost_usd: None,
+            request_count: 1,
+            dedup_key: key.into(),
+        }
+    }
+    fn req(record: UsageRecord) -> LegacyEntry {
+        LegacyEntry::Request {
+            record,
+            native_tool: "qwen".into(),
+            namespace: None,
+            known_fields: 0,
+        }
+    }
+    fn snap_of(entries: Vec<LegacyEntry>) -> LegacySnapshot {
+        let mut s = LegacySnapshot::new("g".into(), "rh".into());
+        s.entries = entries;
+        s.sources.insert(
+            "qwen".into(),
+            LegacySourceStatus {
+                last_scanned_ms: Some(1),
+                stale: false,
+                error: None,
+                unaccounted_rows: 0,
+                unallocated_sessions: 0,
+                warning: None,
+            },
+        );
+        s
+    }
+    /// CapturePrivacy::load 只读这两张表;空规则集 = 无删除谓词。
+    fn guard_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE suppression_rules(rule_id INTEGER PRIMARY KEY,kind TEXT,report_source TEXT,native_tool TEXT,start_ms INTEGER,end_ms INTEGER);
+             CREATE TABLE adoption_forget_ranges(range_id INTEGER PRIMARY KEY,consumer_tool TEXT,start_ms INTEGER,end_ms INTEGER,identity_family TEXT);",
+        )
+        .unwrap();
+        conn
+    }
+    fn eligible() -> BTreeSet<String> {
+        BTreeSet::from(["qwen".into()])
+    }
+    fn buckets(entry: &LegacyEntry) -> (u64, u64, i64) {
+        let LegacyEntry::Request { record, .. } = entry else {
+            panic!("期望 Request 条目");
+        };
+        (record.input_uncached, record.output, record.ts_ms)
+    }
+
+    #[test]
+    fn shrinking_read_is_blocked_with_warning() {
+        let previous = snap_of(vec![req(qwen_rec("k1", 100, 10, 1_000))]);
+        let mut fresh = snap_of(vec![req(qwen_rec("k1", 50, 10, 1_000))]);
+        let guarded = fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(guarded.get("qwen"), Some(&1));
+        assert_eq!(buckets(&fresh.entries[0]), (100, 10, 1_000));
+        let warning = fresh.sources["qwen"].warning.as_deref().unwrap();
+        assert!(warning.contains("DAY_SHRINK_GUARDED:1"), "{warning}");
+    }
+
+    #[test]
+    fn growing_read_replaces_and_pins_ts() {
+        let previous = snap_of(vec![req(qwen_rec("k1", 100, 10, 1_000))]);
+        let mut fresh = snap_of(vec![req(qwen_rec("k1", 200, 20, 2_000))]);
+        fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        // 值取新,时间锚定旧(同 dedup 键的 ts 不得漂移跨日)。
+        assert_eq!(buckets(&fresh.entries[0]), (200, 20, 1_000));
+        assert!(fresh.sources["qwen"].warning.is_none());
+    }
+
+    #[test]
+    fn non_subset_change_retains_old_and_appends_new() {
+        // 旧 {k1,k2} → 新 {k3}:k1/k2 保留,k3 追加(非子集变化不冻结、不丢)。
+        let previous = snap_of(vec![
+            req(qwen_rec("k1", 100, 0, 1_000)),
+            req(qwen_rec("k2", 200, 0, 1_000)),
+        ]);
+        let mut fresh = snap_of(vec![req(qwen_rec("k3", 30, 0, 1_000))]);
+        fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        let mut keys: Vec<&str> = fresh
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                LegacyEntry::Request { record, .. } => record.dedup_key.as_str(),
+                _ => "?",
+            })
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["k1", "k2", "k3"]);
+    }
+
+    #[test]
+    fn second_round_keeps_data_stable_and_warning_steady() {
+        // 持续缩小的源:数据防线每轮生效(保留 100 不变、不重复追加),
+        // warning 文本稳定不叠加;每轮重告警由 serve 层转移过滤(guard_history)。
+        let previous = snap_of(vec![req(qwen_rec("k1", 100, 10, 1_000))]);
+        let mut fresh = snap_of(vec![req(qwen_rec("k1", 50, 10, 1_000))]);
+        let conn = guard_conn();
+        let round1 = fresh
+            .monotonic_history_guard(&previous, &conn, &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(round1.get("qwen"), Some(&1));
+        let warning1 = fresh.sources["qwen"].warning.clone();
+        let mut round2_input = snap_of(vec![req(qwen_rec("k1", 50, 10, 1_000))]);
+        round2_input
+            .monotonic_history_guard(&fresh, &conn, &eligible(), &BTreeSet::new())
+            .unwrap();
+        // 数据稳定:仍是一条、值仍是旧值,无重复追加、无漂移。
+        assert_eq!(round2_input.entries.len(), 1);
+        assert_eq!(buckets(&round2_input.entries[0]), (100, 10, 1_000));
+        // warning 稳定:文本不随轮次叠加。
+        assert_eq!(round2_input.sources["qwen"].warning, warning1);
+    }
+
+    #[test]
+    fn privacy_deletion_is_not_retained() {
+        // 白名单①:显式 source 删除规则下,previous 不被保留(删除必须能缩小)。
+        let conn = guard_conn();
+        conn.execute(
+            "INSERT INTO suppression_rules(kind,report_source) VALUES('source','qwen')",
+            [],
+        )
+        .unwrap();
+        let previous = snap_of(vec![req(qwen_rec("k1", 100, 10, 1_000))]);
+        let mut fresh = snap_of(vec![]);
+        fresh
+            .monotonic_history_guard(&previous, &conn, &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert!(fresh.entries.is_empty());
+        assert!(fresh.sources["qwen"].warning.is_none());
+    }
+
+    #[test]
+    fn rebase_takes_new_baseline_without_retention() {
+        // 白名单②③:重基源本轮新发布即基线,旧条目不保留,留 GUARD_REBASED 痕。
+        let previous = snap_of(vec![req(qwen_rec("k1", 100, 10, 1_000))]);
+        let mut fresh = snap_of(vec![req(qwen_rec("k1", 50, 10, 1_000))]);
+        fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &eligible())
+            .unwrap();
+        assert_eq!(buckets(&fresh.entries[0]), (50, 10, 1_000));
+        assert_eq!(
+            fresh.sources["qwen"].warning.as_deref(),
+            Some("GUARD_REBASED")
+        );
+    }
+
+    #[test]
+    fn day_entry_smaller_projection_is_retained() {
+        let day = |input: i64| {
+            LegacyEntry::Day(LegacyDay {
+                row_key: "d1".into(),
+                report_source: "qwen".into(),
+                native_tool: "qwen".into(),
+                namespace: None,
+                model_key: "m".into(),
+                model_display: "m".into(),
+                native_date: "2026-10-01".into(),
+                timezone: Some("Asia/Shanghai".into()),
+                start_ms: Some(1),
+                end_ms: Some(2),
+                projection: {
+                    let mut projection = [None; 10];
+                    projection[0] = Some(input);
+                    projection
+                },
+            })
+        };
+        let previous = snap_of(vec![day(100)]);
+        let mut fresh = snap_of(vec![day(40)]);
+        let guarded = fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(guarded.get("qwen"), Some(&1));
+        let LegacyEntry::Day(retained) = &fresh.entries[0] else {
+            panic!("期望 Day 条目");
+        };
+        assert_eq!(retained.projection[0], Some(100));
+    }
+
+    #[test]
+    fn session_total_is_not_guarded() {
+        // SessionTotal 不参与 visit 聚合,守卫不保留其历史(新扫描结果直通)。
+        let previous = snap_of(vec![LegacyEntry::SessionTotal {
+            record: qwen_rec("st1", 100, 0, 1_000),
+            known_fields: 0,
+            projection: None,
+            reason: None,
+        }]);
+        let mut fresh = snap_of(vec![]);
+        fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert!(fresh.entries.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_duplicate_keys_retain_previous_group_without_double_count() {
+        // 评审D-A P1①:同键多条(任一侧)是歧义键——保留 previous 全组、丢弃
+        // fresh 组并计数;不丢 previous 条目、也不把多条 fresh 都克隆成同一
+        // 旧条目造成双计。
+        let previous = snap_of(vec![
+            req(qwen_rec("k1", 100, 0, 1_000)),
+            req(qwen_rec("k1", 50, 0, 1_000)),
+        ]);
+        let mut fresh = snap_of(vec![
+            req(qwen_rec("k1", 30, 0, 1_000)),
+            req(qwen_rec("k1", 20, 0, 1_000)),
+        ]);
+        let guarded = fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(guarded.get("qwen"), Some(&2));
+        let mut values: Vec<u64> = fresh.entries.iter().map(|entry| buckets(entry).0).collect();
+        values.sort_unstable();
+        assert_eq!(values, vec![50, 100]);
+    }
+
+    #[test]
+    fn day_mixed_bucket_change_is_retained() {
+        // 评审D-A P2:新值某桶更大但另一桶丢失已知值(None < Some)——整体
+        // 不满足单调,保留旧投影。
+        let day_of = |projection: [Option<i64>; 10]| {
+            LegacyEntry::Day(LegacyDay {
+                row_key: "d1".into(),
+                report_source: "qwen".into(),
+                native_tool: "qwen".into(),
+                namespace: None,
+                model_key: "m".into(),
+                model_display: "m".into(),
+                native_date: "2026-10-01".into(),
+                timezone: Some("Asia/Shanghai".into()),
+                start_ms: Some(1),
+                end_ms: Some(2),
+                projection,
+            })
+        };
+        let mut old_projection = [None; 10];
+        old_projection[0] = Some(100);
+        old_projection[1] = Some(5);
+        let mut new_projection = [None; 10];
+        new_projection[0] = Some(200);
+        let previous = snap_of(vec![day_of(old_projection)]);
+        let mut fresh = snap_of(vec![day_of(new_projection)]);
+        let guarded = fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(guarded.get("qwen"), Some(&1));
+        let LegacyEntry::Day(retained) = &fresh.entries[0] else {
+            panic!("期望 Day 条目");
+        };
+        assert_eq!(retained.projection, old_projection);
+    }
+
+    #[test]
+    fn vanished_source_history_is_retained() {
+        // 源从扫描中整体消失(非失败回滚):历史保留,暂停≠删除。
+        let previous = snap_of(vec![req(qwen_rec("k1", 100, 10, 1_000))]);
+        let mut fresh = LegacySnapshot::new("g".into(), "rh".into());
+        fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(fresh.entries.len(), 1);
+        assert_eq!(buckets(&fresh.entries[0]), (100, 10, 1_000));
+        assert_eq!(
+            fresh.sources["qwen"].warning.as_deref(),
+            Some("SOURCE_VANISHED_RETAINED")
+        );
+        assert!(fresh.sources["qwen"].stale);
     }
 }
 
