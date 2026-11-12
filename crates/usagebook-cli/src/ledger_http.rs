@@ -145,6 +145,31 @@ fn begins_history_cycle(scan: Option<bool>, backlog: bool) -> bool {
 /// serve 失败源合并(2026-10-28 合流:判据与回滚为远端演进版,自扫描闭包提取保持可测)。
 /// 输入容器缺失先标失败;stale/error 源回滚为上一轮完整读,上一轮无完整时间戳则
 /// 不回滚(失败不得伪装成成功空读);诊断计数与 warning 随上一轮保留。
+/// live 路由源清单(MIN==MAX=live)。守卫与巡检共用。
+fn live_route_sources(
+    conn: &rusqlite::Connection,
+) -> usagebook_core::ledger::query_types::QueryResult<std::collections::BTreeSet<String>> {
+    use usagebook_core::ledger::query_types::QueryError;
+    let mut sources = std::collections::BTreeSet::new();
+    let mut st = conn
+        .prepare(
+            "SELECT report_source, MIN(route), MAX(route) FROM source_roots GROUP BY report_source",
+        )
+        .map_err(|e| QueryError::new("LEDGER_UNREADABLE", format!("route read failed: {e}")))?;
+    let mut rows = st
+        .query([])
+        .map_err(|e| QueryError::new("LEDGER_UNREADABLE", format!("route read failed: {e}")))?;
+    while let Some(r) = rows.next()? {
+        let source: String = r.get(0)?;
+        let lo: String = r.get(1)?;
+        let hi: String = r.get(2)?;
+        if lo == hi && lo == "live" {
+            sources.insert(source);
+        }
+    }
+    Ok(sources)
+}
+
 /// P1(缺陷档案 20261110-live路由源历史用量可缩水,方案 v2):live 路由源的
 /// 历史只增不减守卫入口。纳入条件:route=live 且非 claude(已有更强的
 /// protect_claude_capture 条目级保护,双守卫会互相干扰)且非 ccswitch-rollup
@@ -170,18 +195,9 @@ fn guard_history(
         .map_err(|e| QueryError::new("LEDGER_UNREADABLE", format!("guard state read failed: {e}")))
     }
     let mut eligible = BTreeSet::new();
-    {
-        let mut st = conn.prepare(
-            "SELECT report_source, MIN(route), MAX(route) FROM source_roots GROUP BY report_source",
-        )?;
-        let mut rows = st.query([])?;
-        while let Some(r) = rows.next()? {
-            let source: String = r.get(0)?;
-            let lo: String = r.get(1)?;
-            let hi: String = r.get(2)?;
-            if lo == hi && lo == "live" && source != "claude" && source != "ccswitch-rollup" {
-                eligible.insert(source);
-            }
+    for source in live_route_sources(conn)? {
+        if source != "claude" && source != "ccswitch-rollup" {
+            eligible.insert(source);
         }
     }
     if eligible.is_empty() {
@@ -262,13 +278,6 @@ fn guard_history(
             .and_then(|status| status.warning.clone());
         before != after
     });
-    // P3:按日摘要巡检跟随守卫,对守卫后的最终快照生效;claude 不入守卫
-    // (有自己的条目级保护层)但入巡检(缺日级告警)。
-    let mut digest_sources = eligible.clone();
-    digest_sources.insert("claude".into());
-    if let Some(tz) = timezone.as_deref() {
-        day_digest_patrol(snapshot, conn, tz, &digest_sources);
-    }
     let state = serde_json::json!({"generation": generation, "timezone": timezone});
     conn.execute(
         "INSERT INTO ledger_runtime_state(state_key,value_json) VALUES('guard/state',?1)
@@ -283,6 +292,9 @@ fn guard_history(
 /// 记录请求条数与六桶合计摘要于 ledger_runtime_state('guard/digest/<source>'),
 /// 每轮与上轮比对,发现下降即 tracing::warn 并记入 'guard/day-alerts'(留最近
 /// 100 条)。这是 P1 条目级守卫之外的纵深防御,也覆盖 P1 落地前的历史。
+/// 必须在发布点(protect_claude_capture 之后、快照重载为已提交版本时)调用:
+/// 2026-11-11 实测教训——若在扫描闭包(保护前)采样,claude 原始重扫的变少
+/// 会被保护层复原,巡检对"已发布数据"产生假告警(原始信号真实但口径错位)。
 fn day_digest_patrol(
     snapshot: &LegacySnapshot,
     conn: &rusqlite::Connection,
@@ -969,6 +981,27 @@ fn run_inner(
                                     if capture_changed {
                                         // A new capture can resolve a pending bucket.
                                         last_time_repair = None;
+                                    }
+                                    // P3 按日单调巡检:在此(保护后、已提交版)采样——
+                                    // 巡检的是"已发布数据",与看板口径一致。
+                                    let patrol_conn = ledger.connection();
+                                    let tz: Option<String> = patrol_conn
+                                        .query_row(
+                                            "SELECT report_timezone FROM ledger_meta",
+                                            [],
+                                            |r| r.get(0),
+                                        )
+                                        .ok();
+                                    if let Some(tz) = tz.as_deref() {
+                                        let mut digest_sources =
+                                            live_route_sources(patrol_conn).unwrap_or_default();
+                                        digest_sources.remove("ccswitch-rollup");
+                                        day_digest_patrol(
+                                            &snapshot,
+                                            patrol_conn,
+                                            tz,
+                                            &digest_sources,
+                                        );
                                     }
                                 }
                                 Ok(None) => error = Some("CAPTURE_READ_FAILED".into()),
