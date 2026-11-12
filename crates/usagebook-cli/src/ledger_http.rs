@@ -170,13 +170,14 @@ fn live_route_sources(
     Ok(sources)
 }
 
-/// P1(缺陷档案 20261110-live路由源历史用量可缩水,方案 v2):live 路由源的
-/// 历史只增不减守卫入口。纳入条件:route=live 且非 claude(已有更强的
+/// P1+日锁(缺陷档案 20261110;用户约定 2026-11-12):live 路由源历史
+/// 锁死+只增不减守卫入口。纳入条件:route=live 且非 claude(已有更强的
 /// protect_claude_capture 条目级保护,双守卫会互相干扰)且非 ccswitch-rollup
-/// (诊断日行不进总量,load_ccswitch_at 独立入口)。重基触发:PARSER_VERSION
-/// 变更(解析修正可合法下修,留 GUARD_REBASED 痕)、账本时区变更(日界口径
-/// 变了,旧按日基线不可比)、显式豁免(ledger guard-reset,一次性核销)。
-/// 守卫状态存 ledger_runtime_state('guard/state' 与 'guard/rebase/<source>')。
+/// (诊断日行不进总量,load_ccswitch_at 独立入口)。锁判据与单调语义见
+/// `LegacySnapshot::monotonic_history_guard`——守卫无持久状态,豁免只有
+/// ledger guard-reset 人工凭证('guard/rebase/<source>',一次性核销)。
+/// 2026-11-12 随用户约定取消"算法升版/时区重基"通道:历史一经采集即锁死,
+/// 新解析只影响未锁日与新源。
 fn guard_history(
     snapshot: &mut LegacySnapshot,
     previous: &LegacySnapshot,
@@ -203,28 +204,7 @@ fn guard_history(
     if eligible.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let stored = state_row(conn, "guard/state")?;
-    let stored_json: Option<serde_json::Value> =
-        stored.and_then(|value| serde_json::from_str(&value).ok());
-    let generation = usagebook_core::store::PARSER_VERSION.to_string();
-    let timezone: Option<String> = conn
-        .query_row("SELECT report_timezone FROM ledger_meta", [], |r| r.get(0))
-        .ok();
-    let generation_changed = stored_json
-        .as_ref()
-        .and_then(|value| value.get("generation"))
-        .and_then(|value| value.as_str())
-        .is_some_and(|stored| stored != generation);
-    let timezone_changed = stored_json
-        .as_ref()
-        .and_then(|value| value.get("timezone"))
-        .and_then(|value| value.as_str())
-        .zip(timezone.as_deref())
-        .is_some_and(|(stored, current)| stored != current);
     let mut rebase = BTreeSet::new();
-    if generation_changed || timezone_changed {
-        rebase = eligible.clone();
-    }
     for source in &eligible {
         let key = format!("guard/rebase/{source}");
         if state_row(conn, &key)?.is_some() {
@@ -278,12 +258,6 @@ fn guard_history(
             .and_then(|status| status.warning.clone());
         before != after
     });
-    let state = serde_json::json!({"generation": generation, "timezone": timezone});
-    conn.execute(
-        "INSERT INTO ledger_runtime_state(state_key,value_json) VALUES('guard/state',?1)
-         ON CONFLICT(state_key) DO UPDATE SET value_json=excluded.value_json",
-        [state.to_string()],
-    )?;
     Ok(guarded)
 }
 

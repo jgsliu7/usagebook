@@ -1169,21 +1169,22 @@ impl LegacySnapshot {
         Ok(())
     }
 
-    /// P1(缺陷档案 20261110-live路由源历史用量可缩水,方案 v2):live 路由源
-    /// "已发布历史只增不减"的条目级单调守卫。推广 claude 保护层先例
-    /// (protect_claude_capture 的 comparable+monotonic 语义)。previous 先过
-    /// 隐私删除谓词(白名单①:显式删除必须能缩小)。非重基源的 previous
-    /// Request/Day 条目默认保留(append-only);新条目按键匹配后身份相等且
-    /// 六桶全 >= 才替换(替换沿用旧 ts/日区间防日漂移),更小则保留旧值并经
-    /// sources.warning 留痕(warning 已编入指纹且有突变测试,不新增指纹字段;
-    /// SessionTotal 不入守卫,visit 空臂)。重基源(白名单②缓存代次变更/
-    /// 时区变更/③显式豁免)本轮新发布即为新基线,不保留旧条目,warning 留
-    /// GUARD_REBASED 痕。源整体从扫描消失(非失败回滚路径)时保留其历史并
-    /// 留痕,暂停≠删除。
+    /// P1/P1锁死(缺陷档案 20261110;用户约定 2026-11-12):live 路由源
+    /// "已采集历史锁死,只增不减"。推广 claude 保护层先例(comparable+
+    /// monotonic 语义)并叠加**日锁**:某源上次成功完整扫描落在 D 日,则
+    /// 该源 D 日之前的一切视为已锁死——本轮扫描对锁定日的任何版本(更大
+    /// 也一样)一律不采纳,previous 原样保留,被忽略条目计数留痕
+    /// LOCKED_DAY_IGNORED。算法升版不改历史(原白名单②随约定取消):新解析
+    /// 只影响未锁日与新源回填。未锁日沿用条目级单调:previous 默认保留
+    /// (append-only),新条目按键匹配后身份相等且六桶全 >= 才替换(替换
+    /// 沿用旧 ts/日区间防日漂移),更小保留旧值留痕 DAY_SHRINK_GUARDED。
+    /// previous 先过隐私删除谓词(锁定不挡显式删除)。人工豁免(rebase)
+    /// 本轮新发布即基线,留 GUARD_REBASED 痕。SessionTotal 不入守卫;
+    /// 源整体消失保留历史(暂停≠删除)。
     ///
     /// 只应在 serve 装配路径(merge_failed_sources 之后、build_index 之前)
-    /// 调用;失败源已由 merge_failed_sources 回滚,本守卫只管"成功但变少"。
-    /// 返回按源守卫计数(因变小而被保留旧值的条目数)。
+    /// 调用;失败源已由 merge_failed_sources 回滚。返回按源干预计数
+    /// (锁死忽略+变小保留)。
     pub fn monotonic_history_guard(
         &mut self,
         previous: &LegacySnapshot,
@@ -1200,6 +1201,18 @@ impl LegacySnapshot {
             return Ok(BTreeMap::new());
         }
         let policy = CapturePrivacy::load(conn)?;
+        let tz: Option<String> = conn
+            .query_row("SELECT report_timezone FROM ledger_meta", [], |r| r.get(0))
+            .ok();
+        // 锁的判据无状态:扫描时刻所在本地日的零点即锁线,ts 是绝对毫秒,
+        // 不依赖日界重算(时区变更最多挪动锁线数小时,无需重基)。
+        let day_start = |ts_ms: i64| -> Option<i64> {
+            let zone = super::metrics::timezone(tz.as_deref()?).ok()?;
+            let date = chrono::DateTime::from_timestamp_millis(ts_ms)?
+                .with_timezone(&zone)
+                .date_naive();
+            super::metrics::date_boundary(zone, date).ok()
+        };
         let mut guarded: BTreeMap<String, usize> = BTreeMap::new();
         let mut changed = false;
         // 源整体消失:保留历史(暂停/未发现≠删除),重基源除外。
@@ -1231,16 +1244,63 @@ impl LegacySnapshot {
                 continue;
             }
             if rebase.contains(source) {
-                // 重基:新发布即基线,不保留旧条目;留痕可审计。
+                // 人工豁免:新发布即基线,不保留旧条目;留痕可审计。
                 if let Some(status) = self.sources.get_mut(source.as_str()) {
                     status.warning = Some("GUARD_REBASED".into());
                 }
                 changed = true;
                 continue;
             }
+            // 日锁分区:锁定线=上次成功完整扫描所在本地日零点。
+            let horizon = previous
+                .sources
+                .get(source.as_str())
+                .and_then(|status| status.last_scanned_ms)
+                .and_then(day_start)
+                .unwrap_or(i64::MIN);
+            let is_locked = |entry: &LegacyEntry| match entry {
+                LegacyEntry::Request { record, .. } => record.ts_ms < horizon,
+                LegacyEntry::Day(day) => day.end_ms.is_some_and(|end| end <= horizon),
+                LegacyEntry::SessionTotal { .. } => false,
+            };
+            let mut replacements: BTreeMap<usize, LegacyEntry> = BTreeMap::new();
+            let mut drops: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            let mut appends: Vec<LegacyEntry> = Vec::new();
+            let mut count = 0usize;
+            let mut locked_ignored = 0usize;
+            // 锁定日:previous 原样保留;本轮新读一律不采纳(计数留痕)。
+            // 同时收集锁定侧的身份键(评审F P1):同一请求若漂移到开放日
+            // (dedup_key/row_key 复用但 ts 越过锁线),其身份已在锁定历史
+            // 入账,开放侧的新副本必须丢弃,否则永久双计。
+            let mut locked_request_keys: std::collections::BTreeSet<&str> =
+                std::collections::BTreeSet::new();
+            let mut locked_day_keys: std::collections::BTreeSet<&str> =
+                std::collections::BTreeSet::new();
+            let open_prev: Vec<&LegacyEntry> = prev_entries
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    if is_locked(entry) {
+                        match entry {
+                            LegacyEntry::Request { record, .. } => {
+                                locked_request_keys.insert(record.dedup_key.as_str());
+                            }
+                            LegacyEntry::Day(day) => {
+                                locked_day_keys.insert(day.row_key.as_str());
+                            }
+                            LegacyEntry::SessionTotal { .. } => {}
+                        }
+                        appends.push((**entry).clone());
+                        changed = true;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
             let mut prev_requests: BTreeMap<&str, Vec<&LegacyEntry>> = BTreeMap::new();
             let mut prev_days: BTreeMap<&str, Vec<&LegacyEntry>> = BTreeMap::new();
-            for entry in &prev_entries {
+            for entry in &open_prev {
                 match entry {
                     LegacyEntry::Request { record, .. } => prev_requests
                         .entry(record.dedup_key.as_str())
@@ -1255,11 +1315,33 @@ impl LegacySnapshot {
                 }
             }
             // 索引+决策两段式(同键多条见下):先收集 fresh 下标,再统一定夺,
-            // 避免边迭代 self.entries 边按 previous 引用改写。
+            // 避免边迭代 self.entries 边按 previous 引用改写。锁定日的新读
+            // 直接进 drops(计数留痕),不参与匹配。
             let mut fresh_requests: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
             let mut fresh_days: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
             for (index, entry) in self.entries.iter().enumerate() {
                 if entry.report_source() != source.as_str() {
+                    continue;
+                }
+                if is_locked(entry) {
+                    drops.insert(index);
+                    locked_ignored += 1;
+                    changed = true;
+                    continue;
+                }
+                // 跨锁线漂移的重复身份(评审F P1):已入锁定历史的键在开放
+                // 侧再现 = 同一请求的副本,丢弃计数,防永久双计。
+                let locked_duplicate = match entry {
+                    LegacyEntry::Request { record, .. } => {
+                        locked_request_keys.contains(record.dedup_key.as_str())
+                    }
+                    LegacyEntry::Day(day) => locked_day_keys.contains(day.row_key.as_str()),
+                    LegacyEntry::SessionTotal { .. } => false,
+                };
+                if locked_duplicate {
+                    drops.insert(index);
+                    locked_ignored += 1;
+                    changed = true;
                     continue;
                 }
                 match entry {
@@ -1274,10 +1356,6 @@ impl LegacySnapshot {
                     LegacyEntry::SessionTotal { .. } => {}
                 }
             }
-            let mut replacements: BTreeMap<usize, LegacyEntry> = BTreeMap::new();
-            let mut drops: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-            let mut appends: Vec<LegacyEntry> = Vec::new();
-            let mut count = 0usize;
             // 单键单条:可比且六桶全 >= 才替换(沿用旧 ts 防跨日漂移),更小保留旧值。
             // 同键多条(任一侧):歧义键——参照 claude 先例"多条不自动裁决",保留
             // previous 全组、丢弃 fresh 组,计数=被丢弃条数(不丢 previous 条目,
@@ -1413,10 +1491,17 @@ impl LegacySnapshot {
                 });
             }
             self.entries.append(&mut appends);
-            if count > 0 {
-                guarded.insert(source.clone(), count);
+            if count > 0 || locked_ignored > 0 {
+                guarded.insert(source.clone(), count + locked_ignored);
                 if let Some(status) = self.sources.get_mut(source.as_str()) {
-                    let note = format!("DAY_SHRINK_GUARDED:{count}");
+                    let mut notes = Vec::new();
+                    if count > 0 {
+                        notes.push(format!("DAY_SHRINK_GUARDED:{count}"));
+                    }
+                    if locked_ignored > 0 {
+                        notes.push(format!("LOCKED_DAY_IGNORED:{locked_ignored}"));
+                    }
+                    let note = notes.join(";");
                     status.warning = match status.warning.take() {
                         Some(existing) => Some(format!("{existing};{note}")),
                         None => Some(note),
@@ -2219,7 +2304,9 @@ mod monotonic_guard_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE suppression_rules(rule_id INTEGER PRIMARY KEY,kind TEXT,report_source TEXT,native_tool TEXT,start_ms INTEGER,end_ms INTEGER);
-             CREATE TABLE adoption_forget_ranges(range_id INTEGER PRIMARY KEY,consumer_tool TEXT,start_ms INTEGER,end_ms INTEGER,identity_family TEXT);",
+             CREATE TABLE adoption_forget_ranges(range_id INTEGER PRIMARY KEY,consumer_tool TEXT,start_ms INTEGER,end_ms INTEGER,identity_family TEXT);
+             CREATE TABLE ledger_meta(singleton INTEGER PRIMARY KEY,report_timezone TEXT);
+             INSERT INTO ledger_meta VALUES(1,'UTC');",
         )
         .unwrap();
         conn
@@ -2385,6 +2472,89 @@ mod monotonic_guard_tests {
             .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
             .unwrap();
         assert!(fresh.entries.is_empty());
+    }
+
+    #[test]
+    fn locked_day_ignores_any_change_even_growth() {
+        // 用户约定(2026-11-12):已采集历史锁死。上次成功扫描落在 D2 日
+        // (UTC),则 D1 日为锁定日——新读更大也不采纳,previous 原样保留。
+        let day1 = 86_400_000 + 5_000; // D1 日内
+        let scan = 2 * 86_400_000 + 3_600_000; // D2 日 01:00
+        let mut previous = snap_of(vec![req(qwen_rec("k1", 100, 0, day1))]);
+        previous.sources.get_mut("qwen").unwrap().last_scanned_ms = Some(scan);
+        let mut fresh = snap_of(vec![req(qwen_rec("k1", 200, 0, day1))]);
+        let guarded = fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(guarded.get("qwen"), Some(&1));
+        assert_eq!(buckets(&fresh.entries[0]), (100, 0, day1));
+        let warning = fresh.sources["qwen"].warning.as_deref().unwrap();
+        assert!(warning.contains("LOCKED_DAY_IGNORED:1"), "{warning}");
+    }
+
+    #[test]
+    fn locked_day_ignores_new_keys_too() {
+        // 锁定日连"新键新增"也不进:同源过去的一天不可能再长出合法新请求。
+        let day1 = 86_400_000 + 5_000;
+        let scan = 2 * 86_400_000 + 3_600_000;
+        let mut previous = snap_of(vec![req(qwen_rec("k1", 100, 0, day1))]);
+        previous.sources.get_mut("qwen").unwrap().last_scanned_ms = Some(scan);
+        let mut fresh = snap_of(vec![
+            req(qwen_rec("k1", 100, 0, day1)),
+            req(qwen_rec("k-new", 500, 0, day1)),
+        ]);
+        fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        let keys: Vec<&str> = fresh
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                LegacyEntry::Request { record, .. } => record.dedup_key.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(keys, vec!["k1"]);
+        assert!(fresh.sources["qwen"]
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("LOCKED_DAY_IGNORED:2"));
+    }
+
+    #[test]
+    fn scan_day_itself_stays_open_for_growth() {
+        // 扫描当天(D2)不锁:当日新数据正常增长进入(锁定必须等日结束后
+        // 的首次完整扫描,否则会把不完整的当日永久锁住)。
+        let day2 = 2 * 86_400_000 + 5_000;
+        let scan = 2 * 86_400_000 + 3_600_000;
+        let mut previous = snap_of(vec![req(qwen_rec("k1", 100, 0, day2))]);
+        previous.sources.get_mut("qwen").unwrap().last_scanned_ms = Some(scan);
+        let mut fresh = snap_of(vec![req(qwen_rec("k1", 200, 0, day2))]);
+        fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(buckets(&fresh.entries[0]), (200, 0, day2));
+        assert!(fresh.sources["qwen"].warning.is_none());
+    }
+
+    #[test]
+    fn cross_lockline_duplicate_identity_is_dropped() {
+        // 评审F P1:同 dedup_key 的条目从锁定日漂移到开放日——身份已在锁定
+        // 历史入账,开放侧副本必须丢弃,否则同一请求被计两次。
+        let day1 = 86_400_000 + 5_000;
+        let day2 = 2 * 86_400_000 + 5_000;
+        let scan = 2 * 86_400_000 + 3_600_000;
+        let mut previous = snap_of(vec![req(qwen_rec("k1", 100, 0, day1))]);
+        previous.sources.get_mut("qwen").unwrap().last_scanned_ms = Some(scan);
+        let mut fresh = snap_of(vec![req(qwen_rec("k1", 100, 0, day2))]);
+        let guarded = fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(guarded.get("qwen"), Some(&1));
+        assert_eq!(fresh.entries.len(), 1);
+        // 唯一条目 = 锁定日的旧副本(原 ts),不是漂移副本。
+        assert_eq!(buckets(&fresh.entries[0]), (100, 0, day1));
     }
 
     #[test]
