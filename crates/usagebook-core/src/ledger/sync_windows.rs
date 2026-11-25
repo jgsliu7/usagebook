@@ -63,7 +63,7 @@ impl User {
                 return Err(denied());
             }
             // u64 storage gives TOKEN_USER and its embedded SID the required alignment.
-            let mut buffer = vec![0u64; (size as usize + 7) / 8];
+            let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
             let ok = GetTokenInformation(
                 token,
                 TokenUser,

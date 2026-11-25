@@ -1303,10 +1303,7 @@ fn capture_identity_probe(
     }
     // Missing registered objects cannot be certified by mere payload target_done.
     let missing:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM source_objects o JOIN source_roots r USING(root_id) WHERE r.identity_family=?1 AND r.namespace_key=?2 AND o.locator NOT IN(SELECT locator FROM identity_probe_files))",params![CLAUDE_FAMILY,CLAUDE_NAMESPACE],|r|r.get(0))?;
-    if missing {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(!missing)
 }
 // Ordered, length-prefixed rows make this a fixed-size guard, never an unbounded
 // list in a reader frame. The actual captured manifest stays in disk-backed TEMP.

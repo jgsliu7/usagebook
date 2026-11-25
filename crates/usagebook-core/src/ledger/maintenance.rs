@@ -1961,6 +1961,8 @@ pub fn rescue_backup(
                 "preview expired; preview again".into(),
             ));
         }
+        // Only the unix branch below mutates the builder.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
