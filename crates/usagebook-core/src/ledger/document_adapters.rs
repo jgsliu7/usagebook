@@ -506,6 +506,9 @@ fn accepted(source: &str, p: &Path) -> bool {
     }
 }
 
+/// A `last` entry only holds a root back inside this window (at most one pass per
+/// 30 seconds per root); older entries are never read.
+const LAST_FRESH_MS: i64 = 30_000;
 #[derive(Default)]
 pub struct Collector {
     active: BTreeMap<(String, PathBuf), Image>,
@@ -661,6 +664,11 @@ impl Collector {
     pub fn invalidate_discovery(&mut self) {
         self.last.clear();
     }
+    /// Expired entries are never read, so they are dead weight once a root is
+    /// disabled or unregistered. Same window as the read below.
+    fn evict_stale_last(&mut self, now: i64) {
+        self.last.retain(|_, time| now - *time < LAST_FRESH_MS);
+    }
     pub fn poll(
         &mut self,
         ledger: &mut Ledger,
@@ -669,6 +677,7 @@ impl Collector {
         budget: usize,
     ) -> Result<PollSummary> {
         let spec = spec(source).ok_or(LedgerError::SourceNotProtected)?;
+        self.evict_stale_last(now_ms());
         let mut summary = PollSummary::default();
         let mut remaining = budget.clamp(1, 4096);
         let turn = self.next_root;
@@ -682,7 +691,11 @@ impl Collector {
                 continue;
             }
             let key = (source.to_owned(), locator.clone());
-            if self.last.get(&key).is_none_or(|t| now_ms() - *t >= 30_000) {
+            if self
+                .last
+                .get(&key)
+                .is_none_or(|t| now_ms() - *t >= LAST_FRESH_MS)
+            {
                 if let Err(error) = fs::metadata(locator) {
                     if error.kind() == std::io::ErrorKind::NotFound {
                         // The whole registered scope is demonstrably absent.
@@ -882,5 +895,56 @@ impl Collector {
         }
         summary.backlog |= self.active.keys().any(|(s, _)| s == source);
         Ok(summary)
+    }
+}
+
+#[cfg(test)]
+mod last_tests {
+    use super::*;
+
+    #[test]
+    fn stale_entries_are_evicted_at_the_read_window() {
+        // 读取处:now - t >= LAST_FRESH_MS 等价于不存在。刚好到窗口的要逐出,
+        // 窗口之内的和时钟回拨的保留。
+        fn put(collector: &mut Collector, path: &str, time: i64) {
+            collector
+                .last
+                .insert(("gemini".to_owned(), PathBuf::from(path)), time);
+        }
+        let now = 10_000_000_000;
+        let mut collector = Collector::default();
+        put(&mut collector, "/expired", now - LAST_FRESH_MS);
+        put(&mut collector, "/inside", now - LAST_FRESH_MS + 1);
+        put(&mut collector, "/future", now + 5_000);
+        collector.evict_stale_last(now);
+        let left: Vec<String> = collector
+            .last
+            .keys()
+            .map(|(_, path)| path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["/future", "/inside"]);
+    }
+
+    #[test]
+    fn poll_evicts_expired_entries_before_any_early_return() {
+        // 接线:逐出在 poll 入口。roots 传空(相当于源卸载后),循环不执行,
+        // 只有入口的逐出来清这张表。
+        let dir = std::env::temp_dir().join(format!("ub-last-poll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ledger = crate::ledger::db::Ledger::init(dir.join("l.db"), "UTC").unwrap();
+        let now = crate::ledger::types::now_ms();
+        let mut collector = Collector::default();
+        collector.last.insert(
+            ("gemini".to_owned(), PathBuf::from("/expired")),
+            now - LAST_FRESH_MS,
+        );
+        collector
+            .last
+            .insert(("gemini".to_owned(), PathBuf::from("/inside")), now);
+        collector.poll(&mut ledger, "gemini", &[], 16).unwrap();
+        assert_eq!(collector.last.len(), 1, "窗口内的保留,超龄的逐出");
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

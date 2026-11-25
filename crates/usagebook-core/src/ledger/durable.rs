@@ -175,18 +175,22 @@ fn validate_spec(spec: &AdapterSpec) -> Result<()> {
     Ok(())
 }
 
-fn finish_targets(c: &Connection, import_id: i64) -> Result<()> {
+/// Returns how many imports just became complete. Callers use that count to
+/// decide whether the commit sequence must advance. The `completed_ms IS NULL`
+/// filter matters: without it the UPDATE reports every already-complete import
+/// as a changed row on each call, so nothing would ever look unchanged.
+fn finish_targets(c: &Connection, import_id: i64) -> Result<usize> {
     // A replay can fulfill the same object/generation in an earlier capability's
     // sealed manifest too. Complete every satisfied manifest for this root;
     // leaving the older job open would make source status permanently unfinished.
-    c.execute(
+    Ok(c.execute(
         "UPDATE durable_imports SET completed_ms=COALESCE(completed_ms,?2)
          WHERE root_id=(SELECT root_id FROM durable_imports WHERE import_id=?1)
          AND enumeration_done=1
+         AND completed_ms IS NULL
          AND NOT EXISTS(SELECT 1 FROM durable_import_targets t WHERE t.import_id=durable_imports.import_id AND t.state='pending')",
         params![import_id, now_ms()],
-    )?;
-    Ok(())
+    )?)
 }
 
 impl Ledger {
@@ -520,18 +524,19 @@ impl Ledger {
         if !enabled {
             return Err(LedgerError::Cancelled);
         }
+        let mut changed = false;
         let old: Option<(i64,String,i64,String)> = tx.query_row("SELECT object_id,content_generation,byte_length,state FROM source_objects WHERE root_id=?1 AND object_key=?2",params![root.root_id,spec.object_key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let object_id = if let Some((id, generation, length, state)) = old {
             if generation != spec.content_generation || length > spec.byte_length {
-                tx.execute("UPDATE durable_import_targets SET state='gap',error_code='SOURCE_CHANGED_BEFORE_SAVE',finished_ms=?2 WHERE object_id=?1 AND state='pending'",params![id,now_ms()])?;
-                tx.execute("UPDATE source_objects SET locator=?2,content_generation=?3,byte_length=?4,mtime_ns=?5,object_revision=object_revision+1,state='ready',parser_version=?6,saved_offset=0,checkpoint_format=1,checkpoint=X'',target_generation=?3,target_end=?4,target_done=0,last_observed_ms=?7,error_code=NULL,retry_after_ms=NULL,quick_fingerprint=NULL WHERE object_id=?1",params![id,spec.locator,spec.content_generation,spec.byte_length,spec.mtime_ns,root.spec.parser_version,now_ms()])?;
+                changed |= tx.execute("UPDATE durable_import_targets SET state='gap',error_code='SOURCE_CHANGED_BEFORE_SAVE',finished_ms=?2 WHERE object_id=?1 AND state='pending'",params![id,now_ms()])? > 0;
+                changed |= tx.execute("UPDATE source_objects SET locator=?2,content_generation=?3,byte_length=?4,mtime_ns=?5,object_revision=object_revision+1,state='ready',parser_version=?6,saved_offset=0,checkpoint_format=1,checkpoint=X'',target_generation=?3,target_end=?4,target_done=0,last_observed_ms=?7,error_code=NULL,retry_after_ms=NULL,quick_fingerprint=NULL WHERE object_id=?1",params![id,spec.locator,spec.content_generation,spec.byte_length,spec.mtime_ns,root.spec.parser_version,now_ms()])? > 0;
             } else if length != spec.byte_length || state != "ready" {
                 let replay = state == "replay_required";
-                tx.execute("UPDATE source_objects SET locator=?2,byte_length=?3,mtime_ns=?4,object_revision=object_revision+1,state='ready',saved_offset=CASE WHEN ?5 THEN 0 ELSE saved_offset END,checkpoint_format=1,checkpoint=CASE WHEN ?5 THEN X'' ELSE checkpoint END,target_generation=content_generation,target_end=?3,target_done=CASE WHEN ?5 OR byte_length<>?3 THEN 0 ELSE target_done END,last_observed_ms=?6,error_code=NULL,retry_after_ms=NULL WHERE object_id=?1",params![id,spec.locator,spec.byte_length,spec.mtime_ns,replay,now_ms()])?;
+                changed |= tx.execute("UPDATE source_objects SET locator=?2,byte_length=?3,mtime_ns=?4,object_revision=object_revision+1,state='ready',saved_offset=CASE WHEN ?5 THEN 0 ELSE saved_offset END,checkpoint_format=1,checkpoint=CASE WHEN ?5 THEN X'' ELSE checkpoint END,target_generation=content_generation,target_end=?3,target_done=CASE WHEN ?5 OR byte_length<>?3 THEN 0 ELSE target_done END,last_observed_ms=?6,error_code=NULL,retry_after_ms=NULL WHERE object_id=?1",params![id,spec.locator,spec.byte_length,spec.mtime_ns,replay,now_ms()])? > 0;
             }
             id
         } else {
-            tx.execute("INSERT INTO source_objects(root_id,object_key,locator,content_generation,byte_length,mtime_ns,object_revision,state,parser_version,saved_offset,checkpoint_format,checkpoint,target_generation,target_end,last_observed_ms,audit_due_ms) VALUES(?1,?2,?3,?4,?5,?6,0,'ready',?7,0,1,X'',?4,?5,?8,?8)",params![root.root_id,spec.object_key,spec.locator,spec.content_generation,spec.byte_length,spec.mtime_ns,root.spec.parser_version,now_ms()])?;
+            changed |= tx.execute("INSERT INTO source_objects(root_id,object_key,locator,content_generation,byte_length,mtime_ns,object_revision,state,parser_version,saved_offset,checkpoint_format,checkpoint,target_generation,target_end,last_observed_ms,audit_due_ms) VALUES(?1,?2,?3,?4,?5,?6,0,'ready',?7,0,1,X'',?4,?5,?8,?8)",params![root.root_id,spec.object_key,spec.locator,spec.content_generation,spec.byte_length,spec.mtime_ns,root.spec.parser_version,now_ms()])? > 0;
             tx.last_insert_rowid()
         };
         // Recent lanes are supplemental checkpoints, never members of the
@@ -540,14 +545,20 @@ impl Ledger {
             spec.object_key.as_str(),
             "cc-recent-v1" | "local-recent-v1" | "native-db-recent-v2"
         ) {
-            tx.execute("INSERT INTO durable_import_targets(import_id,object_id,target_generation,target_end,state,finished_ms) SELECT ?1,?2,?3,?4,CASE WHEN target_done=1 THEN 'saved' ELSE 'pending' END,CASE WHEN target_done=1 THEN ?5 ELSE NULL END FROM source_objects WHERE object_id=?2 AND EXISTS(SELECT 1 FROM durable_imports WHERE import_id=?1 AND enumeration_done=0) ON CONFLICT DO NOTHING",params![root.import_id,object_id,spec.content_generation,spec.byte_length,now_ms()])?;
+            changed |= tx.execute("INSERT INTO durable_import_targets(import_id,object_id,target_generation,target_end,state,finished_ms) SELECT ?1,?2,?3,?4,CASE WHEN target_done=1 THEN 'saved' ELSE 'pending' END,CASE WHEN target_done=1 THEN ?5 ELSE NULL END FROM source_objects WHERE object_id=?2 AND EXISTS(SELECT 1 FROM durable_imports WHERE import_id=?1 AND enumeration_done=0) ON CONFLICT DO NOTHING",params![root.import_id,object_id,spec.content_generation,spec.byte_length,now_ms()])? > 0;
         }
         if let Some(checkpoint) = initial_checkpoint {
-            tx.execute("UPDATE source_objects SET checkpoint=?2 WHERE object_id=?1 AND saved_offset=0 AND checkpoint=X''",params![object_id,checkpoint])?;
+            changed |= tx.execute("UPDATE source_objects SET checkpoint=?2 WHERE object_id=?1 AND saved_offset=0 AND checkpoint=X''",params![object_id,checkpoint])? > 0;
         }
         let result = load_object(&tx, root, object_id)?;
-        finish_targets(&tx, root.import_id)?;
-        db::bump(&tx)?;
+        changed |= finish_targets(&tx, root.import_id)? > 0;
+        // The transaction and its statements stay as they are; only the commit
+        // sequence becomes conditional. A known, unchanged object is rediscovered
+        // on every poll: an unconditional bump made it one of ~1,200 no-op commits
+        // per round, the bulk of what the service writes while nothing changes.
+        if changed {
+            db::bump(&tx)?;
+        }
         tx.commit()?;
         Ok(result)
     }
@@ -559,10 +570,24 @@ impl Ledger {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE durable_imports SET enumeration_done=1,sealed_ms=COALESCE(sealed_ms,?2) WHERE import_id=?1 AND EXISTS(SELECT 1 FROM source_roots WHERE root_id=?3 AND enabled=1)",params![root.import_id,now_ms(),root.root_id])?;
+        // `last_enumerated_ms` is still written on every call. The commit sequence
+        // advances only when sealing, the root status or an import's completion
+        // actually flips: otherwise this per-round call keeps moving commit_seq
+        // in idle rounds, and cross-round paging cursors go stale for nothing.
+        let mut changed = tx.execute("UPDATE durable_imports SET enumeration_done=1,sealed_ms=COALESCE(sealed_ms,?2) WHERE import_id=?1 AND enumeration_done=0 AND EXISTS(SELECT 1 FROM source_roots WHERE root_id=?3 AND enabled=1)",params![root.import_id,now_ms(),root.root_id])? > 0;
+        changed |= tx
+            .query_row(
+                "SELECT enumeration_done=0 OR error_code IS NOT NULL FROM source_roots WHERE root_id=?1 AND enabled=1",
+                [&root.root_id],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false);
         tx.execute("UPDATE source_roots SET enumeration_done=1,last_enumerated_ms=?2,error_code=NULL WHERE root_id=?1 AND enabled=1",params![root.root_id,now_ms()])?;
-        finish_targets(&tx, root.import_id)?;
-        db::bump(&tx)?;
+        changed |= finish_targets(&tx, root.import_id)? > 0;
+        if changed {
+            db::bump(&tx)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1106,4 +1131,264 @@ fn validate_projection(parser: &str, value: &Value) -> Result<String> {
         return Err(LedgerError::RecordTooLarge);
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod commit_seq_tests {
+    use super::*;
+
+    const SPEC: AdapterSpec = AdapterSpec {
+        identity_family: "codex",
+        collector_key: "reported-history-v1",
+        report_source: "codex",
+        native_tool: "codex",
+        parser_version: "codex-ledger-v1",
+        capability_version: "commit-seq-test-v1",
+        identity_version: 1,
+        semantics_version: 1,
+    };
+
+    fn object(key: &str, generation: &str, byte_length: i64) -> ObjectSpec {
+        ObjectSpec {
+            object_key: key.into(),
+            locator: format!("/{key}"),
+            content_generation: generation.into(),
+            byte_length,
+            mtime_ns: Some(1),
+        }
+    }
+
+    fn temp_ledger(tag: &str) -> (PathBuf, Ledger) {
+        let dir = std::env::temp_dir().join(format!("ub-commit-seq-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = Ledger::init(dir.join("l.db"), "UTC").unwrap();
+        (dir, ledger)
+    }
+
+    fn commit_seq(ledger: &Ledger) -> i64 {
+        ledger
+            .connection()
+            .query_row("SELECT commit_seq FROM ledger_meta", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn rediscovering_an_unchanged_object_keeps_commit_seq() {
+        // 每个 poll 都把范围内的对象重新发现一遍。已知且未变的对象不改变
+        // 任何查询可见的数据,不该推进提交序号(翻页游标和云同步时钟跟着它走)。
+        let (dir, mut ledger) = temp_ledger("discover");
+        let root = ledger
+            .register_durable_root(&SPEC, "unknown:codex", &dir)
+            .unwrap();
+        let first = ledger
+            .discover_durable_object(&root, object("a", "g1", 10))
+            .unwrap();
+        let after_first = commit_seq(&ledger);
+        assert!(after_first > 0, "新对象必须推进提交序号");
+        for _ in 0..3 {
+            let again = ledger
+                .discover_durable_object(&root, object("a", "g1", 10))
+                .unwrap();
+            assert_eq!(again.object_id, first.object_id);
+        }
+        assert_eq!(
+            commit_seq(&ledger),
+            after_first,
+            "已知且未变的对象不该推进提交序号"
+        );
+        ledger
+            .discover_durable_object(&root, object("a", "g2", 20))
+            .unwrap();
+        assert!(
+            commit_seq(&ledger) > after_first,
+            "内容代际变了必须推进提交序号"
+        );
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repeated_enumeration_finish_keeps_commit_seq_but_still_stamps() {
+        let (dir, mut ledger) = temp_ledger("enumeration");
+        let root = ledger
+            .register_durable_root(&SPEC, "unknown:codex", &dir)
+            .unwrap();
+        let stamp = |ledger: &Ledger| -> i64 {
+            ledger
+                .connection()
+                .query_row(
+                    "SELECT last_enumerated_ms FROM source_roots WHERE root_id=?1",
+                    [&root.root_id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        ledger.finish_durable_enumeration(&root).unwrap();
+        let after_first = commit_seq(&ledger);
+        let first_stamp = stamp(&ledger);
+        ledger.finish_durable_enumeration(&root).unwrap();
+        assert_eq!(
+            commit_seq(&ledger),
+            after_first,
+            "没有翻转的枚举收尾不该推进提交序号"
+        );
+        assert!(stamp(&ledger) >= first_stamp, "枚举时间戳照写");
+        // 失败之后的恢复是一次真实的翻转。
+        ledger
+            .fail_durable_enumeration(&root, "SOURCE_READ_ERROR")
+            .unwrap();
+        let after_failure = commit_seq(&ledger);
+        ledger.finish_durable_enumeration(&root).unwrap();
+        assert!(
+            commit_seq(&ledger) > after_failure,
+            "从失败恢复必须推进提交序号"
+        );
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn completing_an_import_counts_as_a_change_only_once() {
+        // finish_targets 对已完成的导入如果也算"改了一行",这个对象每轮被重新
+        // 发现时都会被当成有变化。所以只有刚刚变完成的才算。
+        let (dir, mut ledger) = temp_ledger("complete");
+        let root = ledger
+            .register_durable_root(&SPEC, "unknown:codex", &dir)
+            .unwrap();
+        let found = ledger
+            .discover_durable_object(&root, object("a", "g1", 10))
+            .unwrap();
+        ledger.finish_durable_enumeration(&root).unwrap();
+        // 模拟一次成功的保存:目标已满足(表约束要求非待处理的目标带完成时间)。
+        ledger
+            .connection()
+            .execute(
+                "UPDATE durable_import_targets SET state='saved',finished_ms=1 WHERE object_id=?1",
+                [found.object_id],
+            )
+            .unwrap();
+        let before = commit_seq(&ledger);
+        ledger.finish_durable_enumeration(&root).unwrap();
+        let completed = commit_seq(&ledger);
+        assert!(completed > before, "导入刚完成是一次真实变化");
+        let done: Option<i64> = ledger
+            .connection()
+            .query_row(
+                "SELECT completed_ms FROM durable_imports WHERE import_id=?1",
+                [root.import_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(done.is_some(), "导入应被标记为完成");
+        for _ in 0..3 {
+            ledger
+                .discover_durable_object(&root, object("a", "g1", 10))
+                .unwrap();
+            ledger.finish_durable_enumeration(&root).unwrap();
+        }
+        assert_eq!(
+            commit_seq(&ledger),
+            completed,
+            "早已完成的导入不该再被当成变化"
+        );
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restaging_the_same_manifest_keeps_commit_seq() {
+        let (dir, mut ledger) = temp_ledger("manifest");
+        let root = ledger
+            .register_durable_root(&SPEC, "unknown:codex", &dir)
+            .unwrap();
+        let manifest = b"manifest-v1";
+        ledger
+            .stage_durable_manifest(&root, object("m", "g1", 10), manifest)
+            .unwrap();
+        let after_first = commit_seq(&ledger);
+        ledger
+            .stage_durable_manifest(&root, object("m", "g1", 10), manifest)
+            .unwrap();
+        assert_eq!(
+            commit_seq(&ledger),
+            after_first,
+            "同一份清单再次暂存不是变化"
+        );
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rediscovering_a_non_ready_object_advances_commit_seq() {
+        // 已知对象,代际和长度都没变,只是状态不是 ready。出了错的对象每轮都
+        // 会被重新发现,复位成 ready 是真实变化,必须推进提交序号。
+        let (dir, mut ledger) = temp_ledger("non-ready");
+        let root = ledger
+            .register_durable_root(&SPEC, "unknown:codex", &dir)
+            .unwrap();
+        let found = ledger
+            .discover_durable_object(&root, object("a", "g1", 10))
+            .unwrap();
+        ledger.fail_durable_object(&found, "READ_FAILED").unwrap();
+        let before = commit_seq(&ledger);
+        let again = ledger
+            .discover_durable_object(&root, object("a", "g1", 10))
+            .unwrap();
+        assert_eq!(again.object_id, found.object_id);
+        assert_eq!(again.revision, found.revision + 1, "对象版本加一");
+        assert!(
+            commit_seq(&ledger) > before,
+            "复位成 ready 必须推进提交序号"
+        );
+        let before = commit_seq(&ledger);
+        ledger
+            .discover_durable_object(&root, object("a", "g1", 12))
+            .unwrap();
+        assert!(commit_seq(&ledger) > before, "长度变化必须推进提交序号");
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn completing_an_import_through_discovery_counts_once() {
+        // retire_unrecoverable_db_checkpoints 把目标改成 gap 之后自己不调
+        // finish_targets,导入要等下一次重新发现才补成完成。这一次必须推进。
+        let (dir, mut ledger) = temp_ledger("complete-on-discover");
+        let root = ledger
+            .register_durable_root(&SPEC, "unknown:codex", &dir)
+            .unwrap();
+        let found = ledger
+            .discover_durable_object(&root, object("a", "g1", 10))
+            .unwrap();
+        ledger.finish_durable_enumeration(&root).unwrap();
+        ledger
+            .connection()
+            .execute(
+                "UPDATE durable_import_targets SET state='gap',error_code='DATABASE_CAPABILITY_REPLAY_GAP',finished_ms=1 WHERE object_id=?1 AND state='pending'",
+                [found.object_id],
+            )
+            .unwrap();
+        let before = commit_seq(&ledger);
+        ledger
+            .discover_durable_object(&root, object("a", "g1", 10))
+            .unwrap();
+        assert!(commit_seq(&ledger) > before, "导入刚完成必须推进提交序号");
+        let done: Option<i64> = ledger
+            .connection()
+            .query_row(
+                "SELECT completed_ms FROM durable_imports WHERE import_id=?1",
+                [root.import_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(done.is_some(), "导入应被标记为完成");
+        let completed = commit_seq(&ledger);
+        ledger
+            .discover_durable_object(&root, object("a", "g1", 10))
+            .unwrap();
+        assert_eq!(commit_seq(&ledger), completed, "早已完成的导入不再推进");
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

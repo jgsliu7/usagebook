@@ -565,6 +565,8 @@ struct FileImport {
     object: DurableObject,
     pending: Option<TranscriptBatch>,
 }
+/// A `validated` entry only counts inside this window; older entries are never read.
+const VALIDATED_FRESH_MS: i64 = 3_600_000;
 #[derive(Default)]
 pub struct TranscriptCollector {
     sessions: HashMap<(String, PathBuf), FileImport>,
@@ -602,6 +604,13 @@ impl TranscriptCollector {
             scope.next_discovery_ms = 0;
         }
     }
+    /// Expired entries are never read, so they are dead weight: a deleted file
+    /// or a disabled/unregistered root leaves its key behind for good. Same
+    /// window as the read below.
+    fn evict_stale_validated(&mut self, now: i64) {
+        self.validated
+            .retain(|_, (_, time)| now - *time < VALIDATED_FRESH_MS);
+    }
     pub fn poll(
         &mut self,
         ledger: &mut Ledger,
@@ -616,6 +625,7 @@ impl TranscriptCollector {
         }
         let adapter = spec(source).ok_or(LedgerError::SourceNotProtected)?;
         let now = super::types::now_ms();
+        self.evict_stale_validated(now);
         let mut summary = PollSummary::default();
         let discover = self
             .scopes
@@ -666,10 +676,9 @@ impl TranscriptCollector {
                         summary.errors += 1;
                         continue;
                     };
-                    let recent = self
-                        .validated
-                        .get(&state_key)
-                        .is_some_and(|(old, time)| old == &stamp && now - *time < 3_600_000);
+                    let recent = self.validated.get(&state_key).is_some_and(|(old, time)| {
+                        old == &stamp && now - *time < VALIDATED_FRESH_MS
+                    });
                     if recent {
                         continue;
                     }
@@ -1957,4 +1966,66 @@ fn read_json_document(source: &str, path: &Path, size: i64) -> Result<Vec<Durabl
 #[cfg(feature = "regression-hooks")]
 pub fn project_saved_json_reader_for_regression(reader: impl std::io::Read) -> Result<String> {
     super::source_projection::project_json_reader(reader, &["role", "tokens.input"])
+}
+
+#[cfg(test)]
+mod validated_tests {
+    use super::*;
+
+    #[test]
+    fn stale_entries_are_evicted_at_the_read_window() {
+        // 读取处:age < VALIDATED_FRESH_MS 才命中。刚好到窗口的条目已经读不到,
+        // 必须被逐出;窗口之内的和时钟回拨的保留。
+        fn put(collector: &mut TranscriptCollector, path: &str, time: i64) {
+            collector.validated.insert(
+                ("pi".to_owned(), PathBuf::from(path)),
+                (crate::common::FileStamp::membership(), time),
+            );
+        }
+        let now = 10_000_000_000;
+        let mut collector = TranscriptCollector::default();
+        put(&mut collector, "/expired", now - VALIDATED_FRESH_MS);
+        put(&mut collector, "/inside", now - VALIDATED_FRESH_MS + 1);
+        put(&mut collector, "/future", now + 5_000);
+        collector.evict_stale_validated(now);
+        let mut left: Vec<String> = collector
+            .validated
+            .keys()
+            .map(|(_, path)| path.to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["/future", "/inside"]);
+    }
+
+    #[test]
+    fn poll_evicts_expired_entries_before_any_early_return() {
+        // 接线:逐出在 poll 入口。roots 传空(相当于源卸载后),后面的步骤
+        // 不会碰这张表,只有入口的逐出来清它。
+        let dir = std::env::temp_dir().join(format!("ub-validated-poll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ledger = crate::ledger::db::Ledger::init(dir.join("l.db"), "UTC").unwrap();
+        let now = super::super::types::now_ms();
+        let mut collector = TranscriptCollector::default();
+        collector.validated.insert(
+            ("pi".to_owned(), PathBuf::from("/expired")),
+            (
+                crate::common::FileStamp::membership(),
+                now - VALIDATED_FRESH_MS,
+            ),
+        );
+        collector.validated.insert(
+            ("pi".to_owned(), PathBuf::from("/inside")),
+            (crate::common::FileStamp::membership(), now),
+        );
+        collector.poll(&mut ledger, "pi", &[], 16).unwrap();
+        assert!(!collector
+            .validated
+            .contains_key(&("pi".to_owned(), PathBuf::from("/expired"))));
+        assert!(collector
+            .validated
+            .contains_key(&("pi".to_owned(), PathBuf::from("/inside"))));
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

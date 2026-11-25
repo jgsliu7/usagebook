@@ -1501,11 +1501,22 @@ impl LegacySnapshot {
                     if locked_ignored > 0 {
                         notes.push(format!("LOCKED_DAY_IGNORED:{locked_ignored}"));
                     }
-                    let note = notes.join(";");
-                    status.warning = match status.warning.take() {
-                        Some(existing) => Some(format!("{existing};{note}")),
-                        None => Some(note),
-                    };
+                    // 注记幂等:局部轮(load_completed_saved_sources)把未刷新
+                    // 源的上一版状态原样带入,守卫把带进来的锁定日条目再数
+                    // 一遍;无条件追加会让同一条注记翻倍,告警转移过滤随之
+                    // 把它当成新告警。按分号拆成整段比较,不用子串包含:
+                    // DAY_SHRINK_GUARDED:1 是 DAY_SHRINK_GUARDED:12 的子串。
+                    let mut segments: Vec<String> = status
+                        .warning
+                        .take()
+                        .map(|existing| existing.split(';').map(str::to_owned).collect())
+                        .unwrap_or_default();
+                    for note in notes {
+                        if !segments.contains(&note) {
+                            segments.push(note);
+                        }
+                    }
+                    status.warning = (!segments.is_empty()).then(|| segments.join(";"));
                 }
                 changed = true;
             }
@@ -2490,6 +2501,55 @@ mod monotonic_guard_tests {
         assert_eq!(buckets(&fresh.entries[0]), (100, 0, day1));
         let warning = fresh.sources["qwen"].warning.as_deref().unwrap();
         assert!(warning.contains("LOCKED_DAY_IGNORED:1"), "{warning}");
+    }
+
+    #[test]
+    fn carried_guard_note_is_not_appended_twice() {
+        // 局部轮(load_completed_saved_sources)把上一版的条目和状态原样带入。
+        // 守卫再数一遍带进来的锁定日条目时,注记不能在同一段告警文本上
+        // 重复追加:文本一变,告警转移过滤就把它当成新告警。
+        let day1 = 86_400_000 + 5_000;
+        let scan = 2 * 86_400_000 + 3_600_000;
+        let mut previous = snap_of(vec![req(qwen_rec("k1", 100, 0, day1))]);
+        previous.sources.get_mut("qwen").unwrap().last_scanned_ms = Some(scan);
+        let mut published = previous.clone();
+        let guarded = published
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(guarded.get("qwen"), Some(&1));
+        assert_eq!(
+            published.sources["qwen"].warning.as_deref(),
+            Some("LOCKED_DAY_IGNORED:1")
+        );
+        let mut partial = published.clone();
+        let guarded = partial
+            .monotonic_history_guard(&published, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        // 数据防线不变:守卫照样报告这一条,变的只是文本不再叠加。
+        assert_eq!(guarded.get("qwen"), Some(&1));
+        assert_eq!(
+            partial.sources["qwen"].warning.as_deref(),
+            Some("LOCKED_DAY_IGNORED:1")
+        );
+        assert_eq!(buckets(&partial.entries[0]), (100, 0, day1));
+    }
+
+    #[test]
+    fn guard_note_compares_whole_segments() {
+        // 锁定的是拼接函数的性质:按整段比较,不用子串包含。这里构造的
+        // "已有 :12、新来 :1"在真实流程里不会同时出现(状态被带入的轮次,
+        // 条目也是带入的);它只用来说明子串判断会把 :1 当成已含于 :12。
+        let mut previous = snap_of(vec![req(qwen_rec("k1", 100, 0, 1_000))]);
+        previous.sources.get_mut("qwen").unwrap().warning = Some("DAY_SHRINK_GUARDED:12".into());
+        let mut fresh = previous.clone();
+        fresh.entries = vec![req(qwen_rec("k1", 50, 0, 1_000))];
+        fresh
+            .monotonic_history_guard(&previous, &guard_conn(), &eligible(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(
+            fresh.sources["qwen"].warning.as_deref(),
+            Some("DAY_SHRINK_GUARDED:12;DAY_SHRINK_GUARDED:1")
+        );
     }
 
     #[test]

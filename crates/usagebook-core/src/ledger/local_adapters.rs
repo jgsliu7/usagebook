@@ -527,6 +527,13 @@ impl Collector {
         self.next_pass.clear();
         self.next_recent.clear();
     }
+    /// An entry with `t <= now` behaves exactly like a missing one (that is the
+    /// read condition below), so evicting it is lossless. Without this, the paths
+    /// of deleted or unregistered databases stay in these maps for good.
+    fn evict_due(&mut self, now: i64) {
+        self.next_pass.retain(|_, next| *next > now);
+        self.next_recent.retain(|_, next| *next > now);
+    }
     pub fn poll(
         &mut self,
         ledger: &mut Ledger,
@@ -540,6 +547,7 @@ impl Collector {
             ));
         }
         let adapter = spec(source).ok_or(LedgerError::SourceNotProtected)?;
+        self.evict_due(now_ms());
         let mut summary = PollSummary::default();
         let mut paths = discover_databases(source, roots)?;
         summary.discovered_databases = paths.len();
@@ -1256,4 +1264,54 @@ pub(crate) fn retire_unrecoverable_db_checkpoints(
     tx.execute("UPDATE source_objects SET target_done=1,state='missing',error_code='DATABASE_CAPABILITY_REPLAY_GAP' WHERE root_id=?1 AND target_done=0 AND (checkpoint IS NULL OR length(checkpoint)=0)",[&root.root_id])?;
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod next_pass_tests {
+    use super::*;
+
+    #[test]
+    fn due_entries_are_evicted() {
+        // 读取处:t <= now 等价于不存在。所以 t == now 的要逐出,t > now 的保留。
+        let now = 10_000_000_000;
+        let mut collector = Collector::default();
+        for (path, next) in [("/due", now), ("/future", now + 1)] {
+            let key = ("qoder".to_owned(), PathBuf::from(path));
+            collector.next_pass.insert(key.clone(), next);
+            collector.next_recent.insert(key, next);
+        }
+        collector.evict_due(now);
+        let left = |map: &HashMap<(String, PathBuf), i64>| -> Vec<String> {
+            let mut paths: Vec<String> = map
+                .keys()
+                .map(|(_, path)| path.to_string_lossy().into_owned())
+                .collect();
+            paths.sort();
+            paths
+        };
+        assert_eq!(left(&collector.next_pass), ["/future"]);
+        assert_eq!(left(&collector.next_recent), ["/future"]);
+    }
+
+    #[test]
+    fn poll_evicts_due_entries_before_any_early_return() {
+        // 接线:逐出在 poll 入口。roots 传空(相当于源卸载后),poll 直接
+        // 返回,只有入口的逐出来清这张表。
+        let dir = std::env::temp_dir().join(format!("ub-next-pass-poll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ledger = crate::ledger::db::Ledger::init(dir.join("l.db"), "UTC").unwrap();
+        let now = crate::ledger::types::now_ms();
+        let mut collector = Collector::default();
+        for (path, next) in [("/due", now), ("/future", now + 30_000)] {
+            let key = ("zcode".to_owned(), PathBuf::from(path));
+            collector.next_pass.insert(key.clone(), next);
+            collector.next_recent.insert(key, next);
+        }
+        collector.poll(&mut ledger, "zcode", &[], 512).unwrap();
+        assert_eq!(collector.next_pass.len(), 1, "到期的逐出,未到期的保留");
+        assert_eq!(collector.next_recent.len(), 1, "到期的逐出,未到期的保留");
+        drop(ledger);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
